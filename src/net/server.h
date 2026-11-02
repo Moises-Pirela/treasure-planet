@@ -8,7 +8,8 @@
 //
 // Per tick the server: reads every packet (inputs, joins, leaves), copies each
 // client's latest input onto its player, steps the game, broadcasts what was spawned
-// or despawned (reliably), and every NET_SNAPSHOT_HZ sends each client the positions
+// or despawned and which ships departed or arrived (reliably), and every
+// NET_SNAPSHOT_HZ sends each client the positions
 // of the dynamic entities it is interested in (unreliably). Single-threaded: the
 // scaling unit is the zone, not the core.
 #ifndef TP_SERVER_H
@@ -50,6 +51,7 @@ struct server {
     double last_update;
     bool clock_started;
     cw_id_list spawned, despawned;   // what the last tick created and destroyed, to broadcast
+    cw_observer *ship_changes;       // ships that departed or arrived, to broadcast
     unsigned char scratch[NET_MAX_PACKET];
 };
 

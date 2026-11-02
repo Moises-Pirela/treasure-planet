@@ -14,6 +14,7 @@
 //   client  MSG_INPUT -----------------------------> server     (unreliable, last few inputs)
 //   client <------------------------- MSG_SNAPSHOT  server     (unreliable: who is where)
 //   client <------------- MSG_SPAWN / MSG_DESPAWN   server     (reliable: joins, leaves)
+//   client <--------------------- MSG_SHIP_STATE    server     (reliable: departures, arrivals)
 // Either side may send MSG_DISCONNECT; silence for longer than the timeout is the same.
 //
 // Sharding: a zone server owns one region of the universe. MSG_REDIRECT tells a
@@ -43,6 +44,7 @@ enum net_message_type {
     MSG_KEEPALIVE,           // either: empty
     MSG_DISCONNECT,          // either: empty
     MSG_REDIRECT,            // server -> client: u32 ip, u16 port of the shard to join (reserved)
+    MSG_SHIP_STATE,          // server -> client: net_ship_state
 };
 
 enum net_reject_reason { REJECT_VERSION = 1, REJECT_FULL };
@@ -78,6 +80,16 @@ struct net_input_message {
     PlayerInput inputs[NET_INPUT_REDUNDANCY];
 };
 
+// A ship's timetable position, sent when it departs or arrives. Between these the client
+// counts the timer on by itself: it only drives what players read, and the positions
+// that matter arrive in snapshots.
+struct net_ship_state {
+    cw_entity_id id;
+    int state;                   // ship_state
+    int stop;                    // ship_stop
+    float timer;
+};
+
 cw_component_id net_component_id(const game *g, int component);
 // Payload only; the entity must carry the component.
 bool net_component_write(cw_writer *w, game *g, cw_entity_id id, int component);
@@ -98,5 +110,7 @@ void net_snapshot_entry_write(cw_writer *w, const net_snapshot_entry *e);
 bool net_snapshot_entry_read(cw_reader *r, net_snapshot_entry *e);
 void net_input_write(cw_writer *w, const net_input_message *m);
 bool net_input_read(cw_reader *r, net_input_message *m);
+void net_ship_state_write(cw_writer *w, const net_ship_state *m);
+bool net_ship_state_read(cw_reader *r, net_ship_state *m);
 
 #endif

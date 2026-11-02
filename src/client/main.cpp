@@ -321,7 +321,7 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
         if (now - last_status > 0.25) {
             char prefix[160];
             snprintf(prefix, sizeof(prefix), "Treasure Planet [%s] %s %s, %zu players, %.0f ms", backend, address,
-                     net_state_name(net->state), cw_query_count(g->q_players), net->rtt * 1000.0f);
+                     net_state_name(net->state), game_player_count(g), net->rtt * 1000.0f);
             set_status(window, g, net->state == NC_CONNECTED ? net->player : CW_INVALID_ENTITY, prefix);
             last_status = now;
         }

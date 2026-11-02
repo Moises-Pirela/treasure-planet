@@ -145,6 +145,15 @@ static void on_message(void *user, net_connection *, uint8_t type, cw_reader pay
         }
         break;
     }
+    case MSG_SHIP_STATE: {
+        net_ship_state m;
+        if (!net_ship_state_read(&payload, &m) || !cw_comp_has(w, m.id, g->c_ship)) return;
+        Ship *ship = CW_GET(w, m.id, g->c_ship, Ship);
+        ship->state = m.state;
+        ship->stop = m.stop;
+        ship->timer = m.timer;
+        break;
+    }
     case MSG_BASELINE_END:
         if (c->state == NC_LOADING) c->state = NC_CONNECTED;
         break;
@@ -278,7 +287,22 @@ double net_client_server_tick(const net_client *c, double now) {
     return c->has_offset ? now * GAME_TICK_HZ + c->tick_offset : 0.0;
 }
 
+// Stops at the end of the current state: only the server decides when a ship moves on,
+// and until its message arrives the honest countdown is zero.
+static void advance_ship_timers(net_client *c, float dt) {
+    game *g = c->replica;
+    cw_query ships = cw_query_begin(g->q_ships);
+    cw_entity_id id;
+    while (cw_query_next(&ships, &id)) {
+        Ship *ship = CW_GET(&g->world, id, g->c_ship, Ship);
+        float length = ship->state == SHIP_DOCKED ? ship->dock_seconds : ship->flight_seconds;
+        ship->timer = ship->timer + dt < length ? ship->timer + dt : length;
+    }
+}
+
 void net_client_resolve(net_client *c, double now) {
+    if (c->last_resolve > 0.0 && now > c->last_resolve) advance_ship_timers(c, (float)(now - c->last_resolve));
+    c->last_resolve = now;
     if (!c->has_offset) return;
     game *g = c->replica;
     cw_world *w = &g->world;

@@ -95,6 +95,9 @@ v3 game_player_color(cw_entity_id id);
 // holds the point, or CW_INVALID_ENTITY.
 cw_entity_id game_ship_at(game *g, v3 point);
 cw_entity_id game_find_ship(game *g, const char *name);
+// Every player in this world. Not q_players, which holds those simulated here and so
+// is empty on a client: inputs never leave the server.
+size_t game_player_count(game *g);
 v3 game_ship_position(const Ship *ship, float t01, bool to_planet);
 
 // Player size, in metres: position is the centre of the feet.

@@ -45,7 +45,7 @@ struct net_client {
     cw_entity_id player;
     float interp_delay;
     uint32_t nonce;
-    double started, last_connect_sent;
+    double started, last_connect_sent, last_resolve;
 
     PlayerInput pending;         // since the last MSG_INPUT; jump accumulates
     bool has_pending;
@@ -73,7 +73,8 @@ void net_client_update(net_client *c, double now);
 // The local player's input this frame; sent at the tick rate, jumps never dropped.
 void net_client_send_input(net_client *c, const PlayerInput *in, double now);
 // Writes interpolated positions into the replica's Transforms (position and previous
-// both, so any alpha renders the same point). Call before game_client_frame.
+// both, so any alpha renders the same point), and counts ship timers on from the last
+// MSG_SHIP_STATE. Call before game_client_frame.
 void net_client_resolve(net_client *c, double now);
 void net_client_disconnect(net_client *c);
 // False for an entity whose snapshots stopped (out of interest, or its spawn is still

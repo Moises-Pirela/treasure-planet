@@ -302,6 +302,7 @@ bool server_init(server *s, const server_config *config) {
     cw_sim_register(&s->zone.sim, d);
     game_tick(&s->zone);   // settles the universe's own created list before anyone joins
     s->spawned.count = 0;
+    s->ship_changes = cw_observer_create(&s->zone.world, s->zone.c_ship);
 
     s->clock = cw_clock_make(GAME_TICK_HZ);
     return true;
@@ -329,6 +330,24 @@ server_client *server_client_of(server *s, cw_entity_id player) {
     for (int i = 0; i < s->config.max_clients; ++i)
         if (s->clients[i].state != CLIENT_FREE && s->clients[i].player == player) return &s->clients[i];
     return NULL;
+}
+
+static void broadcast_ship_changes(server *s) {
+    if (!cw_observer_pending(s->ship_changes, CW_CHANGE_MODIFIED)) return;
+    cw_observer_observe(s->ship_changes);
+    cw_world *w = &s->zone.world;
+    cw_query changed = cw_observer_iter(s->ship_changes, CW_CHANGE_MODIFIED);
+    cw_entity_id id;
+    while (cw_query_next(&changed, &id)) {
+        const Ship *ship = CW_GET(w, id, s->zone.c_ship, Ship);
+        net_ship_state m = {id, ship->state, ship->stop, ship->timer};
+        cw_writer wr;
+        cw_writer_init_fixed(&wr, s->scratch, NET_MAX_PAYLOAD);
+        net_ship_state_write(&wr, &m);
+        for (int i = 0; i < s->config.max_clients; ++i)
+            if (s->clients[i].state == CLIENT_ACTIVE)
+                net_connection_send(&s->clients[i].connection, MSG_SHIP_STATE, true, s->scratch, wr.size);
+    }
 }
 
 static void apply_inputs(server *s) {
@@ -370,6 +389,7 @@ void server_update(server *s, double now) {
             }
             s->spawned.count = s->despawned.count = 0;
         }
+        broadcast_ship_changes(s);
         if (s->zone.world.tick % SNAPSHOT_EVERY == 0)
             for (int i = 0; i < s->config.max_clients; ++i)
                 if (s->clients[i].state == CLIENT_ACTIVE) send_snapshot(s, &s->clients[i]);

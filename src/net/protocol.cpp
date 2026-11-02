@@ -302,3 +302,21 @@ bool net_input_read(cw_reader *r, net_input_message *m) {
     }
     return cw_reader_ok(r);
 }
+
+void net_ship_state_write(cw_writer *w, const net_ship_state *m) {
+    cw_writer_i64(w, m->id);
+    cw_writer_u8(w, (uint8_t)m->state);
+    cw_writer_u8(w, (uint8_t)m->stop);
+    cw_writer_f32(w, m->timer);
+}
+bool net_ship_state_read(cw_reader *r, net_ship_state *m) {
+    uint8_t state = 0, stop = 0;
+    cw_reader_i64(r, &m->id);
+    cw_reader_u8(r, &state);
+    cw_reader_u8(r, &stop);
+    cw_reader_f32(r, &m->timer);
+    m->state = state;
+    m->stop = stop;
+    return cw_reader_ok(r) && (state == SHIP_DOCKED || state == SHIP_FLYING)
+        && (stop == STOP_HUB || stop == STOP_PLANET);
+}

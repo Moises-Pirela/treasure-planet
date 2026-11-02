@@ -202,6 +202,9 @@ static void test_two_clients_see_each_other(void) {
     CHECK(cw_world_entity_count(&gb->world) == server_entities);
     CHECK(game_find_ship(ga, "Emerald Skiff") == game_find_ship(&s->zone, "Emerald Skiff"));
     CHECK(cw_query_count(ga->q_solids) == cw_query_count(s->zone.q_solids));
+    CHECK(game_player_count(&s->zone) == 2);
+    CHECK(game_player_count(ga) == 2);      // what the window title shows
+    CHECK(game_player_count(gb) == 2);
 
     // Each sees the other as a capsule, coloured by the other's id.
     for (int k = 0; k < 2; ++k) {
@@ -260,15 +263,68 @@ static void test_two_clients_see_each_other(void) {
     CHECK(!cw_world_is_valid(&gb->world, a_player));
     CHECK(cw_world_is_valid(&gb->world, cb->player));
     CHECK(cb->state == NC_CONNECTED);
+    CHECK(game_player_count(gb) == 1);
 
     // A third player joins later and appears on B without B reconnecting.
     int c = rig_add_client(&r, 0.0f);
     CHECK(rig_wait_connected(&r, 5.0));
     rig_run(&r, 0.3);
+    CHECK(game_player_count(gb) == 2);
     CHECK(cw_world_is_valid(&gb->world, r.clients[c]->player));
     CHECK(CW_GET(&gb->world, r.clients[c]->player, gb->c_visual, Visual)->mesh == MESH_CAPSULE);
     CHECK(cw_world_entity_count(&gb->world) == cw_world_entity_count(&s->zone.world));
     CHECK(cw_world_entity_count(&r.games[c]->world) == cw_world_entity_count(&s->zone.world));
+    rig_destroy(&r);
+}
+
+// A ship's countdown and state keep up on clients, though snapshots only carry positions.
+static void test_ship_state_reaches_clients(void) {
+    rig r;
+    rig_init(&r, 0.0f);
+    int a = rig_add_client(&r, 0.0f);
+    CHECK(rig_wait_connected(&r, 5.0));
+    if (failures) { rig_destroy(&r); return; }
+    game *zone = &r.zone->zone;
+    cw_entity_id id = game_find_ship(zone, "Emerald Skiff");
+    Ship *truth = CW_GET(&zone->world, id, zone->c_ship, Ship);
+    const Ship *seen = CW_GET(&r.games[a]->world, id, r.games[a]->c_ship, Ship);
+    const float close_enough = 0.25f;
+
+    // Docked: no messages, and the client counts by itself.
+    float before = seen->timer;
+    rig_run(&r, 1.0);
+    CHECK(seen->timer > before + 0.8f);
+    CHECK(fabsf(seen->timer - truth->timer) < close_enough);
+
+    // Departure: skip most of the wait, then watch it arrive.
+    truth->timer = truth->dock_seconds - 0.1f;
+    rig_run(&r, 0.5);
+    CHECK(truth->state == SHIP_FLYING);
+    CHECK(seen->state == SHIP_FLYING && seen->stop == STOP_PLANET);
+    CHECK(fabsf(seen->timer - truth->timer) < close_enough);
+
+    // Someone joining mid-flight gets it from the baseline.
+    int b = rig_add_client(&r, 0.0f);
+    CHECK(rig_wait_connected(&r, 5.0));
+    rig_run(&r, 0.2);
+    const Ship *late = CW_GET(&r.games[b]->world, id, r.games[b]->c_ship, Ship);
+    CHECK(late->state == SHIP_FLYING && late->stop == STOP_PLANET);
+    CHECK(fabsf(late->timer - truth->timer) < close_enough);
+
+    // Arrival, and both restart their count from the server's.
+    truth->timer = truth->flight_seconds - 0.1f;
+    rig_run(&r, 0.5);
+    CHECK(truth->state == SHIP_DOCKED);
+    CHECK(seen->state == SHIP_DOCKED && seen->stop == STOP_PLANET);
+    CHECK(late->state == SHIP_DOCKED && late->stop == STOP_PLANET);
+    CHECK(fabsf(seen->timer - truth->timer) < close_enough);
+    CHECK(fabsf(late->timer - truth->timer) < close_enough);
+
+    // A client whose message is late stops at zero left, and never counts past it.
+    Ship *frozen = CW_GET(&r.games[a]->world, id, r.games[a]->c_ship, Ship);
+    frozen->timer = frozen->dock_seconds - 0.05f;
+    rig_run(&r, 0.3);
+    CHECK(frozen->timer == frozen->dock_seconds);
     rig_destroy(&r);
 }
 
@@ -330,6 +386,7 @@ int main(void) {
     }
     test_reliable_channel_under_loss();
     test_two_clients_see_each_other();
+    test_ship_state_reaches_clients();
     test_join_and_play_under_loss();
     test_rejections();
     net_shutdown();

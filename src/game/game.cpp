@@ -62,11 +62,13 @@ static void system_ships(cw_world *w, cw_phase, float dt) {
                 ship->state = SHIP_FLYING;
                 ship->stop = ship->stop == STOP_HUB ? STOP_PLANET : STOP_HUB;
                 ship->timer = 0.0f;
+                cw_comp_touch(w, id, g->c_ship);   // writes through a pointer do not reach observers
             }
         } else if (ship->timer >= ship->flight_seconds) {
             after = ship->stop == STOP_PLANET ? ship->planet_dock : ship->hub_dock;
             ship->state = SHIP_DOCKED;
             ship->timer = 0.0f;
+            cw_comp_touch(w, id, g->c_ship);
         } else {
             after = game_ship_position(ship, ship->timer / ship->flight_seconds, ship->stop == STOP_PLANET);
         }
@@ -342,4 +344,8 @@ cw_entity_id game_find_ship(game *g, const char *name) {
     while (cw_query_next(&ships, &id))
         if (strcmp(CW_GET(w, id, g->c_ship, Ship)->name, name) == 0) return id;
     return CW_INVALID_ENTITY;
+}
+
+size_t game_player_count(game *g) {
+    return cw_query_count_filter(&g->world, cw_filter_all(cw_mask(&g->c_player, 1)), SIZE_MAX);
 }
