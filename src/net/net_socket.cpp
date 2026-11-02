@@ -77,6 +77,19 @@ double net_seconds(void) {
 #endif
 }
 
+double net_wall_seconds(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    uint64_t hundreds = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;   // 100 ns since 1601
+    return (double)(hundreds - UINT64_C(116444736000000000)) * 1e-7;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
+}
+
 void net_sleep(double seconds) {
     if (seconds <= 0.0) return;
 #ifdef _WIN32

@@ -59,6 +59,7 @@ size_t net_connection_unacked(const net_connection *c) { return c->send_count; }
 static void send_outgoing(net_connection *c, double now) {
     write_header(c->outgoing, c->session, (uint16_t)(c->receive_expected - 1u));
     net_socket_send(c->socket, c->peer, c->outgoing, c->outgoing_size);
+    c->bytes_sent += c->outgoing_size;
     c->outgoing_size = NET_PACKET_HEADER;
     c->last_sent = now;
     ++c->packets_sent;
@@ -128,6 +129,7 @@ bool net_connection_receive(net_connection *c, const void *packet, size_t size, 
     }
     c->last_received = now;
     ++c->packets_received;
+    c->bytes_received += size;
     acknowledge(c, ack);
 
     while (cw_reader_remaining(&r) >= NET_MESSAGE_HEADER) {
@@ -152,7 +154,7 @@ bool net_connection_receive(net_connection *c, const void *packet, size_t size, 
         slot->data = (unsigned char *)malloc(length ? length : 1);
         memcpy(slot->data, payload, length);
         slot->size = length;
-        slot->type = (uint8_t)(type & ~NET_RELIABLE_FLAG);
+        slot->type = (uint8_t)(type & (uint8_t)~NET_RELIABLE_FLAG);
 
         // Deliver everything that is now contiguous, in order.
         for (;;) {
@@ -181,4 +183,41 @@ void net_connection_flush(net_connection *c, double now, bool force) {
         m->sent_at = now;
     }
     if (c->outgoing_size > NET_PACKET_HEADER || force) send_outgoing(c, now);
+}
+
+// ---------------------------------------------------------------------------
+// Varints
+// ---------------------------------------------------------------------------
+void net_write_uvarint(cw_writer *w, uint64_t value) {
+    while (value >= 0x80) {
+        cw_writer_u8(w, (uint8_t)(value | 0x80));
+        value >>= 7;
+    }
+    cw_writer_u8(w, (uint8_t)value);
+}
+
+bool net_read_uvarint(cw_reader *r, uint64_t *value) {
+    uint64_t result = 0;
+    for (unsigned shift = 0; shift < 64; shift += 7) {
+        uint8_t byte = 0;
+        if (!cw_reader_u8(r, &byte)) return false;
+        result |= (uint64_t)(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) {
+            *value = result;
+            return true;
+        }
+    }
+    r->error = true;
+    return false;
+}
+
+void net_write_svarint(cw_writer *w, int64_t value) {
+    net_write_uvarint(w, ((uint64_t)value << 1) ^ (uint64_t)(value >> 63));
+}
+
+bool net_read_svarint(cw_reader *r, int64_t *value) {
+    uint64_t raw;
+    if (!net_read_uvarint(r, &raw)) return false;
+    *value = (int64_t)(raw >> 1) ^ -(int64_t)(raw & 1);
+    return true;
 }

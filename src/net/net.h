@@ -45,7 +45,8 @@ struct net_socket;
 
 bool net_init(void);
 void net_shutdown(void);
-double net_seconds(void);                   // monotonic
+double net_seconds(void);                   // monotonic, for intervals
+double net_wall_seconds(void);              // since the Unix epoch, sub-millisecond: the universe clock
 void net_sleep(double seconds);
 
 net_socket *net_socket_open(uint16_t port);         // 0 for any free port; NULL on failure
@@ -98,6 +99,7 @@ struct net_connection {
 
     double last_received, last_sent;
     uint32_t packets_sent, packets_received, packets_rejected, messages_resent;
+    uint64_t bytes_sent, bytes_received;
 };
 
 void net_connection_init(net_connection *c, net_socket *socket, net_address peer, uint32_t session,
@@ -122,5 +124,12 @@ size_t net_connection_unacked(const net_connection *c);
 bool net_packet_peek(const void *packet, size_t size, uint32_t *session);
 // Modular 16-bit comparison: positive when a is newer than b.
 int net_sequence_compare(uint16_t a, uint16_t b);
+
+// Variable-length integers (LEB128): small values in one byte, up to ten for the
+// largest. Signed values are zigzag-mapped first so small negatives stay small.
+void net_write_uvarint(cw_writer *w, uint64_t value);
+bool net_read_uvarint(cw_reader *r, uint64_t *value);
+void net_write_svarint(cw_writer *w, int64_t value);
+bool net_read_svarint(cw_reader *r, int64_t *value);
 
 #endif

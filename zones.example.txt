@@ -1,0 +1,12 @@
+# Zone servers and the places each one owns (see src/net/zones.h).
+# Every server is started with this same file:
+#   treasure_server --zones zones.txt --zone hub
+#   treasure_server --zones zones.txt --zone planets
+# A player who walks into a place owned by another zone is handed over to it.
+# Ships fly between places on universe time, which every zone reads off the
+# wall clock, so nothing here needs the servers to talk to each other.
+
+secret change-me-before-anyone-can-reach-these-ports
+
+zone hub      127.0.0.1:27500  hub
+zone planets  127.0.0.1:27501  Verdant Ember Azure

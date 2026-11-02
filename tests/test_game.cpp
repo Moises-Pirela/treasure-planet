@@ -38,7 +38,7 @@ static void test_players_stand_and_walls_block(void) {
     game *g = (game *)malloc(sizeof(game));
     game_init(g, CW_HOST);
     game_build_universe(g);
-    cw_entity_id p = game_spawn_player(g, v3_add(g->spawn, v3_make(0, 2, 0)));
+    cw_entity_id p = game_spawn_player(g, v3_add(g->spawn, v3_make(0, 2, 0)), true);
     run_seconds(g, 1.0f);
     CHECK(fabsf(transform_of(g, p)->position.y) < 0.01f);    // landed on the hub
     CHECK(player_of(g, p)->grounded);
@@ -59,7 +59,7 @@ static void test_players_stand_and_walls_block(void) {
     CHECK(player_of(g, p)->grounded);
 
     // Walking off the edge of the world puts you back at the hub.
-    cw_entity_id q = game_spawn_player(g, v3_make(29, 0, 0));
+    cw_entity_id q = game_spawn_player(g, v3_make(29, 0, 0), true);
     walk_to(g, q, 40.0f, 0.0f, 1.0f);
     run_seconds(g, 10.0f);
     CHECK(transform_of(g, q)->position.y > -1.0f);
@@ -82,9 +82,9 @@ static void test_boarding_and_flight(void) {
     v3 hub_dock = ship->hub_dock;
 
     // Alice and Bruno wait where the pier meets the hub; Carol stays in the middle.
-    cw_entity_id alice = game_spawn_player(g, v3_make(hub_dock.x - 1.0f, 0, -28));
-    cw_entity_id bruno = game_spawn_player(g, v3_make(hub_dock.x + 1.0f, 0, -28));
-    cw_entity_id carol = game_spawn_player(g, g->spawn);
+    cw_entity_id alice = game_spawn_player(g, v3_make(hub_dock.x - 1.0f, 0, -28), true);
+    cw_entity_id bruno = game_spawn_player(g, v3_make(hub_dock.x + 1.0f, 0, -28), true);
+    cw_entity_id carol = game_spawn_player(g, g->spawn, true);
     run_seconds(g, 0.2f);
     CHECK(game_ship_at(g, transform_of(g, alice)->position) == CW_INVALID_ENTITY);
 
@@ -165,7 +165,7 @@ static void test_save_and_restore(void) {
     game *a = (game *)malloc(sizeof(game));
     game_init(a, CW_HOST);
     game_build_universe(a);
-    cw_entity_id player = game_spawn_player(a, a->spawn);
+    cw_entity_id player = game_spawn_player(a, a->spawn, true);
     run_seconds(a, 25.0f);     // the skiff is mid-flight by now
 
     cw_snapshot_save_config save = {};

@@ -90,9 +90,7 @@ bool net_component_write(cw_writer *w, game *g, cw_entity_id id, int component) 
         cw_writer_f32(w, s->cruise_height);
         cw_writer_f32(w, s->flight_seconds);
         cw_writer_f32(w, s->dock_seconds);
-        cw_writer_f32(w, s->timer);
-        cw_writer_u8(w, (uint8_t)s->state);
-        cw_writer_u8(w, (uint8_t)s->stop);
+        cw_writer_f32(w, s->phase);   // the derived fields follow from universe time
         return true;
     }
     case NET_C_PLANET: {
@@ -155,12 +153,8 @@ bool net_component_read(cw_reader *r, game *g, cw_entity_id id, int component) {
         cw_reader_f32(r, &s.cruise_height);
         cw_reader_f32(r, &s.flight_seconds);
         cw_reader_f32(r, &s.dock_seconds);
-        cw_reader_f32(r, &s.timer);
-        uint8_t state = 0, stop = 0;
-        cw_reader_u8(r, &state);
-        cw_reader_u8(r, &stop);
-        s.state = state;
-        s.stop = stop;
+        cw_reader_f32(r, &s.phase);
+        game_ship_at_time(&s, game_time_of_tick(g, world->tick));
         return cw_reader_ok(r) && cw_comp_set(world, id, g->c_ship, &s, sizeof(s));
     }
     case NET_C_PLANET: {
@@ -230,12 +224,75 @@ size_t net_entity_size(game *g, cw_entity_id id) {
     return w.size;
 }
 
+void net_connect_write(cw_writer *w, const net_connect_message *m, const net_zone_table *zones) {
+    cw_writer_u32(w, m->version);
+    cw_writer_u32(w, m->nonce);
+    if (!m->has_ticket || !zones) {
+        cw_writer_u16(w, 0);
+        return;
+    }
+    unsigned char ticket[NET_TICKET_SIZE];
+    cw_writer t;
+    cw_writer_init_fixed(&t, ticket, sizeof(ticket));
+    net_ticket_write(&t, &m->ticket, zones);
+    cw_writer_u16(w, (uint16_t)t.size);
+    cw_writer_bytes(w, ticket, t.size);
+}
+
+bool net_connect_read(cw_reader *r, net_connect_message *m, const net_zone_table *zones, bool *bad_ticket) {
+    memset(m, 0, sizeof(*m));
+    *bad_ticket = false;
+    uint16_t size = 0;
+    cw_reader_u32(r, &m->version);
+    cw_reader_u32(r, &m->nonce);
+    cw_reader_u16(r, &size);
+    if (!cw_reader_ok(r)) return false;
+    if (size == 0) return true;
+    cw_reader t;
+    if (!cw_reader_sub(r, size, &t)) return false;
+    if (zones && net_ticket_read(&t, &m->ticket, zones)) m->has_ticket = true;
+    else *bad_ticket = true;
+    return true;
+}
+
+// A redirect's ticket travels as opaque bytes: the client cannot sign or verify it.
+void net_redirect_write(cw_writer *w, const net_redirect *m, const net_zone_table *zones) {
+    cw_writer_u32(w, m->address.ip);
+    cw_writer_u16(w, m->address.port);
+    unsigned char ticket[NET_TICKET_SIZE];
+    cw_writer t;
+    cw_writer_init_fixed(&t, ticket, sizeof(ticket));
+    net_ticket_write(&t, &m->ticket, zones);
+    cw_writer_u16(w, (uint16_t)t.size);
+    cw_writer_bytes(w, ticket, t.size);
+}
+
+bool net_redirect_read(cw_reader *r, net_address *address, unsigned char *ticket, size_t *ticket_size) {
+    uint16_t size = 0;
+    cw_reader_u32(r, &address->ip);
+    cw_reader_u16(r, &address->port);
+    cw_reader_u16(r, &size);
+    if (!cw_reader_ok(r) || size > NET_TICKET_SIZE) return false;
+    *ticket_size = size;
+    return cw_reader_bytes(r, ticket, size);
+}
+
 void net_welcome_write(cw_writer *w, const net_welcome *m) {
     cw_writer_u32(w, m->session);
     cw_writer_i64(w, m->player);
     cw_writer_u32(w, m->tick);
     cw_writer_u8(w, m->tick_hz);
     cw_writer_u8(w, m->snapshot_hz);
+    cw_writer_f64(w, m->universe_base);
+    write_v3(w, m->spawn);
+    cw_writer_u64(w, m->account);
+    cw_writer_u8(w, (uint8_t)m->place_count);
+    for (int i = 0; i < m->place_count; ++i) {
+        write_name(w, m->places[i].name);
+        write_v3(w, m->places[i].center);
+        write_v3(w, m->places[i].half);
+        write_v3(w, m->places[i].spawn);
+    }
 }
 bool net_welcome_read(cw_reader *r, net_welcome *m) {
     cw_reader_u32(r, &m->session);
@@ -243,36 +300,25 @@ bool net_welcome_read(cw_reader *r, net_welcome *m) {
     cw_reader_u32(r, &m->tick);
     cw_reader_u8(r, &m->tick_hz);
     cw_reader_u8(r, &m->snapshot_hz);
-    return cw_reader_ok(r);
-}
-
-void net_snapshot_header_write(cw_writer *w, const net_snapshot_header *h) {
-    cw_writer_u32(w, h->tick);
-    cw_writer_u32(w, h->last_input_seq);
-    cw_writer_u16(w, h->count);
-}
-bool net_snapshot_header_read(cw_reader *r, net_snapshot_header *h) {
-    cw_reader_u32(r, &h->tick);
-    cw_reader_u32(r, &h->last_input_seq);
-    cw_reader_u16(r, &h->count);
-    return cw_reader_ok(r);
-}
-void net_snapshot_entry_write(cw_writer *w, const net_snapshot_entry *e) {
-    cw_writer_i64(w, e->id);
-    write_v3(w, e->position);
-    cw_writer_f32(w, e->yaw);
-    cw_writer_f32(w, e->pitch);
-}
-bool net_snapshot_entry_read(cw_reader *r, net_snapshot_entry *e) {
-    cw_reader_i64(r, &e->id);
-    e->position = read_v3(r);
-    cw_reader_f32(r, &e->yaw);
-    cw_reader_f32(r, &e->pitch);
+    cw_reader_f64(r, &m->universe_base);
+    m->spawn = read_v3(r);
+    cw_reader_u64(r, &m->account);
+    uint8_t count = 0;
+    cw_reader_u8(r, &count);
+    if (count > GAME_MAX_PLACES) return false;
+    m->place_count = count;
+    for (int i = 0; i < m->place_count; ++i) {
+        if (!read_name(r, m->places[i].name)) return false;
+        m->places[i].center = read_v3(r);
+        m->places[i].half = read_v3(r);
+        m->places[i].spawn = read_v3(r);
+    }
     return cw_reader_ok(r);
 }
 
 void net_input_write(cw_writer *w, const net_input_message *m) {
     cw_writer_u32(w, m->seq);
+    cw_writer_u32(w, m->ack_tick);
     cw_writer_u8(w, (uint8_t)m->count);
     for (uint32_t i = 0; i < m->count && i < NET_INPUT_REDUNDANCY; ++i) {
         const PlayerInput *in = &m->inputs[i];
@@ -287,6 +333,7 @@ bool net_input_read(cw_reader *r, net_input_message *m) {
     memset(m, 0, sizeof(*m));
     uint8_t count = 0;
     cw_reader_u32(r, &m->seq);
+    cw_reader_u32(r, &m->ack_tick);
     cw_reader_u8(r, &count);
     if (count == 0 || count > NET_INPUT_REDUNDANCY) return false;
     m->count = count;
@@ -301,22 +348,4 @@ bool net_input_read(cw_reader *r, net_input_message *m) {
         in->jump = jump != 0;
     }
     return cw_reader_ok(r);
-}
-
-void net_ship_state_write(cw_writer *w, const net_ship_state *m) {
-    cw_writer_i64(w, m->id);
-    cw_writer_u8(w, (uint8_t)m->state);
-    cw_writer_u8(w, (uint8_t)m->stop);
-    cw_writer_f32(w, m->timer);
-}
-bool net_ship_state_read(cw_reader *r, net_ship_state *m) {
-    uint8_t state = 0, stop = 0;
-    cw_reader_i64(r, &m->id);
-    cw_reader_u8(r, &state);
-    cw_reader_u8(r, &stop);
-    cw_reader_f32(r, &m->timer);
-    m->state = state;
-    m->stop = stop;
-    return cw_reader_ok(r) && (state == SHIP_DOCKED || state == SHIP_FLYING)
-        && (stop == STOP_HUB || stop == STOP_PLANET);
 }

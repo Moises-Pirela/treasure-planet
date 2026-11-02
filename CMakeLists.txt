@@ -1,9 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(treasure_planet VERSION 0.1.0 LANGUAGES C CXX)
 
-option(TP_BUILD_CLIENT "Build the windowed client; off needs no window system or GPU libraries" ON)
+option(TP_BUILD_CLIENT "Build the windowed client (Windows only for now)" ${WIN32})
 option(TP_BUILD_TESTS "Build the headless tests" ON)
-option(TP_WAYLAND "Also support native Wayland on Linux (X11 always works, including under XWayland)" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,9 +18,8 @@ function(tp_strict target)
         target_compile_options(${target} PRIVATE /W4 /WX /permissive- /GR- /EHs-c- /utf-8)
         target_compile_definitions(${target} PRIVATE _HAS_EXCEPTIONS=0 _CRT_SECURE_NO_WARNINGS NOMINMAX)
     else()
-        # Partial aggregate initialisation is the C idiom here: the rest is zero by definition.
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-missing-field-initializers
-                               -fno-exceptions -fno-rtti)
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti
+            -Wno-missing-field-initializers)
     endif()
 endfunction()
 
@@ -45,8 +43,8 @@ endif()
 # headless, so the server runs on Linux and the tests run the whole stack in-process.
 # ---------------------------------------------------------------------------
 add_library(tp_net STATIC
-    src/net/net_socket.cpp src/net/net_connection.cpp src/net/protocol.cpp
-    src/net/server.cpp src/net/client.cpp)
+    src/net/net_socket.cpp src/net/net_connection.cpp src/net/snapshot.cpp src/net/zones.cpp
+    src/net/protocol.cpp src/net/server.cpp src/net/client.cpp)
 target_link_libraries(tp_net PUBLIC tp_game)
 if(WIN32)
     target_link_libraries(tp_net PUBLIC ws2_32)
@@ -65,10 +63,12 @@ if(TP_BUILD_TESTS)
     enable_testing()
     foreach(name test_ecs test_game test_net)
         add_executable(${name} tests/${name}.cpp)
-        target_link_libraries(${name} PRIVATE tp_net)
         tp_strict(${name})
         add_test(NAME ${name} COMMAND ${name})
     endforeach()
+    target_link_libraries(test_ecs PRIVATE tp_game)
+    target_link_libraries(test_game PRIVATE tp_game)
+    target_link_libraries(test_net PRIVATE tp_net)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -85,23 +85,18 @@ if(TP_BUILD_CLIENT)
     add_library(tp_volk STATIC third_party/volk/volk.c)
     target_include_directories(tp_volk PUBLIC third_party/volk third_party/vulkan)
     target_compile_definitions(tp_volk PUBLIC VK_NO_PROTOTYPES)
-    target_link_libraries(tp_volk PUBLIC ${CMAKE_DL_LIBS})
-
-    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_WAYLAND ${TP_WAYLAND} CACHE BOOL "" FORCE)
-    add_subdirectory(third_party/glfw EXCLUDE_FROM_ALL)
+    if(WIN32)
+        target_compile_definitions(tp_volk PUBLIC VK_USE_PLATFORM_WIN32_KHR)
+    endif()
 
     add_executable(treasure_planet
         src/client/main.cpp
-        src/platform/platform_glfw.cpp
+        src/platform/platform_win32.cpp
         src/render/renderer.cpp
         src/render/backend_gl.cpp
         src/render/backend_vk.cpp)
-    target_include_directories(treasure_planet SYSTEM PRIVATE third_party/gl)
-    target_include_directories(treasure_planet PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    target_link_libraries(treasure_planet PRIVATE tp_net tp_volk glfw)
+    target_include_directories(treasure_planet PRIVATE
+        third_party/gl ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    target_link_libraries(treasure_planet PRIVATE tp_net tp_volk opengl32 user32 gdi32)
     tp_strict(treasure_planet)
 endif()

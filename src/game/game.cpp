@@ -20,6 +20,9 @@ static const float KILL_HEIGHT = -600.0f;   // fell off the world: back to the h
 // then flies a rise / cruise / descend path to the other dock. Whatever is inside
 // its volume when it moves moves with it, so boarding is walking onto the deck,
 // and any number of players (later: cargo) travel by standing there.
+//
+// The timetable is read off universe time rather than integrated, so every server
+// and every client computes the same position for the same moment.
 // ---------------------------------------------------------------------------
 static float smooth(float t) { return t * t * (3.0f - 2.0f * t); }
 
@@ -48,30 +51,39 @@ static bool inside_box(v3 point, v3 center, v3 half) {
         && fabsf(point.z - center.z) <= half.z;
 }
 
-static void system_ships(cw_world *w, cw_phase, float dt) {
+v3 game_ship_at_time(Ship *ship, double universe_time) {
+    // docked at the hub, flying out, docked at the planet, flying back, repeat.
+    double leg = (double)ship->dock_seconds + (double)ship->flight_seconds;
+    double period = 2.0 * leg;
+    double t = fmod(universe_time + (double)ship->phase, period);
+    if (t < 0.0) t += period;
+    bool second_leg = t >= leg;
+    if (second_leg) t -= leg;
+    if (t < (double)ship->dock_seconds) {
+        ship->state = SHIP_DOCKED;
+        ship->stop = second_leg ? STOP_PLANET : STOP_HUB;
+        ship->timer = (float)t;
+        return second_leg ? ship->planet_dock : ship->hub_dock;
+    }
+    ship->state = SHIP_FLYING;
+    ship->stop = second_leg ? STOP_HUB : STOP_PLANET;
+    ship->timer = (float)(t - (double)ship->dock_seconds);
+    return game_ship_position(ship, ship->timer / ship->flight_seconds, !second_leg);
+}
+
+double game_time_of_tick(const game *g, uint64_t tick) {
+    return g->universe_base + (double)tick / (double)GAME_TICK_HZ;
+}
+
+static void system_ships(cw_world *w, cw_phase, float) {
     game *g = game_of(w);
+    double time = game_time_of_tick(g, w->tick + 1);   // where this tick ends
     cw_query ships = cw_query_begin(g->q_ships);
     cw_entity_id id;
     while (cw_query_next(&ships, &id)) {
         Ship *ship = CW_GET(w, id, g->c_ship, Ship);
         Transform *ship_t = CW_GET(w, id, g->c_transform, Transform);
-        ship->timer += dt;
-        v3 before = ship_t->position, after = before;
-        if (ship->state == SHIP_DOCKED) {
-            if (ship->timer >= ship->dock_seconds) {
-                ship->state = SHIP_FLYING;
-                ship->stop = ship->stop == STOP_HUB ? STOP_PLANET : STOP_HUB;
-                ship->timer = 0.0f;
-                cw_comp_touch(w, id, g->c_ship);   // writes through a pointer do not reach observers
-            }
-        } else if (ship->timer >= ship->flight_seconds) {
-            after = ship->stop == STOP_PLANET ? ship->planet_dock : ship->hub_dock;
-            ship->state = SHIP_DOCKED;
-            ship->timer = 0.0f;
-            cw_comp_touch(w, id, g->c_ship);
-        } else {
-            after = game_ship_position(ship, ship->timer / ship->flight_seconds, ship->stop == STOP_PLANET);
-        }
+        v3 before = ship_t->position, after = game_ship_at_time(ship, time);
         ship_t->position = after;
         v3 delta = v3_sub(after, before);
         if (delta.x == 0.0f && delta.y == 0.0f && delta.z == 0.0f) continue;
@@ -89,8 +101,7 @@ static void system_ships(cw_world *w, cw_phase, float dt) {
 }
 
 // Ship parts are derived state: hull transform plus a fixed offset, for both the
-// current and the previous position. Shared with clients, who receive only the hull
-// over the network and place the dozen parts of each ship themselves.
+// current and the previous position.
 static void system_attachments(cw_world *w, cw_phase, float) {
     game *g = game_of(w);
     cw_query parts = cw_query_begin(g->q_attachments);
@@ -114,8 +125,6 @@ static bool overlaps(v3 feet, v3 center, v3 half) {
         && feet.z + PLAYER_RADIUS > center.z - half.z && feet.z - PLAYER_RADIUS < center.z + half.z;
 }
 
-static float *axis_of(v3 *v, int axis) { return axis == 0 ? &v->x : axis == 1 ? &v->y : &v->z; }
-
 // Moves along one axis and stops at the first solid crossed. A solid the player is
 // well inside (a ship landed on them) is ignored, so nobody can get stuck; "well"
 // because a carried player can sit a rounding error below the deck they stand on,
@@ -124,7 +133,7 @@ static float *axis_of(v3 *v, int axis) { return axis == 0 ? &v->x : axis == 1 ? 
 static bool move_axis(game *g, Transform *t, int axis, float amount, bool can_step) {
     cw_world *w = &g->world;
     v3 from = t->position, to = from;
-    *axis_of(&to, axis) += amount;
+    (&to.x)[axis] += amount;
     bool blocked = false;
     cw_query solids = cw_query_begin(g->q_solids);
     cw_entity_id id;
@@ -150,10 +159,9 @@ static bool move_axis(game *g, Transform *t, int axis, float amount, bool can_st
             }
         }
         blocked = true;
-        v3 half = solid->half;
-        float near_face = *axis_of(&center, axis) - (amount > 0.0f ? 1.0f : -1.0f) * *axis_of(&half, axis);
+        float near_face = (&center.x)[axis] - (amount > 0.0f ? 1.0f : -1.0f) * (&solid->half.x)[axis];
         float reach = axis == 1 ? (amount > 0.0f ? PLAYER_HEIGHT : 0.0f) : (amount > 0.0f ? PLAYER_RADIUS : -PLAYER_RADIUS);
-        *axis_of(&to, axis) = near_face - reach;
+        (&to.x)[axis] = near_face - reach;
     }
     t->position = to;
     return blocked;
@@ -254,14 +262,16 @@ void game_init(game *g, cw_sim_role role) {
     g->q_players = cw_query_create(w, cw_filter_all(cw_mask(players, 3)));
     g->q_ships = cw_query_create(w, cw_filter_all(cw_mask(ships, 2)));
     g->q_attachments = cw_query_create(w, cw_filter_all(cw_mask(parts, 2)));
-    cw_component_id movers[] = {g->c_player, g->c_ship};
-    g->q_dynamic = cw_query_create(w, cw_filter_make(cw_mask(&g->c_transform, 1), cw_mask(movers, 2), cw_signature{}));
+    cw_component_id all_players[] = {g->c_transform, g->c_player};
+    g->q_all_players = cw_query_create(w, cw_filter_all(cw_mask(all_players, 2)));
 
+    // Every movement system is shared: a client runs them on its own player and on
+    // the ships, which is prediction. Only what a server adds is host-only.
     cw_system_desc d = {};
     d.name = "remember_positions";
     d.phases = CW_PHASE(CW_EARLY_UPDATE);
     d.fn = system_remember_positions;
-    d.authority = CW_HOST_ONLY;
+    d.authority = CW_SHARED;
     d.order = 0;
     cw_sim_register(&g->sim, d);
     d.name = "ships";
@@ -271,12 +281,10 @@ void game_init(game *g, cw_sim_role role) {
     cw_sim_register(&g->sim, d);
     d.name = "attachments";
     d.fn = system_attachments;
-    d.authority = CW_SHARED;
     d.order = 15;
     cw_sim_register(&g->sim, d);
     d.name = "players";
     d.fn = system_players;
-    d.authority = CW_HOST_ONLY;
     d.order = 20;
     cw_sim_register(&g->sim, d);
 }
@@ -288,9 +296,21 @@ void game_destroy(game *g) {
 
 void game_tick(game *g) { cw_sim_tick(&g->sim, &g->world, 1.0f / (float)GAME_TICK_HZ); }
 
-void game_client_frame(game *g) {
-    cw_sim_dispatch(&g->sim, &g->world, CW_UPDATE, 0.0f);   // shared systems only: attachments
-    cw_sim_entity_lifecycle(&g->sim, &g->world, 0.0f);
+void game_place_ships(game *g) {
+    cw_world *w = &g->world;
+    double time = game_time_of_tick(g, w->tick);
+    cw_query ships = cw_query_begin(g->q_ships);
+    cw_entity_id id;
+    while (cw_query_next(&ships, &id)) {
+        Transform *t = CW_GET(w, id, g->c_transform, Transform);
+        t->position = t->previous = game_ship_at_time(CW_GET(w, id, g->c_ship, Ship), time);
+    }
+    system_attachments(w, CW_UPDATE, 0.0f);
+}
+
+void game_replay_tick(game *g) {
+    cw_sim_replay(&g->sim, &g->world, 1.0f / (float)GAME_TICK_HZ);   // shared CW_UPDATE systems only
+    ++g->world.tick;
 }
 
 v3 game_player_color(cw_entity_id id) {
@@ -310,7 +330,7 @@ v3 game_player_color(cw_entity_id id) {
     }
 }
 
-cw_entity_id game_spawn_player(game *g, v3 position) {
+cw_entity_id game_spawn_player(game *g, v3 position, bool with_input) {
     cw_world *w = &g->world;
     cw_entity_id id = cw_world_create_entity(w);
     Transform t = {position, position};
@@ -319,7 +339,7 @@ cw_entity_id game_spawn_player(game *g, v3 position) {
     Visual visual = {MESH_CAPSULE, v3_make(1, 1, 1), game_player_color(id)};
     cw_comp_set(w, id, g->c_transform, &t, sizeof(t));
     cw_comp_set(w, id, g->c_player, &p, sizeof(p));
-    cw_comp_set(w, id, g->c_input, &in, sizeof(in));
+    if (with_input) cw_comp_set(w, id, g->c_input, &in, sizeof(in));
     cw_comp_set(w, id, g->c_visual, &visual, sizeof(visual));
     return id;
 }
@@ -346,6 +366,14 @@ cw_entity_id game_find_ship(game *g, const char *name) {
     return CW_INVALID_ENTITY;
 }
 
-size_t game_player_count(game *g) {
-    return cw_query_count_filter(&g->world, cw_filter_all(cw_mask(&g->c_player, 1)), SIZE_MAX);
+int game_place_at(const game *g, v3 point) {
+    for (int i = 0; i < g->place_count; ++i)
+        if (inside_box(point, g->places[i].center, g->places[i].half)) return i;
+    return -1;
+}
+
+int game_find_place(const game *g, const char *name) {
+    for (int i = 0; i < g->place_count; ++i)
+        if (strcmp(g->places[i].name, name) == 0) return i;
+    return -1;
 }

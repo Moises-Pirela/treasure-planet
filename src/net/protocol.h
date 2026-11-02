@@ -7,47 +7,45 @@
 // never silently changes the wire. Bump NET_PROTOCOL_VERSION when a message changes.
 //
 // Joining:
-//   client  MSG_CONNECT ---------------------------> server     (unreliable, repeated)
-//   client <--------------------------- MSG_WELCOME  server     (reliable: session, your entity)
+//   client  MSG_CONNECT ---------------------------> server     (unreliable, repeated; a ticket if handed over)
+//   client <--------------------------- MSG_WELCOME  server     (reliable: session, your entity, the clock)
 //   client <--- MSG_SPAWN x N, MSG_BASELINE_END ---  server     (reliable: the whole world)
 // Playing, every tick or snapshot:
-//   client  MSG_INPUT -----------------------------> server     (unreliable, last few inputs)
-//   client <------------------------- MSG_SNAPSHOT  server     (unreliable: who is where)
+//   client  MSG_INPUT -----------------------------> server     (unreliable, one per tick, the last few repeated)
+//   client <------------------------- MSG_SNAPSHOT  server     (unreliable: players, delta-coded; snapshot.h)
 //   client <------------- MSG_SPAWN / MSG_DESPAWN   server     (reliable: joins, leaves)
-//   client <--------------------- MSG_SHIP_STATE    server     (reliable: departures, arrivals)
+// Changing zone:
+//   client <------------------------- MSG_REDIRECT  server     (reliable: the other zone and a signed ticket)
+//   client  MSG_CONNECT + ticket -----------> other server
 // Either side may send MSG_DISCONNECT; silence for longer than the timeout is the same.
-//
-// Sharding: a zone server owns one region of the universe. MSG_REDIRECT tells a
-// client which server owns the region it is entering; entity ids are 64-bit so each
-// shard can be given its own range and a client can hold entities from several at once.
 #ifndef TP_PROTOCOL_H
 #define TP_PROTOCOL_H
 
 #include "../game/game.h"
 #include "net.h"
+#include "snapshot.h"
+#include "zones.h"
 
 #define NET_SNAPSHOT_HZ 20
 #define NET_INPUT_REDUNDANCY 3       // inputs per MSG_INPUT: the newest and the ones before it
-#define NET_MAX_SNAPSHOT_ENTRIES 40  // per MSG_SNAPSHOT; larger sets span several messages
 #define NET_TIMEOUT 5.0              // seconds of silence before a peer is gone
 #define NET_KEEPALIVE 0.5            // seconds of nothing to say before saying so
 
 enum net_message_type {
-    MSG_CONNECT = 1,         // client -> server: u32 protocol version, u32 nonce
+    MSG_CONNECT = 1,         // client -> server: net_connect_message
     MSG_WELCOME,             // server -> client: net_welcome
     MSG_REJECT,              // server -> client: u8 net_reject_reason
     MSG_SPAWN,               // server -> client: u16 count, then entity records (net_entity_write)
     MSG_DESPAWN,             // server -> client: u16 count, i64 ids
     MSG_BASELINE_END,        // server -> client: the world so far is complete
-    MSG_SNAPSHOT,            // server -> client: net_snapshot_header, then entries
+    MSG_SNAPSHOT,            // server -> client: snapshot_encode
     MSG_INPUT,               // client -> server: net_input_message
     MSG_KEEPALIVE,           // either: empty
     MSG_DISCONNECT,          // either: empty
-    MSG_REDIRECT,            // server -> client: u32 ip, u16 port of the shard to join (reserved)
-    MSG_SHIP_STATE,          // server -> client: net_ship_state
+    MSG_REDIRECT,            // server -> client: net_redirect
 };
 
-enum net_reject_reason { REJECT_VERSION = 1, REJECT_FULL };
+enum net_reject_reason { REJECT_VERSION = 1, REJECT_FULL, REJECT_TICKET };
 
 // The components that cross the wire, in their own numbering so the game's
 // component ids (assigned at runtime) never leak into the protocol.
@@ -56,38 +54,34 @@ enum net_component {
     NET_C_COUNT
 };
 
+struct net_connect_message {
+    uint32_t version, nonce;
+    bool has_ticket;
+    net_ticket ticket;
+};
+
 struct net_welcome {
     uint32_t session;
     cw_entity_id player;
-    uint32_t tick;
+    uint32_t tick;               // the server's tick as it sent this
     uint8_t tick_hz, snapshot_hz;
-};
-
-struct net_snapshot_header {
-    uint32_t tick;               // server tick the positions are from
-    uint32_t last_input_seq;     // newest input the server had applied, for the client's RTT
-    uint16_t count;
-};
-struct net_snapshot_entry {
-    cw_entity_id id;
-    v3 position;
-    float yaw, pitch;
+    double universe_base;        // universe time at the server's tick zero
+    v3 spawn;                    // where players come back after falling off the world
+    uint64_t account;
+    game_place places[GAME_MAX_PLACES];
+    int place_count;
 };
 
 struct net_input_message {
     uint32_t seq;                // of the newest input; the ones before it count down
+    uint32_t ack_tick;           // newest snapshot the client holds, the base for the next delta
     uint32_t count;              // 1..NET_INPUT_REDUNDANCY, oldest first
     PlayerInput inputs[NET_INPUT_REDUNDANCY];
 };
 
-// A ship's timetable position, sent when it departs or arrives. Between these the client
-// counts the timer on by itself: it only drives what players read, and the positions
-// that matter arrive in snapshots.
-struct net_ship_state {
-    cw_entity_id id;
-    int state;                   // ship_state
-    int stop;                    // ship_stop
-    float timer;
+struct net_redirect {
+    net_address address;
+    net_ticket ticket;
 };
 
 cw_component_id net_component_id(const game *g, int component);
@@ -102,15 +96,16 @@ bool net_entity_write(cw_writer *w, game *g, cw_entity_id id);
 bool net_entity_read(cw_reader *r, game *g, cw_entity_id *id);
 size_t net_entity_size(game *g, cw_entity_id id);
 
+// Tickets are signed with the zone table's secret; a NULL table means none is carried.
+void net_connect_write(cw_writer *w, const net_connect_message *m, const net_zone_table *zones);
+// A ticket that fails its signature leaves has_ticket false and sets *bad_ticket.
+bool net_connect_read(cw_reader *r, net_connect_message *m, const net_zone_table *zones, bool *bad_ticket);
 void net_welcome_write(cw_writer *w, const net_welcome *m);
 bool net_welcome_read(cw_reader *r, net_welcome *m);
-void net_snapshot_header_write(cw_writer *w, const net_snapshot_header *h);
-bool net_snapshot_header_read(cw_reader *r, net_snapshot_header *h);
-void net_snapshot_entry_write(cw_writer *w, const net_snapshot_entry *e);
-bool net_snapshot_entry_read(cw_reader *r, net_snapshot_entry *e);
 void net_input_write(cw_writer *w, const net_input_message *m);
 bool net_input_read(cw_reader *r, net_input_message *m);
-void net_ship_state_write(cw_writer *w, const net_ship_state *m);
-bool net_ship_state_read(cw_reader *r, net_ship_state *m);
+void net_redirect_write(cw_writer *w, const net_redirect *m, const net_zone_table *zones);
+// The ticket is opaque to the client: it is copied out for the next MSG_CONNECT.
+bool net_redirect_read(cw_reader *r, net_address *address, unsigned char *ticket, size_t *ticket_size);
 
 #endif

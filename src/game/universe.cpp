@@ -84,11 +84,11 @@ static void spawn_ship(game *g, const planet_row *row, cw_entity_id planet, v3 h
     ship.cruise_height = 40.0f;
     ship.flight_seconds = row->flight_seconds;
     ship.dock_seconds = row->dock_seconds;
-    ship.state = SHIP_DOCKED;
-    ship.stop = STOP_HUB;
+    ship.phase = 0.0f;           // every ship starts its timetable docked at the hub
+    v3 at = game_ship_at_time(&ship, game_time_of_tick(g, g->world.tick));
 
     cw_entity_id id = cw_world_create_entity(w);
-    Transform t = {hub_dock, hub_dock};
+    Transform t = {at, at};
     cw_comp_set(w, id, g->c_transform, &t, sizeof(t));
     cw_comp_set(w, id, g->c_ship, &ship, sizeof(ship));
 
@@ -108,11 +108,25 @@ static void spawn_ship(game *g, const planet_row *row, cw_entity_id planet, v3 h
         spawn_part(g, id, hub_dock, row->parts[i].offset, row->parts[i].half, row->parts[i].color);
 }
 
+static void declare_place(game *g, const char *name, v3 center, v3 half, v3 spawn) {
+    if (g->place_count == GAME_MAX_PLACES) return;
+    game_place *place = &g->places[g->place_count++];
+    memset(place, 0, sizeof(*place));
+    strncpy(place->name, name, GAME_NAME_CAPACITY - 1);
+    place->center = center;
+    place->half = half;
+    place->spawn = spawn;
+}
+
 static void spawn_planet(game *g, const planet_row *row) {
     cw_world *w = &g->world;
     // The landing pad butts against the ship's stern, level with its deck.
     v3 pad = v3_make(row->dock.x, row->dock.y - 1.0f, row->dock.z + row->deck_half_z + PAD_HALF);
     spawn_block(g, pad, v3_make(PAD_HALF, 1.0f, PAD_HALF), v3_scale(row->color, 1.3f));
+    // Standing anywhere over the pad is being at the planet; the docked ship's deck
+    // is not, so a passenger who stays aboard rides back.
+    declare_place(g, row->planet, v3_add(pad, v3_make(0, 20.0f, 0)), v3_make(PAD_HALF, 21.0f, PAD_HALF),
+                  v3_add(pad, v3_make(0, 1.0f, 10.0f)));
     spawn_block(g, v3_add(pad, v3_make(10, 2.0f, 8)), v3_make(2, 1, 2), v3_scale(row->color, 0.8f));
     spawn_block(g, v3_add(pad, v3_make(-14, 2.5f, 15)), v3_make(3, 1.5f, 2), v3_scale(row->color, 0.7f));
 
@@ -134,6 +148,9 @@ static void spawn_planet(game *g, const planet_row *row) {
 
 void game_build_universe(game *g) {
     g->spawn = v3_make(0.0f, 0.0f, 12.0f);
+    // The hub and its piers; the ships docked at their ends are not part of it.
+    declare_place(g, "hub", v3_make(0, 20.0f, -PIER_LENGTH * 0.5f),
+                  v3_make(HUB_HALF + 5.0f, 21.0f, HUB_HALF + PIER_LENGTH * 0.5f), g->spawn);
     v3 stone = v3_make(0.5f, 0.5f, 0.55f);
     spawn_block(g, v3_make(0, -1.0f, 0), v3_make(HUB_HALF, 1.0f, HUB_HALF), stone);
     spawn_block(g, v3_make(0, 3.0f, 22.0f), v3_make(8, 3, 2), v3_scale(stone, 0.7f));      // a terminal

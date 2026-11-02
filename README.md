@@ -6,37 +6,16 @@ A first-person multiplayer MMORPG in C-style C++. Players gather in a hub world 
 
 ## Build and run
 
-The Vulkan headers, the Vulkan function loader (volk), GLFW and the compiled shaders are all in the repository, so no machine needs the Vulkan SDK to build or play. It is only for editing shaders and for validation layers. Each platform needs a compiler, CMake, and a graphics driver:
-
-**Windows:** Visual Studio with the C++ tools and its CMake component.
+Needs Visual Studio with the C++ tools and its CMake component. Everything else is in the repository, and the Vulkan SDK is optional. The server and the tests also build on Linux with CMake and GCC or Clang.
 
 ```powershell
-.\build.ps1            # debug build, then the tests. -Release for optimised
+.\build.ps1            # debug build, then the tests
+.\build.ps1 -Release
 build\debug\treasure_planet.exe                 # alone: Vulkan, falling back to OpenGL
 build\debug\treasure_planet.exe --renderer gl
 ```
 
-**Linux (X11, or Wayland through XWayland):**
-
-```sh
-sudo apt install build-essential cmake libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libvulkan1 mesa-vulkan-drivers
-./build.sh             # debug build, then the tests. --release for optimised
-build/debug/treasure_planet
-```
-
-A VM without GPU passthrough still runs the game, slowly, on Mesa's software drivers. For a machine that only runs the server, the simulation and the tests, `./build.sh --headless` needs just a compiler and CMake. Configure with `-DTP_WAYLAND=ON` for native Wayland, which also needs `libwayland-dev` and `libxkbcommon-dev`.
-
-**macOS:** the Xcode command line tools, plus CMake and MoltenVK, which implements Vulkan on top of Metal.
-
-```sh
-brew install cmake molten-vk
-./build.sh
-build/debug/treasure_planet
-```
-
-macOS only runs the Vulkan backend, because its OpenGL stops at 4.1 and this game's needs 4.5.
-
-Multiplayer is a server and any number of clients (paths as on Windows; Linux and macOS drop the `.exe`):
+Multiplayer is a server and any number of clients:
 
 ```powershell
 build\debug\treasure_server.exe                           # listens on UDP 27500
@@ -45,7 +24,7 @@ build\debug\treasure_planet.exe --connect 127.0.0.1        # ...so start two
 build\debug\treasure_bots.exe --connect 127.0.0.1 --count 50    # headless players, for load
 ```
 
-`treasure_server` takes `--port N`, `--max-clients N` (default 64) and `--interest METRES` (only send players within that distance of each other; the default sends everyone). The window title shows the connection state, the player count and the round trip.
+`treasure_server` takes `--port N`, `--max-clients N` (default 64), `--interest METRES` (only send players within that distance of each other; the default sends everyone), `--trace` (log every player's position once a second) and, for several servers sharing the universe, `--zones FILE --zone NAME` (see Multiplayer below). The window title shows the connection state, the player count, the input round trip and the number of zone hand-offs so far.
 
 | Input | Action |
 | --- | --- |
@@ -61,15 +40,16 @@ Ships keep a timetable, so be aboard before they leave. The window title shows t
 ```
 src/ecs/        the ECS, ported from clockwork-c
 src/game/       the simulation: components, systems and the universe's content. No window, no renderer
-src/net/        the multiplayer stack: UDP transport, wire protocol, zone server, replica client
+src/net/        the multiplayer stack: UDP transport, wire protocol, snapshots, zones and tickets,
+                the zone server, the predicting client
 src/server/     the headless server executable
 src/tools/      the bots executable
 src/render/     the renderer API and its two backends
-src/platform/   window, input and graphics setup, on GLFW
+src/platform/   window, input and GL context (Windows only for now)
 src/client/     the game loop: input in, ticks or packets, draws out
 tests/          headless tests of the ECS, the game, and the whole network stack over loopback
 tools/          shader compilation, capture comparison
-third_party/    GL and Vulkan headers, volk, GLFW
+third_party/    GL and Vulkan headers, volk
 ```
 
 The dependencies point one way: `client -> net -> game -> ecs`, and `client -> render -> platform`. The game and the network stack cannot see the renderer or the window, so the server links `tp_net` alone and runs anywhere.
@@ -92,24 +72,35 @@ Adding a planet with its ship is one row in `PLANETS` in [universe.cpp](src/game
 
 ## Multiplayer
 
-The server is the only simulation. A client never moves anything: it sends its input and draws a replica of the server's world. The same `game` code serves both, in two roles: a `CW_HOST` game runs every system, a `CW_CLIENT` game is a replica the ECS refuses to simulate (systems marked `CW_HOST_ONLY` are skipped), leaving only derived state such as ship parts following their hull.
+The server is the only authority. A client sends inputs and receives the world; what it simulates itself, it simulates only to hide latency, and the server's word replaces it whenever they disagree. The same `game` code runs in both roles: a `CW_HOST` game owns the truth, a `CW_CLIENT` game is a replica that predicts what it can.
 
-Everything goes over one UDP socket per peer, in packets of at most 1200 bytes ([net.h](src/net/net.h)). A connection carries two channels: **unreliable** for anything superseded by the next packet, and **reliable, ordered** (cumulative acks, retransmission, a 64-message window with a backlog behind it) for anything that must arrive. The wire format is explicit, little-endian, field by field ([protocol.h](src/net/protocol.h)); no struct is ever copied raw, so a Windows client and a Linux server agree.
+**Transport.** Everything goes over one UDP socket per peer, in packets of at most 1200 bytes ([net.h](src/net/net.h)). A connection carries two channels: **unreliable** for anything superseded by the next packet, and **reliable, ordered** (cumulative acks, retransmission, a 64-message window with a backlog behind it) for anything that must arrive. The wire format is explicit, little-endian, field by field ([protocol.h](src/net/protocol.h)); no struct is ever copied raw, so a Windows client and a Linux server agree.
 
-Joining: the client repeats `CONNECT` until the server answers with a reliable `WELCOME` (the session id, the client's player entity), then streams the whole world as `SPAWN` records and ends with `BASELINE_END`. Entity ids are the server's, mirrored exactly, so nothing needs translating. Playing: the client sends its input 60 times a second (each message repeats the last three, so a lost packet drops nothing; a jump pressed in any of them still counts), the server applies the newest before each tick, and 20 times a second sends every client a `SNAPSHOT` of the dynamic entities it is interested in: ships always, other players within the interest radius. Joins and leaves arrive as reliable `SPAWN`/`DESPAWN`, and ship departures and arrivals as reliable `SHIP_STATE`; between those the client counts each ship's timer on by itself.
+**Joining.** The client repeats `CONNECT` until the server answers with a reliable `WELCOME` (the session, the client's player entity, the universe clock), then streams the whole world as `SPAWN` records and ends with `BASELINE_END`. Entity ids are the server's, mirrored exactly. Joins and leaves arrive later as reliable `SPAWN`/`DESPAWN`.
 
-The client keeps a short history of samples per moving entity and renders 100 ms behind the server's clock, interpolating between the two samples around that time. Remote players are smooth at 20 Hz and a lost snapshot costs nothing. The local player is rendered the same way, so their own movement shows one round trip plus the delay late; client side prediction is the next step and this layout (authoritative samples kept apart from the rendered `Transform`) is where it plugs in.
+**Universe time and ships.** Ships follow a timetable read off *universe time*, the wall clock shared by every server and client, rather than integrating their motion. So a ship is a pure function of time: two servers that have never spoken put it in the same place, a client predicts it exactly, and snapshots never mention ships at all. (`treasure_server --universe-epoch` shifts the clock, for tests; every zone must be given the same value.)
 
-**Scaling.** The unit is the zone server ([server.h](src/net/server.h)): one authoritative game, one socket, one client table, single-threaded, nothing global. Within a zone, per-client cost is bounded by the interest radius rather than the population; across zones, sharding is running more of them, each owning a region of the universe (the hub, a planet) and handing players over with `REDIRECT` as they cross a boundary, which ships flying between regions make a natural event. Entity ids are 64-bit so each shard can own a range and a client can hold entities from several at once. `REDIRECT` is reserved in the protocol and not yet implemented; one zone serves the whole universe today.
+**Prediction.** The client runs the real movement systems on its own player, one tick ahead of the server, numbering every input and remembering the position each one led to. The server queues inputs and consumes exactly one per tick (holding two as a jitter buffer), and each snapshot says which input it had applied. The client then sets its player to the server's state at that tick, replays the inputs the server has not seen yet with `game_replay_tick`, and compares. Usually the result is identical to the millimetre; when it is not (a collision the server saw first, a late input the server had to repeat), the simulation is corrected at once and the picture catches up through a view offset that fades in a tenth of a second. The replay also anchors the client's tick counter to the server's, which is what keeps the predicted ships where the server has them, passengers included. Players a client does not own are not simulated: they arrive in snapshots and are rendered 100 ms behind the server's clock, interpolated between samples, in the frame of the ship they stand on.
 
-[tests/test_net.cpp](tests/test_net.cpp) runs the whole stack in one process over loopback: a server and two clients that see each other as capsules, movement arriving on the other side, a player leaving, a third joining, all of it again through 25-30% simulated packet loss, and the rejections (full server, wrong version, no server).
+**Snapshots** ([snapshot.h](src/net/snapshot.h)) are quantised (millimetres, 16-bit angles) and delta-coded against the last snapshot the client acknowledged: a player standing still costs two bytes, a moving one six or so, and a snapshot that gets lost costs nothing but the next one being coded against an older base. Players are prioritised by distance within the packet budget, and an interest radius (`--interest`) leaves distant players out altogether, so a client's traffic is bounded by how crowded its surroundings are, not by the population. Four players walking together is about 1 KB/s each.
+
+**Zones** ([zones.h](src/net/zones.h), [server.h](src/net/server.h)). The universe is divided by *place*: the hub, each planet's landing pad. A zone server owns some places and every player standing in them; it simulates the whole static universe and every ship regardless, since those cost nothing and agree everywhere. When a player walks into a place another zone owns, their server issues a *ticket* (their state, signed with the shared secret by SipHash) and redirects the client; the client connects to the new zone with the ticket, builds the new world alongside the old one, and switches only once it is complete, bridging the two predictions with the same view offset that hides mispredictions. Servers never talk to each other. A ship flight from the hub to a planet is therefore a hand-off between processes, and [zones.example.txt](zones.example.txt) is everything needed to run two of them. Today a zone is one process and one core; the next step up is several zones per process and a directory service in place of the static file.
+
+```powershell
+build\debug\treasure_server.exe --zones zones.example.txt --zone hub
+build\debug\treasure_server.exe --zones zones.example.txt --zone planets
+build\debug\treasure_planet.exe --connect 127.0.0.1:27500
+build\debug\treasure_bots.exe --connect 127.0.0.1:27500 --count 3 --ride     # ride the ships between zones
+```
+
+[tests/test_net.cpp](tests/test_net.cpp) runs all of it in one process over loopback: the reliable channel through 30% loss, the snapshot codec, ticket signatures (against the SipHash reference vector), two clients seeing each other as capsules with prediction agreeing with the server to the millimetre, a player leaving and another joining, the same again through 25% loss, the rejections, and two zones handing a player over, with a forged ticket refused.
 
 ## The renderer
 
 Callers create meshes and submit a frame, which is a camera, a sun and a list of draws. They never see a graphics API. Each backend implements the small table in [backend.h](src/render/backend.h):
 
-- **Vulkan 1.1**, loaded at runtime through volk, so machines without a driver still start. On macOS it runs on MoltenVK.
-- **OpenGL 4.5** core with direct state access, on Windows and Linux.
+- **Vulkan 1.1**, loaded at runtime through volk, so machines without a driver still start.
+- **OpenGL 4.5** core with direct state access.
 
 Both use the same shader source ([mesh.glsl](src/render/shaders/mesh.glsl)) and the same conventions: y-up clip space, and reversed depth with an infinite far plane on a 32-bit float buffer, so a deck rail and a distant planet share a depth buffer without fighting.
 
@@ -120,10 +111,10 @@ To check that the backends agree, capture the same scripted scene with each and 
 ```powershell
 build\debug\treasure_planet.exe --renderer vulkan --capture vk.bmp --ticks 60
 build\debug\treasure_planet.exe --renderer gl --capture gl.bmp --ticks 60
-python tools\compare_captures.py vk.bmp gl.bmp 8
+python tools\compare_captures.py vk.bmp gl.bmp
 ```
 
-`--at X Y Z` and `--look YAW PITCH` place the camera. Expect a handful of differing pixels out of 921,600, along triangle edges, because the two APIs break rasterisation ties differently. The last argument is how many differing pixels to allow.
+`--at X Y Z` and `--look YAW PITCH` place the camera. Expect a handful of differing pixels out of 921,600, along triangle edges: the two APIs break rasterisation ties differently.
 
 ## Licences
 

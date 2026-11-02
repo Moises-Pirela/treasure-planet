@@ -12,6 +12,8 @@
 
 #define MOUSE_RADIANS_PER_COUNT 0.0025f
 #define MAX_PITCH 1.5f
+#define KEY_ESCAPE 0x1B
+#define KEY_SPACE 0x20
 #define STAR_COUNT 900
 
 struct options {
@@ -186,6 +188,7 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
     if (cw_world_is_valid(w, player)) {
         const Transform *pt = CW_GET(w, player, g->c_transform, Transform);
         eye = eye_of(v3_lerp(pt->previous, pt->position, alpha));
+        if (net) eye = v3_add(eye, net_client_view_offset(net));   // a fading misprediction
     }
     m4 view = m4_look_to(eye, look_direction(yaw, pitch));
     m4 projection = m4_perspective(70.0f * TP_PI / 180.0f, (float)width / (float)height, 0.1f);
@@ -252,7 +255,7 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
 // camera's and persist between frames.
 static PlayerInput read_input(plat_window *window, float *yaw, float *pitch) {
     const plat_input *input = plat_window_input(window);
-    if (input->keys[PLAT_KEY_ESCAPE]) plat_window_capture_mouse(window, false);
+    if (input->keys[KEY_ESCAPE]) plat_window_capture_mouse(window, false);
     if (input->clicked) plat_window_capture_mouse(window, true);
     if (input->mouse_captured) {
         *yaw -= input->mouse_dx * MOUSE_RADIANS_PER_COUNT;
@@ -263,7 +266,7 @@ static PlayerInput read_input(plat_window *window, float *yaw, float *pitch) {
     PlayerInput in = {};
     in.forward = (input->keys['W'] ? 1.0f : 0.0f) - (input->keys['S'] ? 1.0f : 0.0f);
     in.strafe = (input->keys['D'] ? 1.0f : 0.0f) - (input->keys['A'] ? 1.0f : 0.0f);
-    in.jump = input->keys[PLAT_KEY_SPACE];
+    in.jump = input->keys[KEY_SPACE];
     in.yaw = *yaw;
     in.pitch = *pitch;
     return in;
@@ -278,28 +281,21 @@ static const char *net_state_name(net_client_state state) {
     }
 }
 
-// Online: the world is the server's. Input goes out every tick, snapshots come back,
-// and what is drawn is the replica interpolated a little behind the server's clock.
+// Online: the world is the server's. The session predicts our player and the ships
+// and interpolates everyone else; we hand it the input and draw what it holds.
 static int run_online(const options *o, plat_window *window, renderer *r, const char *backend,
                       const r_mesh *meshes, r_mesh stars, draw_list *list, float *yaw, float *pitch) {
     if (!net_init()) {
         fputs("the network could not be initialised\n", stderr);
         return 1;
     }
-    game *g = (game *)malloc(sizeof(game));
-    game_init(g, CW_CLIENT);
-    net_client *net = (net_client *)malloc(sizeof(net_client));
-    if (!net_client_init(net, g, o->connect, NET_INTERP_DELAY)) {
-        fprintf(stderr, "could not resolve %s\n", o->connect);
-        game_destroy(g);
-        free(g);
-        free(net);
+    net_session session;
+    if (!net_session_init(&session, o->connect, NET_INTERP_DELAY)) {
+        fprintf(stderr, "%s: %s\n", o->connect, session.failure);
         net_shutdown();
         return 1;
     }
-    char address[32];
-    net_address_format(net->server, address, sizeof(address));
-    fprintf(stderr, "connecting to %s\n", address);
+    fprintf(stderr, "connecting to %s\n", o->connect);
 
     double last_status = 0.0;
     int status = 0;
@@ -307,31 +303,28 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
     while (plat_window_poll(window)) {
         PlayerInput in = read_input(window, yaw, pitch);
         double now = net_seconds();
-        net_client_send_input(net, &in, now);
-        net_client_update(net, now);
-        if (net->state == NC_DISCONNECTED) {
-            fprintf(stderr, "disconnected: %s\n", net->failure);
+        net_session_frame(&session, &in, now);
+        net_client_state state = net_session_state(&session);
+        if (state == NC_DISCONNECTED) {
+            fprintf(stderr, "disconnected: %s\n", session.failure);
             status = 1;
             break;
         }
-        if (net->state == NC_CONNECTED) {
-            net_client_resolve(net, now);
-            game_client_frame(g);
-        }
+        game *g = session.world;
+        net_client *link = session.link;
+        cw_entity_id player = state == NC_CONNECTED ? link->player : CW_INVALID_ENTITY;
         if (now - last_status > 0.25) {
-            char prefix[160];
-            snprintf(prefix, sizeof(prefix), "Treasure Planet [%s] %s %s, %zu players, %.0f ms", backend, address,
-                     net_state_name(net->state), game_player_count(g), net->rtt * 1000.0f);
-            set_status(window, g, net->state == NC_CONNECTED ? net->player : CW_INVALID_ENTITY, prefix);
+            char address[32], prefix[200];
+            net_address_format(link->server, address, sizeof(address));
+            snprintf(prefix, sizeof(prefix), "Treasure Planet [%s] %s %s, %zu players, %.0f ms, %d hand-offs", backend,
+                     address, net_state_name(state), cw_query_count(g->q_all_players), link->rtt * 1000.0f,
+                     session.handoffs);
+            set_status(window, g, player, prefix);
             last_status = now;
         }
-        draw_world(r, window, g, net->state == NC_CONNECTED ? net->player : CW_INVALID_ENTITY, *yaw, *pitch, 1.0f,
-                   meshes, stars, list, net, NULL);
+        draw_world(r, window, g, player, *yaw, *pitch, net_client_alpha(link), meshes, stars, list, link, NULL);
     }
-    net_client_destroy(net);
-    free(net);
-    game_destroy(g);
-    free(g);
+    net_session_destroy(&session);
     net_shutdown();
     return status;
 }
@@ -348,7 +341,6 @@ static int run(const options *o) {
         plat_window_destroy(window);
         return 1;
     }
-    plat_window_show(window);
     const char *backend = renderer_backend_name(r);
     fprintf(stderr, "renderer: %s\n", backend);
 
@@ -373,7 +365,7 @@ static int run(const options *o) {
     game *g = (game *)malloc(sizeof(game));
     game_init(g, CW_HOST);
     game_build_universe(g);
-    cw_entity_id player = game_spawn_player(g, o->has_position ? o->position : g->spawn);
+    cw_entity_id player = game_spawn_player(g, o->has_position ? o->position : g->spawn, true);
     char prefix[64];
     snprintf(prefix, sizeof(prefix), "Treasure Planet [%s]", backend);
 

@@ -6,10 +6,15 @@
 // All game state lives in the cw_world. Everything shares one coordinate space and
 // ships really fly through it: nothing teleports and no level is loaded.
 //
-// The same code serves two roles. A CW_HOST game is authoritative: it runs every
-// system and owns the truth. A CW_CLIENT game is a replica fed by the network: the
-// ECS skips CW_HOST_ONLY systems for it, so it never simulates players or ships, and
-// only derives what follows from replicated state (ship parts riding their hull).
+// The same code serves two roles. A CW_HOST game is authoritative and owns the truth.
+// A CW_CLIENT game is a replica fed by the network that predicts what it can: ships,
+// which are a pure function of universe time, and the one player it has an input
+// for; every other player is interpolated from snapshots. The ECS skips
+// CW_HOST_ONLY systems on a client, which is how the server keeps hooks to itself.
+//
+// Universe time is the clock every zone server and every client share: ships follow
+// a timetable against it, so two servers that have never spoken agree where a ship
+// is, and a client predicts a ship exactly. It is tick * dt plus a base set at start.
 #ifndef TP_GAME_H
 #define TP_GAME_H
 
@@ -54,6 +59,8 @@ struct Ship {
     cw_entity_id planet;
     float cruise_height;         // height above the higher dock while cruising
     float flight_seconds, dock_seconds;
+    float phase;                 // seconds into the timetable at universe time zero
+    // Derived from universe time every tick, never integrated:
     float timer;                 // seconds in the current state
     int state;                   // ship_state
     int stop;                    // ship_stop: where it is docked, or flying to
@@ -66,39 +73,61 @@ struct Planet {
 // at the origin, so it is drawn unscaled (Visual.half of 1) at the Transform.
 enum visual_mesh { MESH_CUBE, MESH_SPHERE, MESH_CAPSULE, MESH_COUNT };
 
+// A place is somewhere players stand still long enough to belong to: the hub, a
+// planet's landing pad. Zone servers own places; a player who walks into a place
+// another server owns is handed over. Ships in flight are between places.
+#define GAME_MAX_PLACES 8
+struct game_place {
+    char name[GAME_NAME_CAPACITY];
+    v3 center, half;             // the box a player must be inside to be "at" the place
+    v3 spawn;                    // where a player arriving fresh stands
+};
+
 struct game {
     cw_world world;
     cw_sim sim;
     cw_sim_role role;
     cw_component_id c_transform, c_solid, c_attachment, c_visual, c_input, c_player, c_ship, c_planet;
     cw_cached_query *q_solids, *q_players, *q_ships, *q_attachments;
-    cw_cached_query *q_dynamic;  // what moves on its own and so is worth a snapshot: players and ships
+    cw_cached_query *q_all_players;   // every player, with or without an input
     v3 spawn;
+    double universe_base;        // universe time at tick zero
+    game_place places[GAME_MAX_PLACES];
+    int place_count;
 };
 
 void game_init(game *g, cw_sim_role role);
 void game_destroy(game *g);
-// One authoritative step (CW_HOST). On a client this runs only the derived systems.
+// One fixed step: every system, then the entity lifecycle, then the tick advances.
 void game_tick(game *g);
-// A client's per-frame step: derives ship parts from their hulls and sweeps despawned
-// entities. Nothing else moves; the network moved it already.
-void game_client_frame(game *g);
+// One step of the movement systems only (ships, attachments, players), for replaying
+// a client's inputs over a state the server sent. Advances the tick like game_tick.
+void game_replay_tick(game *g);
+// The universe time at which the positions of tick `tick` hold.
+double game_time_of_tick(const game *g, uint64_t tick);
+// Puts every ship and its parts where the timetable has them at the current tick,
+// previous position included, carrying nobody: for a replica whose tick just moved.
+void game_place_ships(game *g);
 
-// Builds the hub, the planets and one ship per planet.
+// Builds the hub, the planets and one ship per planet, and declares the places.
 void game_build_universe(game *g);
-// Players are capsules, coloured by their id so two players never look alike.
-cw_entity_id game_spawn_player(game *g, v3 position);
+// Players are capsules, coloured by their id so two players never look alike. The
+// input component is what makes a player simulated: a replica leaves it off every
+// player but its own.
+cw_entity_id game_spawn_player(game *g, v3 position, bool with_input);
 void game_despawn_player(game *g, cw_entity_id id);   // gone at the end of the next tick
 v3 game_player_color(cw_entity_id id);
 
 // Queries the client and the tests use. game_ship_at returns the ship whose volume
-// holds the point, or CW_INVALID_ENTITY.
+// holds the point, or CW_INVALID_ENTITY. game_place_at returns an index into
+// places, or -1 between places.
 cw_entity_id game_ship_at(game *g, v3 point);
 cw_entity_id game_find_ship(game *g, const char *name);
-// Every player in this world. Not q_players, which holds those simulated here and so
-// is empty on a client: inputs never leave the server.
-size_t game_player_count(game *g);
+int game_place_at(const game *g, v3 point);
+int game_find_place(const game *g, const char *name);
 v3 game_ship_position(const Ship *ship, float t01, bool to_planet);
+// Where the timetable puts a ship at a universe time; fills the derived fields.
+v3 game_ship_at_time(Ship *ship, double universe_time);
 
 // Player size, in metres: position is the centre of the feet.
 #define PLAYER_RADIUS 0.3f
