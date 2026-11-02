@@ -152,7 +152,7 @@ bool net_connection_receive(net_connection *c, const void *packet, size_t size, 
         slot->data = (unsigned char *)malloc(length ? length : 1);
         memcpy(slot->data, payload, length);
         slot->size = length;
-        slot->type = (uint8_t)(type & (uint8_t)~NET_RELIABLE_FLAG);
+        slot->type = (uint8_t)(type & ~NET_RELIABLE_FLAG);
 
         // Deliver everything that is now contiguous, in order.
         for (;;) {

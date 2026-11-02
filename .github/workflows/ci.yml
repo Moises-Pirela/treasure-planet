@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test (debug)
+        run: .\build.ps1
+      - name: Build and test (release)
+        run: .\build.ps1 -Release
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            xvfb libvulkan1 mesa-vulkan-drivers libgl1 libglx-mesa0 libgl1-mesa-dri
+      - name: Build and test (debug)
+        run: ./build.sh
+      - name: Build and test (release)
+        run: ./build.sh --release
+      - name: Build headless
+        run: cmake -S . -B build/headless -DTP_BUILD_CLIENT=OFF && cmake --build build/headless --parallel
+      # There is no GPU here: Mesa's software rasterisers run both backends.
+      - name: Render with both backends and compare
+        run: |
+          xvfb-run -a -s "-screen 0 1280x720x24" build/debug/treasure_planet --renderer vulkan --capture vk.bmp --ticks 60 2>&1 | tee vk.log
+          xvfb-run -a -s "-screen 0 1280x720x24" build/debug/treasure_planet --renderer gl --capture gl.bmp --ticks 60 2>&1 | tee gl.log
+          grep -q "renderer: Vulkan" vk.log
+          grep -q "renderer: OpenGL" gl.log
+          python3 tools/compare_captures.py vk.bmp gl.bmp 200
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-captures
+          path: |
+            *.bmp
+            *.log
+          if-no-files-found: ignore
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install molten-vk
+      - name: Build and test (debug)
+        run: ./build.sh
+      - name: Build and test (release)
+        run: ./build.sh --release
+      # Hosted Mac runners may lack a usable GPU, so this reports without failing the build.
+      - name: Try rendering through MoltenVK
+        continue-on-error: true
+        run: build/debug/treasure_planet --capture mac.bmp --ticks 60 2>&1 | tee mac.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-captures
+          path: |
+            *.bmp
+            *.log
+          if-no-files-found: ignore
