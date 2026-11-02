@@ -10,8 +10,6 @@
 
 #define MOUSE_RADIANS_PER_COUNT 0.0025f
 #define MAX_PITCH 1.5f
-#define KEY_ESCAPE 0x1B
-#define KEY_SPACE 0x20
 #define STAR_COUNT 900
 
 struct options {
@@ -231,6 +229,7 @@ static int run(const options *o) {
         plat_window_destroy(window);
         return 1;
     }
+    plat_window_show(window);
     const char *backend = renderer_backend_name(r);
     fprintf(stderr, "renderer: %s\n", backend);
 
@@ -272,7 +271,7 @@ static int run(const options *o) {
         plat_window_capture_mouse(window, true);
         while (plat_window_poll(window)) {
             const plat_input *input = plat_window_input(window);
-            if (input->keys[KEY_ESCAPE]) plat_window_capture_mouse(window, false);
+            if (input->keys[PLAT_KEY_ESCAPE]) plat_window_capture_mouse(window, false);
             if (input->clicked) plat_window_capture_mouse(window, true);
             if (input->mouse_captured) {
                 yaw -= input->mouse_dx * MOUSE_RADIANS_PER_COUNT;
@@ -284,7 +283,7 @@ static int run(const options *o) {
             PlayerInput *in = CW_GET(&g->world, player, g->c_input, PlayerInput);
             in->forward = (input->keys['W'] ? 1.0f : 0.0f) - (input->keys['S'] ? 1.0f : 0.0f);
             in->strafe = (input->keys['D'] ? 1.0f : 0.0f) - (input->keys['A'] ? 1.0f : 0.0f);
-            in->jump = input->keys[KEY_SPACE];
+            in->jump = input->keys[PLAT_KEY_SPACE];
             in->yaw = yaw;
             in->pitch = pitch;
 

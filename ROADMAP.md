@@ -39,5 +39,5 @@ These are simplifications that will stop working, listed so that they are not mi
 ## Engine work along the way
 
 - **Renderer:** textures, shadows, instancing (each draw is its own call), a real allocator in the Vulkan backend (each buffer is its own allocation), an in-game HUD and text (status lives in the window title).
-- **Platform:** Linux, for servers first. The ECS and the simulation are written to be portable, but have only been built with MSVC so far.
-- **Tooling:** continuous integration, running the capture comparison and the Vulkan validation layers in it. Core and synchronization validation are clean today. Best-practice validation only flags the per-buffer allocations above and one access mask in the capture path.
+- **Platform:** packaging, such as bundling MoltenVK with a macOS build. Windows, Linux and macOS share one platform layer on GLFW.
+- **Tooling:** running the Vulkan validation layers in CI, which so far builds, tests and compares captures. Core and synchronization validation are clean today. Best-practice validation only flags the per-buffer allocations above and one access mask in the capture path.

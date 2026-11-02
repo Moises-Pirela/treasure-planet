@@ -102,6 +102,8 @@ static bool overlaps(v3 feet, v3 center, v3 half) {
         && feet.z + PLAYER_RADIUS > center.z - half.z && feet.z - PLAYER_RADIUS < center.z + half.z;
 }
 
+static float *axis_of(v3 *v, int axis) { return axis == 0 ? &v->x : axis == 1 ? &v->y : &v->z; }
+
 // Moves along one axis and stops at the first solid crossed. A solid the player is
 // well inside (a ship landed on them) is ignored, so nobody can get stuck; "well"
 // because a carried player can sit a rounding error below the deck they stand on,
@@ -110,7 +112,7 @@ static bool overlaps(v3 feet, v3 center, v3 half) {
 static bool move_axis(game *g, Transform *t, int axis, float amount, bool can_step) {
     cw_world *w = &g->world;
     v3 from = t->position, to = from;
-    (&to.x)[axis] += amount;
+    *axis_of(&to, axis) += amount;
     bool blocked = false;
     cw_query solids = cw_query_begin(g->q_solids);
     cw_entity_id id;
@@ -136,9 +138,10 @@ static bool move_axis(game *g, Transform *t, int axis, float amount, bool can_st
             }
         }
         blocked = true;
-        float near_face = (&center.x)[axis] - (amount > 0.0f ? 1.0f : -1.0f) * (&solid->half.x)[axis];
+        v3 half = solid->half;
+        float near_face = *axis_of(&center, axis) - (amount > 0.0f ? 1.0f : -1.0f) * *axis_of(&half, axis);
         float reach = axis == 1 ? (amount > 0.0f ? PLAYER_HEIGHT : 0.0f) : (amount > 0.0f ? PLAYER_RADIUS : -PLAYER_RADIUS);
-        (&to.x)[axis] = near_face - reach;
+        *axis_of(&to, axis) = near_face - reach;
     }
     t->position = to;
     return blocked;

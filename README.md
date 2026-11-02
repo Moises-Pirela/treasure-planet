@@ -6,14 +6,35 @@ A first-person multiplayer MMORPG in C-style C++. Players gather in a hub world 
 
 ## Build and run
 
-Needs Visual Studio with the C++ tools and its CMake component. Everything else is in the repository, and the Vulkan SDK is optional.
+The Vulkan headers, the Vulkan function loader (volk), GLFW and the compiled shaders are all in the repository, so no machine needs the Vulkan SDK to build or play. It is only for editing shaders and for validation layers. Each platform needs a compiler, CMake, and a graphics driver:
+
+**Windows:** Visual Studio with the C++ tools and its CMake component.
 
 ```powershell
-.\build.ps1            # debug build, then the tests
-.\build.ps1 -Release
+.\build.ps1            # debug build, then the tests. -Release for optimised
 build\debug\treasure_planet.exe                 # Vulkan, falling back to OpenGL
 build\debug\treasure_planet.exe --renderer gl
 ```
+
+**Linux (X11, or Wayland through XWayland):**
+
+```sh
+sudo apt install build-essential cmake libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libvulkan1 mesa-vulkan-drivers
+./build.sh             # debug build, then the tests. --release for optimised
+build/debug/treasure_planet
+```
+
+A VM without GPU passthrough still runs the game, slowly, on Mesa's software drivers. For a machine that only runs the simulation and tests, `./build.sh --headless` needs just a compiler and CMake. Configure with `-DTP_WAYLAND=ON` for native Wayland, which also needs `libwayland-dev` and `libxkbcommon-dev`.
+
+**macOS:** the Xcode command line tools, plus CMake and MoltenVK, which implements Vulkan on top of Metal.
+
+```sh
+brew install cmake molten-vk
+./build.sh
+build/debug/treasure_planet
+```
+
+macOS only runs the Vulkan backend, because its OpenGL stops at 4.1 and this game's needs 4.5.
 
 | Input | Action |
 | --- | --- |
@@ -30,11 +51,11 @@ Ships keep a timetable, so be aboard before they leave. The window title shows t
 src/ecs/        the ECS, ported from clockwork-c
 src/game/       the simulation: components, systems and the universe's content. No window, no renderer
 src/render/     the renderer API and its two backends
-src/platform/   window, input and GL context (Windows only for now)
+src/platform/   window, input and graphics setup, on GLFW
 src/client/     the game loop: input in, ticks, draws out
 tests/          headless tests of the ECS and of the game itself
 tools/          shader compilation, capture comparison
-third_party/    GL and Vulkan headers, volk
+third_party/    GL and Vulkan headers, volk, GLFW
 ```
 
 The dependencies point one way: `client -> game -> ecs`, and `client -> render -> platform`. The game cannot see the renderer, so a server can link `tp_game` alone.
@@ -59,8 +80,8 @@ Adding a planet with its ship is one row in `PLANETS` in [universe.cpp](src/game
 
 Callers create meshes and submit a frame, which is a camera, a sun and a list of draws. They never see a graphics API. Each backend implements the small table in [backend.h](src/render/backend.h):
 
-- **Vulkan 1.1**, loaded at runtime through volk, so machines without a driver still start.
-- **OpenGL 4.5** core with direct state access.
+- **Vulkan 1.1**, loaded at runtime through volk, so machines without a driver still start. On macOS it runs on MoltenVK.
+- **OpenGL 4.5** core with direct state access, on Windows and Linux.
 
 Both use the same shader source ([mesh.glsl](src/render/shaders/mesh.glsl)) and the same conventions: y-up clip space, and reversed depth with an infinite far plane on a 32-bit float buffer, so a deck rail and a distant planet share a depth buffer without fighting.
 
@@ -71,10 +92,10 @@ To check that the backends agree, capture the same scripted scene with each and 
 ```powershell
 build\debug\treasure_planet.exe --renderer vulkan --capture vk.bmp --ticks 60
 build\debug\treasure_planet.exe --renderer gl --capture gl.bmp --ticks 60
-python tools\compare_captures.py vk.bmp gl.bmp
+python tools\compare_captures.py vk.bmp gl.bmp 8
 ```
 
-`--at X Y Z` and `--look YAW PITCH` place the camera. Expect a handful of differing pixels out of 921,600, along triangle edges: the two APIs break rasterisation ties differently.
+`--at X Y Z` and `--look YAW PITCH` place the camera. Expect a handful of differing pixels out of 921,600, along triangle edges, because the two APIs break rasterisation ties differently. The last argument is how many differing pixels to allow.
 
 ## Licences
 
