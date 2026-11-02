@@ -112,8 +112,8 @@ int main(int argc, char **argv) {
     for (;;) {
         double now = net_seconds();
         if (seconds > 0.0 && now - start > seconds) break;
-        int online = 0, gone = 0, handoffs = 0;
-        float rtt_sum = 0.0f, error_sum = 0.0f;
+        int online = 0, gone = 0, handoffs = 0, handoffs_failed = 0;
+        float rtt_sum = 0.0f, error_sum = 0.0f, handoff_seconds = 0.0f;
         for (int i = 0; i < count; ++i) {
             bot *b = &bots[i];
             if (net_session_state(&b->session) == NC_DISCONNECTED) { ++gone; continue; }
@@ -131,11 +131,13 @@ int main(int argc, char **argv) {
                 error_sum += b->session.link->last_error;
             }
             handoffs += b->session.handoffs;
+            handoffs_failed += b->session.handoffs_failed;
+            if (b->session.last_handoff_seconds > handoff_seconds) handoff_seconds = b->session.last_handoff_seconds;
         }
         if (verbose && now - last_report >= 5.0) {
-            fprintf(stderr, "bots: %d online, %d gone, %d hand-offs, mean rtt %.1f ms, mean misprediction %.1f mm\n",
-                    online, gone, handoffs, online ? rtt_sum / (float)online * 1000.0f : 0.0f,
-                    online ? error_sum / (float)online * 1000.0f : 0.0f);
+            fprintf(stderr, "bots: %d online, %d gone, %d hand-offs (%d failed, slowest %.0f ms), mean rtt %.1f ms, "
+                    "mean misprediction %.1f mm\n", online, gone, handoffs, handoffs_failed, handoff_seconds * 1000.0f,
+                    online ? rtt_sum / (float)online * 1000.0f : 0.0f, online ? error_sum / (float)online * 1000.0f : 0.0f);
             if (riding && net_session_state(&bots[0].session) == NC_CONNECTED) {
                 game *g = bots[0].session.world;
                 cw_entity_id player = bots[0].session.link->player;

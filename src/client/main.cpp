@@ -316,9 +316,9 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
         if (now - last_status > 0.25) {
             char address[32], prefix[200];
             net_address_format(link->server, address, sizeof(address));
-            snprintf(prefix, sizeof(prefix), "Treasure Planet [%s] %s %s, %zu players, %.0f ms, %d hand-offs", backend,
-                     address, net_state_name(state), cw_query_count(g->q_all_players), link->rtt * 1000.0f,
-                     session.handoffs);
+            snprintf(prefix, sizeof(prefix), "Treasure Planet [%s] %s %s, %zu players, %.0f ms, %d hand-offs (%.0f ms)",
+                     backend, address, net_state_name(state), cw_query_count(g->q_all_players), link->rtt * 1000.0f,
+                     session.handoffs, session.last_handoff_seconds * 1000.0f);
             set_status(window, g, player, prefix);
             last_status = now;
         }

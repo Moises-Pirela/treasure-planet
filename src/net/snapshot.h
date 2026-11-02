@@ -37,6 +37,8 @@ struct snapshot_entry {
 struct snapshot {
     uint32_t tick;
     uint32_t last_input_seq;     // newest input of the receiving client applied by this tick
+    int8_t input_lead;           // inputs of the client still queued after it: its clock runs
+                                 // ahead by this much, and it steers to keep that at the target
     snapshot_entry *entries;     // grows as needed (snapshot_reserve); freed by snapshot_free
     uint16_t count, capacity;
 };
@@ -68,7 +70,7 @@ float snapshot_pitch(const snapshot_entry *e);
 const snapshot_entry *snapshot_find(const snapshot *s, cw_entity_id id);
 void snapshot_sort(snapshot *s);
 
-// Header: u32 tick, u32 base tick (0: none), u32 last input seq, u16 count. Then
+// Header: u32 tick, u32 base tick (0: none), u32 last input seq, i8 input lead, u16 count. Then
 // `count` entries delta-coded against `base`, which may be NULL. The writer must
 // be fixed-size: on overflow the caller drops entries and tries again.
 bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w);

@@ -187,15 +187,24 @@ static void on_snapshot(net_client *c, cw_reader *r, double now) {
 
     // The server's clock as seen from here, for placing the interpolation window.
     double offset = (double)tick - now * GAME_TICK_HZ;
-    if (!c->has_offset || fabs(offset - c->tick_offset) > GAME_TICK_HZ) {
-        c->tick_offset = offset;
-        c->has_offset = true;
-    } else if (offset > c->tick_offset) {
-        c->tick_offset += (offset - c->tick_offset) * 0.5;    // we were behind: catch up
-    } else {
-        c->tick_offset += (offset - c->tick_offset) * 0.02;   // drift back slowly
-    }
+    if (c->has_offset && fabs(offset - c->tick_offset) > GAME_TICK_HZ) c->offset_count = c->offset_next = 0;   // a jump: start over
+    c->offsets[c->offset_next] = offset;
+    c->offset_next = (c->offset_next + 1) % NET_OFFSET_WINDOW;
+    if (c->offset_count < NET_OFFSET_WINDOW) ++c->offset_count;
+    c->tick_offset = c->offsets[0];
+    for (int i = 1; i < c->offset_count; ++i)
+        if (c->offsets[i] > c->tick_offset) c->tick_offset = c->offsets[i];
+    c->has_offset = true;
     c->latest_tick = tick;
+
+    // Our tick rate follows the server's: too many inputs queued there means our
+    // clock runs fast, too few means slow.
+    c->input_lead = snap->input_lead;
+    float excess = (float)snap->input_lead - (float)c->input_target;
+    c->rate = 1.0f - NET_RATE_GAIN * excess;
+    if (c->rate < 1.0f - NET_RATE_LIMIT) c->rate = 1.0f - NET_RATE_LIMIT;
+    if (c->rate > 1.0f + NET_RATE_LIMIT) c->rate = 1.0f + NET_RATE_LIMIT;
+    c->clock.dt = 1.0f / ((float)GAME_TICK_HZ * c->rate);
     if ((int32_t)(snap->last_input_seq - c->acked_input_seq) > 0) {
         if (c->input_seq - snap->last_input_seq < 64) {
             float sample = (float)(now - c->input_sent_at[snap->last_input_seq % 64]);
@@ -236,6 +245,7 @@ static void on_message(void *user, net_connection *, uint8_t type, cw_reader pay
         }
         c->player = m.player;
         c->account = m.account;
+        c->input_target = m.input_target;
         g->universe_base = m.universe_base;
         g->spawn = m.spawn;
         g->place_count = m.place_count;
@@ -345,6 +355,7 @@ bool net_client_init(net_client *c, game *g, net_address server, const unsigned 
         c->ticket_size = ticket_size;
     }
     c->clock = cw_clock_make(GAME_TICK_HZ);
+    c->rate = 1.0f;
     snapshot_ring_init(&c->received);
 
     cw_world *w = &g->world;
@@ -375,10 +386,20 @@ void net_client_destroy(net_client *c) {
 void net_client_disconnect(net_client *c) {
     if (c->state == NC_DISCONNECTED) return;
     if (c->state != NC_CONNECTING) {
-        net_connection_send(&c->connection, MSG_DISCONNECT, false, NULL, 0);
-        net_connection_flush(&c->connection, net_seconds(), false);
+        // Unreliable by nature (we are leaving), so said three times: a lost notice
+        // would leave a frozen ghost on the server until its timeout.
+        for (int i = 0; i < 3; ++i) {
+            net_connection_send(&c->connection, MSG_DISCONNECT, false, NULL, 0);
+            net_connection_flush(&c->connection, net_seconds(), false);
+        }
     }
     fail(c, "disconnected");
+}
+
+void net_client_handoff_failed(net_client *c) {
+    if (!c->redirect_pending) return;
+    c->redirect_pending = false;
+    if (c->state == NC_CONNECTED) net_connection_send(&c->connection, MSG_HANDOFF_FAILED, true, NULL, 0);
 }
 
 static void send_connect(net_client *c, double now) {
@@ -446,7 +467,14 @@ void net_client_frame(net_client *c, const PlayerInput *in, double now) {
         float frame_dt = (float)(now - c->last_frame);
         c->last_frame = now;
         int steps = cw_clock_advance(&c->clock, frame_dt);
-        for (int i = 0; i < steps; ++i) predict_tick(c, in, now);
+        PlayerInput applied = *in;
+        if (c->redirect_pending) {
+            // Frozen for the hand-off, like the server has us: the other zone picks
+            // up exactly where the ticket says, and nothing rubber-bands meanwhile.
+            applied.forward = applied.strafe = 0.0f;
+            applied.jump = false;
+        }
+        for (int i = 0; i < steps; ++i) predict_tick(c, &applied, now);
 
         // The correction fades by half every NET_CORRECTION_HALF_LIFE.
         float keep = powf(0.5f, frame_dt / NET_CORRECTION_HALF_LIFE);
@@ -554,9 +582,10 @@ void net_session_frame(net_session *s, const PlayerInput *in, double now) {
     if (s->next_link) {
         net_client_frame(s->next_link, in, now);
         if (s->next_link->state == NC_DISCONNECTED) {
-            // The new zone would not have us; stay here. The old zone asks again later.
+            // The new zone would not have us; stay here, unfrozen. The old zone asks again later.
             session_close(&s->next_world, &s->next_link);
-            s->link->redirect_pending = false;
+            net_client_handoff_failed(s->link);
+            ++s->handoffs_failed;
         } else if (s->next_link->state == NC_CONNECTED && s->next_link->snapshots_received > 0) {
             // The new zone is ready. Bridge the two predictions with the view offset
             // so the switch does not show, then let the old zone go.
@@ -574,10 +603,12 @@ void net_session_frame(net_session *s, const PlayerInput *in, double now) {
             s->next_world = NULL;
             s->next_link = NULL;
             ++s->handoffs;
+            s->last_handoff_seconds = (float)(now - s->handoff_started);
         }
     } else if (s->link->redirect_pending) {
+        s->handoff_started = now;
         if (!session_open(s, &s->next_world, &s->next_link, s->link->redirect_address, s->link->redirect_ticket,
                           s->link->redirect_ticket_size))
-            s->link->redirect_pending = false;
+            net_client_handoff_failed(s->link);
     }
 }

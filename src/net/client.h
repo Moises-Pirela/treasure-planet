@@ -31,6 +31,9 @@
 #define NET_CORRECTION_HALF_LIFE 0.08f   // seconds for half a correction to fade
 #define NET_CONNECT_RETRY 0.25
 #define NET_CONNECT_TIMEOUT 5.0
+#define NET_RATE_GAIN 0.02f          // tick rate change per queued input away from the server's target
+#define NET_RATE_LIMIT 0.10f         // the most the tick rate is bent either way
+#define NET_OFFSET_WINDOW 40         // snapshots over which the server clock offset is tracked: two seconds
 
 enum net_client_state { NC_CONNECTING, NC_LOADING, NC_CONNECTED, NC_DISCONNECTED };
 
@@ -69,10 +72,15 @@ struct net_client {
     unsigned char ticket[NET_TICKET_SIZE];    // presented with MSG_CONNECT after a hand-off
     size_t ticket_size;
 
-    // Prediction.
+    // Prediction. The clock's dt is bent a little either way to keep the server's
+    // input queue at its target: that is how the client's tick rate follows the
+    // server's clock rather than its own.
     cw_clock clock;
     double last_frame;
     bool clock_started;
+    uint8_t input_target;
+    int8_t input_lead;           // as of the last snapshot
+    float rate;                  // ticks per server tick, steered around 1
     predicted_input history[NET_PREDICTION_HISTORY];   // by seq
     uint32_t input_seq;
     double input_sent_at[64];    // by seq, for the round trip
@@ -87,10 +95,16 @@ struct net_client {
     float rtt;                   // input sent to input seen applied in a snapshot: the network
                                  // both ways plus the server's jitter buffer and snapshot interval
     uint32_t snapshots_received, snapshots_dropped;
-    double tick_offset;          // estimated server tick = now * hz + tick_offset
+    // The server's clock as seen here: estimated server tick = now * hz + tick_offset.
+    // Each snapshot gives one sample; the largest over the window is the one that
+    // travelled fastest and so the truest, and the window lets it follow drift.
+    double offsets[NET_OFFSET_WINDOW];
+    int offset_count, offset_next;
+    double tick_offset;
     bool has_offset;
 
-    // Hand-off.
+    // Hand-off. Once redirected, our inputs are sent without movement (the server
+    // froze us anyway) until the other zone is showing or the attempt has failed.
     bool redirect_pending;
     net_address redirect_address;
     unsigned char redirect_ticket[NET_TICKET_SIZE];
@@ -108,6 +122,8 @@ void net_client_destroy(net_client *c);
 // due with `in` as the player's input, interpolates the others, flushes.
 void net_client_frame(net_client *c, const PlayerInput *in, double now);
 void net_client_disconnect(net_client *c);
+// Tells the server the redirect it sent did not work out, so it unfreezes us.
+void net_client_handoff_failed(net_client *c);
 // For rendering predicted entities between ticks.
 float net_client_alpha(const net_client *c);
 // Added to the local player's rendered position while a misprediction fades.
@@ -128,7 +144,9 @@ struct net_session {
     game *next_world;
     net_client *next_link;
     float interp_delay;
-    int handoffs;
+    int handoffs, handoffs_failed;
+    double handoff_started;      // when the current redirect was received
+    float last_handoff_seconds;  // frozen time of the last successful hand-off
     const char *failure;
 };
 

@@ -25,7 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define NET_PROTOCOL_VERSION 2
+#define NET_PROTOCOL_VERSION 3
 #define NET_MAX_PACKET 1200          // bytes, safely under every common MTU
 #define NET_PACKET_HEADER 10         // magic, session, ack
 #define NET_MESSAGE_HEADER 3         // type, size

@@ -15,8 +15,11 @@
 //   client <------------------------- MSG_SNAPSHOT  server     (unreliable: players, delta-coded; snapshot.h)
 //   client <------------- MSG_SPAWN / MSG_DESPAWN   server     (reliable: joins, leaves)
 // Changing zone:
-//   client <------------------------- MSG_REDIRECT  server     (reliable: the other zone and a signed ticket)
+//   client <------------------------- MSG_REDIRECT  server     (reliable: the other zone and a signed ticket;
+//                                                               the player is frozen here from now on)
 //   client  MSG_CONNECT + ticket -----------> other server
+//   client  MSG_DISCONNECT ----------------------> server     (once the other zone is showing)
+//   client  MSG_HANDOFF_FAILED ------------------> server     (instead, if the other zone would not have us)
 // Either side may send MSG_DISCONNECT; silence for longer than the timeout is the same.
 #ifndef TP_PROTOCOL_H
 #define TP_PROTOCOL_H
@@ -43,6 +46,7 @@ enum net_message_type {
     MSG_KEEPALIVE,           // either: empty
     MSG_DISCONNECT,          // either: empty
     MSG_REDIRECT,            // server -> client: net_redirect
+    MSG_HANDOFF_FAILED,      // client -> server: empty; the redirect did not work out, unfreeze me
 };
 
 enum net_reject_reason { REJECT_VERSION = 1, REJECT_FULL, REJECT_TICKET };
@@ -68,6 +72,7 @@ struct net_welcome {
     double universe_base;        // universe time at the server's tick zero
     v3 spawn;                    // where players come back after falling off the world
     uint64_t account;
+    uint8_t input_target;        // inputs the server likes to have queued: what the client steers for
     game_place places[GAME_MAX_PLACES];
     int place_count;
 };

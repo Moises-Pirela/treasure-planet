@@ -219,6 +219,8 @@ static void test_tickets(void) {
     net_ticket back = {};
     cw_reader r = cw_reader_make(buffer, w.size);
     CHECK(net_ticket_read(&r, &back, &zones));
+    CHECK(back.signature != 0);
+    t.signature = back.signature;
     CHECK(memcmp(&back, &t, sizeof(t)) == 0);
 
     unsigned char forged[NET_TICKET_SIZE];
@@ -376,6 +378,14 @@ static void test_two_clients_see_each_other(void) {
     CHECK(distance(position_in(gb, ca->player), a_before_on_b) > 2.0f);
     CHECK(distance(position_in(gb, cb->player), s->zone.spawn) < 0.01f);    // B never moved
     CHECK(s->clients[0].inputs.starved + s->clients[1].inputs.starved < 20);
+    // The clients' tick rates follow the server's: its input queues sit at the target.
+    for (int k = 0; k < 2; ++k) {
+        const input_queue *q = &server_client_of(s, k ? cb->player : ca->player)->inputs;
+        int lead = (int)(q->newest - q->last_applied);
+        CHECK(lead >= SERVER_INPUT_TARGET - 1 && lead <= SERVER_INPUT_TARGET + 3);
+        CHECK(q->skipped == 0);
+    }
+    CHECK(ca->rate > 0.9f && ca->rate < 1.1f);
     r.inputs[a].forward = 0.0f;
     // Once A stops and the interpolation delay passes, every view agrees exactly.
     // Standing still, a snapshot is a couple of bytes per player: B hears almost
@@ -565,6 +575,27 @@ static void test_zones(void) {
     CHECK(distance(position_in(gb, ca->player), position_in(&planet_server->zone, ca->player)) < 0.01f);
     CHECK(ca->last_error < 0.002f);
 
+    // The ticket A arrived with is good once: presenting it again is refused.
+    {
+        game *again_world = (game *)malloc(sizeof(game));
+        game_init(again_world, CW_CLIENT);
+        net_client *again = (net_client *)malloc(sizeof(net_client));
+        CHECK(net_client_init(again, again_world, zones.zones[planets].address, ca->ticket, ca->ticket_size, 0.0f));
+        PlayerInput idle = {};
+        start = net_seconds();
+        while (again->state != NC_DISCONNECTED && net_seconds() - start < 5.0) {
+            rig_step(&r);
+            net_client_frame(again, &idle, net_seconds());
+        }
+        CHECK(again->state == NC_DISCONNECTED);
+        CHECK(again->failure && strstr(again->failure, "ticket"));
+        CHECK(planet_server->client_count == 2);
+        net_client_destroy(again);
+        game_destroy(again_world);
+        free(again);
+        free(again_world);
+    }
+
     // A ticket that was not signed by a zone is refused.
     game *forger_world = (game *)malloc(sizeof(game));
     game_init(forger_world, CW_CLIENT);
@@ -588,6 +619,103 @@ static void test_zones(void) {
     rig_destroy(&r);
 }
 
+// A hand-off to a zone that will not answer: the player is frozen meanwhile, nothing
+// is lost, and both sides thaw and carry on in the old zone.
+static void test_handoff_failure(void) {
+    net_zone_table zones;
+    net_zones_init(&zones);
+    int hub = net_zones_add(&zones, "hub", net_address_make(0x7f000001u, 0));
+    int planets = net_zones_add(&zones, "planets", net_address_make(0x7f000001u, 0));
+    net_zone_add_place(&zones.zones[hub], "hub");
+    net_zone_add_place(&zones.zones[planets], "Verdant");
+
+    rig r;
+    memset(&r, 0, sizeof(r));
+    server_config config = server_config_default();
+    config.max_clients = RIG_MAX;
+    config.zones = &zones;
+    config.zone = hub;
+    server *hub_server = rig_add_server(&r, &config, 0.0f);
+    zones.zones[hub].address.port = server_port(hub_server);
+    config.zone = planets;
+    server *dead = rig_add_server(&r, &config, 1.0f);   // there, but every packet it sends is lost
+    zones.zones[planets].address.port = server_port(dead);
+    int a = rig_add_client_to(&r, hub_server, 0.0f);
+    CHECK(rig_wait_connected(&r, 5.0));
+    if (failures) { rig_destroy(&r); return; }
+    net_client *ca = link_of(&r, a);
+    server_client *sc = server_client_of(hub_server, ca->player);
+    int verdant = game_find_place(&hub_server->zone, "Verdant");
+    v3 pad = hub_server->zone.places[verdant].spawn;
+    Transform *at = CW_GET(&hub_server->zone.world, ca->player, hub_server->zone.c_transform, Transform);
+    at->position = at->previous = v3_add(pad, v3_make(0, 0.5f, 0));
+    r.inputs[a].forward = 1.0f;   // trying to walk the whole time
+
+    // Frozen: redirected, and not moving despite the input, on the server or in the prediction.
+    rig_run(&r, 1.0);
+    CHECK(sc->state == CLIENT_HANDING_OFF);
+    CHECK(ca->redirect_pending && r.sessions[a].next_link != NULL);
+    CHECK(distance(position_in(&hub_server->zone, ca->player), pad) < 0.05f);
+    CHECK(distance(position_in(world_of(&r, a), ca->player), pad) < 0.05f);
+    CHECK(ca->last_error < 0.002f);
+
+    // The attempt times out; the client says so; everyone thaws. Moved off the pad
+    // by the server (so the hub does not just try again), the player walks on.
+    double start = net_seconds();
+    while (r.sessions[a].handoffs_failed == 0 && net_seconds() - start < NET_CONNECT_TIMEOUT + 2.0) rig_step(&r);
+    CHECK(r.sessions[a].handoffs_failed == 1);
+    CHECK(!ca->redirect_pending && r.sessions[a].next_link == NULL);
+    at->position = at->previous = hub_server->zone.spawn;
+    rig_run(&r, 0.6);
+    CHECK(sc->handoffs_failed >= 1);
+    CHECK(sc->state == CLIENT_ACTIVE);
+    CHECK(distance(position_in(&hub_server->zone, ca->player), hub_server->zone.spawn) > 2.0f);
+    CHECK(ca->state == NC_CONNECTED && hub_server->client_count == 1);
+    rig_destroy(&r);
+}
+
+// The server's tick follows the wall clock, through stalls and clock jumps, so
+// universe time means the same thing on every zone.
+static void test_server_clock(void) {
+    server_config config = server_config_default();
+    config.port = 0;
+    server *s = (server *)malloc(sizeof(server));
+    CHECK(server_init(s, &config));
+    double start = net_seconds();
+    while (net_seconds() - start < 1.0) {
+        server_update(s, net_seconds());
+        net_sleep(0.001);
+    }
+    uint64_t target = server_target_tick(s);
+    CHECK(s->zone.world.tick <= target && target - s->zone.world.tick <= 1);
+    CHECK(fabs(game_time_of_tick(&s->zone, s->zone.world.tick) - (net_wall_seconds() - config.universe_epoch)) < 0.05);
+
+    // A stall: time passes, no updates. Short ones are simulated in full.
+    net_sleep(0.3);
+    uint64_t before = s->zone.world.tick;
+    server_update(s, net_seconds());
+    CHECK(s->zone.world.tick - before >= 17 && s->zone.world.tick - before <= 19);
+    CHECK(s->ticks_skipped == 0);
+
+    // A long one (here: the clock saying we are 3 s behind) is caught up to a point
+    // and the rest skipped.
+    s->zone.universe_base -= 3.0;
+    server_update(s, net_seconds());
+    CHECK(s->ticks_skipped >= 180 - SERVER_MAX_CATCHUP && s->ticks_skipped <= 180 - SERVER_MAX_CATCHUP + 3);
+    target = server_target_tick(s);
+    CHECK(target - s->zone.world.tick <= 3);
+
+    // A clock jump (10 s) moves universe time instead of the tick.
+    uint64_t tick = s->zone.world.tick;
+    s->zone.universe_base -= 10.0;
+    server_update(s, net_seconds());
+    CHECK(s->rebases == 1);
+    CHECK(s->zone.world.tick - tick <= 2);
+    CHECK(fabs(game_time_of_tick(&s->zone, s->zone.world.tick) - (net_wall_seconds() - config.universe_epoch)) < 0.05);
+    server_destroy(s);
+    free(s);
+}
+
 int main(void) {
     if (!net_init()) {
         puts("test_net: the network could not be initialised");
@@ -600,6 +728,8 @@ int main(void) {
     test_join_and_play_under_loss();
     test_rejections();
     test_zones();
+    test_handoff_failure();
+    test_server_clock();
     net_shutdown();
     if (failures) {
         printf("test_net: %d failed\n", failures);

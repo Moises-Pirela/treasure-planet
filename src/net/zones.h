@@ -51,6 +51,7 @@ struct net_ticket {
     v3 position, velocity;
     float yaw, pitch;
     double issued;               // universe time
+    uint64_t signature;          // filled by net_ticket_read; what a zone remembers to refuse a replay
 };
 void net_ticket_write(cw_writer *w, const net_ticket *ticket, const net_zone_table *zones);
 // False when the signature does not match the table's secret (or the bytes are short).

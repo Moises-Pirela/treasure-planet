@@ -202,5 +202,6 @@ bool net_ticket_read(cw_reader *r, net_ticket *t, const net_zone_table *zones) {
     cw_reader_f32(&b, &t->yaw);
     cw_reader_f32(&b, &t->pitch);
     cw_reader_f64(&b, &t->issued);
+    t->signature = signature;
     return cw_reader_ok(&b);
 }

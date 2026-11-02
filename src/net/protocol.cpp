@@ -286,6 +286,7 @@ void net_welcome_write(cw_writer *w, const net_welcome *m) {
     cw_writer_f64(w, m->universe_base);
     write_v3(w, m->spawn);
     cw_writer_u64(w, m->account);
+    cw_writer_u8(w, m->input_target);
     cw_writer_u8(w, (uint8_t)m->place_count);
     for (int i = 0; i < m->place_count; ++i) {
         write_name(w, m->places[i].name);
@@ -303,6 +304,7 @@ bool net_welcome_read(cw_reader *r, net_welcome *m) {
     cw_reader_f64(r, &m->universe_base);
     m->spawn = read_v3(r);
     cw_reader_u64(r, &m->account);
+    cw_reader_u8(r, &m->input_target);
     uint8_t count = 0;
     cw_reader_u8(r, &count);
     if (count > GAME_MAX_PLACES) return false;

@@ -164,6 +164,8 @@ static void build_snapshot(server *s, server_client *c) {
     snapshot *snap = &s->scratch_snapshot;
     snap->tick = (uint32_t)w->tick;
     snap->last_input_seq = c->inputs.last_applied;
+    int lead = c->inputs.started ? (int)(c->inputs.newest - c->inputs.last_applied) : 0;
+    snap->input_lead = (int8_t)(lead > 127 ? 127 : lead < -127 ? -127 : lead);
     snap->count = 0;
     v3 own = CW_GET(w, c->player, g->c_transform, Transform)->position;
     float radius2 = s->config.interest_radius * s->config.interest_radius;
@@ -228,6 +230,13 @@ static void on_client_message(void *user, net_connection *, uint8_t type, cw_rea
     case MSG_DISCONNECT:
         c->state = CLIENT_LEAVING;
         break;
+    case MSG_HANDOFF_FAILED:
+        if (c->state == CLIENT_HANDING_OFF) {
+            c->state = CLIENT_ACTIVE;   // unfrozen; check_handoffs tries again after the retry delay
+            c->redirected_at = net_seconds();
+            ++c->handoffs_failed;
+        }
+        break;
     default:
         break;   // MSG_KEEPALIVE, and anything a newer client might say
     }
@@ -271,7 +280,30 @@ v3 server_spawn(const server *s) {
     return s->zone.spawn;
 }
 
+static void drop_client(server *s, server_client *c, const char *why);
+
+// A ticket is good once. The memory is a ring, long enough to outlive a ticket.
+static bool ticket_seen(server *s, const net_ticket *t) {
+    for (int i = 0; i < SERVER_TICKET_MEMORY; ++i)
+        if (s->tickets[i].signature == t->signature && s->tickets[i].issued == t->issued) return true;
+    s->tickets[s->next_ticket].signature = t->signature;
+    s->tickets[s->next_ticket].issued = t->issued;
+    s->next_ticket = (s->next_ticket + 1) % SERVER_TICKET_MEMORY;
+    return false;
+}
+
 static void accept_client(server *s, net_address from, const net_connect_message *m, double now) {
+    if (m->has_ticket) {
+        if (ticket_seen(s, &m->ticket)) {
+            reject(s, from, REJECT_TICKET, now);
+            return;
+        }
+        // The same player again, from a connection that never closed: this one is the
+        // live one, so the old body goes.
+        for (int i = 0; i < s->config.max_clients; ++i)
+            if (s->clients[i].state != CLIENT_FREE && s->clients[i].account == m->ticket.account)
+                drop_client(s, &s->clients[i], "superseded");
+    }
     server_client *c = NULL;
     for (int i = 0; i < s->config.max_clients && !c; ++i)
         if (s->clients[i].state == CLIENT_FREE) c = &s->clients[i];
@@ -310,6 +342,7 @@ static void accept_client(server *s, net_address from, const net_connect_message
     welcome.universe_base = s->zone.universe_base;
     welcome.spawn = s->zone.spawn;
     welcome.account = c->account;
+    welcome.input_target = SERVER_INPUT_TARGET;
     welcome.place_count = s->zone.place_count;
     memcpy(welcome.places, s->zone.places, sizeof(welcome.places));
     cw_writer w;
@@ -393,7 +426,8 @@ static void check_handoffs(server *s, double now) {
         cw_writer_init_fixed(&w, s->scratch, NET_MAX_PAYLOAD);
         net_redirect_write(&w, &m, zones);
         net_connection_send(&c->connection, MSG_REDIRECT, true, s->scratch, w.size);
-        c->redirected_at = now;
+        c->redirected_at = c->handoff_started = now;
+        c->state = CLIENT_HANDING_OFF;
         if (s->config.verbose)
             fprintf(stderr, "server: player %lld entered %s, handing over to zone %s\n", (long long)c->player,
                     g->places[place].name, zones->zones[owner].name);
@@ -432,9 +466,12 @@ bool server_init(server *s, const server_config *config) {
     cw_sim_register(&s->zone.sim, d);
     game_tick(&s->zone);   // settles the universe's own created list before anyone joins
     s->spawned.count = 0;
-
-    s->clock = cw_clock_make(GAME_TICK_HZ);
     return true;
+}
+
+uint64_t server_target_tick(const server *s) {
+    double elapsed = net_wall_seconds() - s->config.universe_epoch - s->zone.universe_base;
+    return elapsed <= 0.0 ? 0 : (uint64_t)(elapsed * GAME_TICK_HZ);
 }
 
 void server_destroy(server *s) {
@@ -466,29 +503,56 @@ server_client *server_client_of(server *s, cw_entity_id player) {
 static void apply_inputs(server *s) {
     for (int i = 0; i < s->config.max_clients; ++i) {
         server_client *c = &s->clients[i];
-        if (c->state != CLIENT_ACTIVE) continue;
+        if (c->state != CLIENT_ACTIVE && c->state != CLIENT_HANDING_OFF) continue;
         PlayerInput *in = CW_GET(&s->zone.world, c->player, s->zone.c_input, PlayerInput);
-        if (in) *in = input_queue_apply(&c->inputs);
+        if (!in) continue;
+        *in = input_queue_apply(&c->inputs);
+        if (c->state == CLIENT_HANDING_OFF) {
+            // Frozen: the ticket described this player standing here, and the other
+            // zone will pick up from exactly that. Looking around still works.
+            in->forward = in->strafe = 0.0f;
+            in->jump = false;
+        }
     }
 }
 
 void server_update(server *s, double now) {
     receive_packets(s, now);
 
-    // Leavers and the silent go first, so the tick below despawns them.
+    // Leavers and the silent go first, so the tick below despawns them. A frozen
+    // player whose hand-off went nowhere thaws.
     for (int i = 0; i < s->config.max_clients; ++i) {
         server_client *c = &s->clients[i];
         if (c->state == CLIENT_LEAVING) drop_client(s, c, "left");
-        else if (c->state == CLIENT_ACTIVE && now - c->connection.last_received > s->config.timeout)
+        else if (c->state != CLIENT_FREE && now - c->connection.last_received > s->config.timeout)
             drop_client(s, c, "timed out");
+        else if (c->state == CLIENT_HANDING_OFF && now - c->handoff_started > SERVER_HANDOFF_TIMEOUT) {
+            c->state = CLIENT_ACTIVE;
+            ++c->handoffs_failed;
+            if (s->config.verbose) fprintf(stderr, "server: player %lld never left; unfrozen\n", (long long)c->player);
+        }
     }
 
-    if (!s->clock_started) {
-        s->clock_started = true;
-        s->last_update = now;
+    // The wall clock says which tick we should be at. Normally that is the next one
+    // or two. After a stall we catch up, to a point: beyond SERVER_MAX_CATCHUP the
+    // skipped time is skipped (ships are functions of time and land where they
+    // should; players simply did not move). A large jump either way means the clock
+    // itself moved, and universe time moves with it.
+    uint64_t tick = s->zone.world.tick, target = server_target_tick(s);
+    double behind = ((double)target - (double)tick) / GAME_TICK_HZ;
+    if (behind < -SERVER_REBASE_SECONDS || behind > SERVER_REBASE_SECONDS) {
+        s->zone.universe_base += behind;   // universe time at tick zero moves so that target == tick
+        target = tick;
+        ++s->rebases;
+        if (s->config.verbose) fprintf(stderr, "server: the clock jumped %.1f s; universe time follows\n", behind);
+    } else if (target > tick + SERVER_MAX_CATCHUP) {
+        uint64_t skipped = target - tick - SERVER_MAX_CATCHUP;
+        s->zone.world.tick += skipped;
+        s->ticks_skipped += (uint32_t)skipped;
+        if (s->config.verbose)
+            fprintf(stderr, "server: %.2f s behind the clock; skipped %llu ticks\n", behind, (unsigned long long)skipped);
     }
-    int steps = cw_clock_advance(&s->clock, (float)(now - s->last_update));
-    s->last_update = now;
+    int steps = (int)(target - s->zone.world.tick);
     for (int step = 0; step < steps; ++step) {
         apply_inputs(s);
         game_tick(&s->zone);
@@ -496,7 +560,7 @@ void server_update(server *s, double now) {
         if (s->spawned.count || s->despawned.count) {
             for (int i = 0; i < s->config.max_clients; ++i) {
                 server_client *c = &s->clients[i];
-                if (c->state != CLIENT_ACTIVE) continue;
+                if (c->state != CLIENT_ACTIVE && c->state != CLIENT_HANDING_OFF) continue;
                 if (s->despawned.count) send_despawns(s, c, s->despawned.data, s->despawned.count);
                 if (s->spawned.count) send_spawns(s, c, s->spawned.data, s->spawned.count);
             }
@@ -505,7 +569,8 @@ void server_update(server *s, double now) {
         if (s->zone.world.tick % SNAPSHOT_EVERY == 0) {
             check_handoffs(s, now);
             for (int i = 0; i < s->config.max_clients; ++i)
-                if (s->clients[i].state == CLIENT_ACTIVE) send_snapshot(s, &s->clients[i]);
+                if (s->clients[i].state == CLIENT_ACTIVE || s->clients[i].state == CLIENT_HANDING_OFF)
+                    send_snapshot(s, &s->clients[i]);
         }
     }
 
@@ -520,7 +585,7 @@ void server_update(server *s, double now) {
         game *g = &s->zone;
         for (int i = 0; i < s->config.max_clients; ++i) {
             server_client *c = &s->clients[i];
-            if (c->state != CLIENT_ACTIVE) continue;
+            if (c->state == CLIENT_FREE) continue;
             v3 at = CW_GET(&g->world, c->player, g->c_transform, Transform)->position;
             int place = game_place_at(g, at);
             fprintf(stderr, "trace: tick %llu player %lld at %.2f %.2f %.2f, %s, aboard %lld, input %u applied %u starved %u skipped %u\n",

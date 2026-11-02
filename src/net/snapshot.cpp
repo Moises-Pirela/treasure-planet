@@ -111,6 +111,7 @@ bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w) {
     cw_writer_u32(w, s->tick);
     cw_writer_u32(w, base ? base->tick : 0);
     cw_writer_u32(w, s->last_input_seq);
+    cw_writer_i8(w, s->input_lead);
     cw_writer_u16(w, s->count);
     for (uint16_t i = 0; i < s->count; ++i) {
         const snapshot_entry *e = &s->entries[i];
@@ -156,6 +157,7 @@ bool snapshot_decode(cw_reader *r, const snapshot *base, snapshot *out) {
     cw_reader_u32(r, &out->tick);
     cw_reader_u32(r, &base_tick);
     cw_reader_u32(r, &out->last_input_seq);
+    cw_reader_i8(r, &out->input_lead);
     cw_reader_u16(r, &count);
     if (!cw_reader_ok(r)) return false;
     if ((base == NULL) != (base_tick == 0) || (base && base->tick != base_tick)) return false;
