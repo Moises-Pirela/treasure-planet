@@ -18,7 +18,8 @@ function(tp_strict target)
         target_compile_options(${target} PRIVATE /W4 /WX /permissive- /GR- /EHs-c- /utf-8)
         target_compile_definitions(${target} PRIVATE _HAS_EXCEPTIONS=0 _CRT_SECURE_NO_WARNINGS NOMINMAX)
     else()
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti)
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti
+            -Wno-missing-field-initializers)
     endif()
 endfunction()
 
@@ -37,11 +38,32 @@ if(NOT MSVC)
     target_link_libraries(tp_ecs PUBLIC m)
 endif()
 
+# ---------------------------------------------------------------------------
+# Networking: transport, protocol, the zone server and the replica client. All
+# headless, so the server runs on Linux and the tests run the whole stack in-process.
+# ---------------------------------------------------------------------------
+add_library(tp_net STATIC
+    src/net/net_socket.cpp src/net/net_connection.cpp src/net/protocol.cpp
+    src/net/server.cpp src/net/client.cpp)
+target_link_libraries(tp_net PUBLIC tp_game)
+if(WIN32)
+    target_link_libraries(tp_net PUBLIC ws2_32)
+endif()
+tp_strict(tp_net)
+
+add_executable(treasure_server src/server/main.cpp)
+target_link_libraries(treasure_server PRIVATE tp_net)
+tp_strict(treasure_server)
+
+add_executable(treasure_bots src/tools/bots.cpp)
+target_link_libraries(treasure_bots PRIVATE tp_net)
+tp_strict(treasure_bots)
+
 if(TP_BUILD_TESTS)
     enable_testing()
-    foreach(name test_ecs test_game)
+    foreach(name test_ecs test_game test_net)
         add_executable(${name} tests/${name}.cpp)
-        target_link_libraries(${name} PRIVATE tp_game)
+        target_link_libraries(${name} PRIVATE tp_net)
         tp_strict(${name})
         add_test(NAME ${name} COMMAND ${name})
     endforeach()
@@ -73,6 +95,6 @@ if(TP_BUILD_CLIENT)
         src/render/backend_vk.cpp)
     target_include_directories(treasure_planet PRIVATE
         third_party/gl ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    target_link_libraries(treasure_planet PRIVATE tp_game tp_volk opengl32 user32 gdi32)
+    target_link_libraries(treasure_planet PRIVATE tp_net tp_volk opengl32 user32 gdi32)
     tp_strict(treasure_planet)
 endif()

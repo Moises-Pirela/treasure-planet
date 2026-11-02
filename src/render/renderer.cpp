@@ -102,3 +102,45 @@ r_mesh renderer_mesh_sphere(renderer *r, int segments, int rings) {
     free(indices);
     return mesh;
 }
+
+r_mesh renderer_mesh_capsule(renderer *r, float radius, float height, int segments, int rings) {
+    // A sphere whose rings are split at the equator and pulled apart by the
+    // cylinder's length, so the normals stay those of the sphere: rings is per
+    // hemisphere, and the two equator rings share the seam.
+    float shift = height - 2.0f * radius;
+    if (shift < 0.0f) shift = 0.0f;
+    int total_rings = rings * 2 + 1;       // rings 0..rings are the top half, rings+1.. the bottom
+    uint32_t vertex_count = (uint32_t)((segments + 1) * (total_rings + 1));
+    uint32_t index_count = (uint32_t)(segments * total_rings * 6);
+    r_vertex *vertices = (r_vertex *)malloc(vertex_count * sizeof(r_vertex));
+    uint32_t *indices = (uint32_t *)malloc(index_count * sizeof(uint32_t));
+    r_vertex *v = vertices;
+    for (int ring = 0; ring <= total_rings; ++ring) {
+        bool top = ring <= rings;
+        int local = top ? ring : ring - 1;                         // 0..2*rings over the whole sphere
+        float polar = TP_PI * (float)local / (float)(2 * rings);   // 0 at the north pole, pi at the south
+        float center_y = top ? radius + shift : radius;
+        for (int segment = 0; segment <= segments; ++segment) {
+            float around = 2.0f * TP_PI * (float)segment / (float)segments;
+            float x = sinf(polar) * sinf(around), y = cosf(polar), z = sinf(polar) * cosf(around);
+            v->normal[0] = x;
+            v->normal[1] = y;
+            v->normal[2] = z;
+            v->position[0] = x * radius;
+            v->position[1] = center_y + y * radius;
+            v->position[2] = z * radius;
+            ++v;
+        }
+    }
+    uint32_t *out = indices, stride = (uint32_t)segments + 1;
+    for (uint32_t ring = 0; ring < (uint32_t)total_rings; ++ring)
+        for (uint32_t segment = 0; segment < (uint32_t)segments; ++segment) {
+            uint32_t a = ring * stride + segment, b = a + stride;
+            *out++ = a;  *out++ = b;      *out++ = b + 1;
+            *out++ = a;  *out++ = b + 1;  *out++ = a + 1;
+        }
+    r_mesh mesh = renderer_mesh_create(r, vertices, vertex_count, indices, index_count);
+    free(vertices);
+    free(indices);
+    return mesh;
+}

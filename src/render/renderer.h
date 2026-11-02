@@ -50,6 +50,8 @@ r_mesh renderer_mesh_create(renderer *r, const r_vertex *vertices, uint32_t vert
                             const uint32_t *indices, uint32_t index_count);
 r_mesh renderer_mesh_cube(renderer *r);                       // half extents of 1
 r_mesh renderer_mesh_sphere(renderer *r, int segments, int rings);    // radius 1
+// A capsule standing on the origin: `height` tall overall, along +y.
+r_mesh renderer_mesh_capsule(renderer *r, float radius, float height, int segments, int rings);
 void renderer_mesh_destroy(renderer *r, r_mesh mesh);
 
 // The frame is complete when this returns. width/height of 0 draws nothing.

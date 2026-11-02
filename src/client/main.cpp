@@ -1,7 +1,9 @@
-// The client: reads the keyboard and mouse into one player's input, ticks the
-// simulation at a fixed rate and draws what is in the world. It owns no game state
-// beyond where the camera looks, so a network client can replace the local game_tick.
+// The client: reads the keyboard and mouse into one player's input and draws what is
+// in the world. It owns no game state beyond where the camera looks. Alone, it ticks
+// the simulation itself; with --connect, the world is a replica fed by a server and
+// the input goes there instead (src/net/client.h).
 #include "../game/game.h"
+#include "../net/client.h"
 #include "../platform/platform.h"
 #include "../render/renderer.h"
 #include <stdio.h>
@@ -16,6 +18,7 @@
 
 struct options {
     r_backend_kind backend;
+    const char *connect;         // host[:port] of a zone server; NULL plays alone
     const char *capture_path;    // render one scripted frame, write it and exit
     int capture_ticks;
     bool has_position;
@@ -34,6 +37,8 @@ static bool parse_options(int argc, char **argv, options *o) {
             if (!strcmp(name, "vulkan")) o->backend = R_BACKEND_VULKAN;
             else if (!strcmp(name, "gl") || !strcmp(name, "opengl")) o->backend = R_BACKEND_OPENGL;
             else return false;
+        } else if (!strcmp(arg, "--connect") && more) {
+            o->connect = argv[++i];
         } else if (!strcmp(arg, "--capture") && more) {
             o->capture_path = argv[++i];
         } else if (!strcmp(arg, "--ticks") && more) {
@@ -85,8 +90,13 @@ static r_mesh create_stars(renderer *r) {
     return mesh;
 }
 
-static void set_status(plat_window *window, game *g, cw_entity_id player, const char *backend) {
+// The title bar: where the player stands relative to the ships, after `prefix`.
+static void set_status(plat_window *window, game *g, cw_entity_id player, const char *prefix) {
     cw_world *w = &g->world;
+    if (!cw_world_is_valid(w, player)) {
+        plat_window_set_title(window, prefix);
+        return;
+    }
     v3 at = CW_GET(w, player, g->c_transform, Transform)->position;
     cw_entity_id aboard = game_ship_at(g, at);
     cw_entity_id shown = aboard;
@@ -104,19 +114,19 @@ static void set_status(plat_window *window, game *g, cw_entity_id player, const 
             }
         }
     }
-    char text[256];
+    char text[320];
     if (shown == CW_INVALID_ENTITY) {
-        snprintf(text, sizeof(text), "Treasure Planet [%s]: every ship is away", backend);
+        snprintf(text, sizeof(text), "%s: every ship is away", prefix);
     } else {
         const Ship *ship = CW_GET(w, shown, g->c_ship, Ship);
         const Planet *planet = CW_GET(w, ship->planet, g->c_planet, Planet);
         const char *place = ship->stop == STOP_PLANET ? planet->name : "the hub";
         if (ship->state == SHIP_FLYING)
-            snprintf(text, sizeof(text), "Treasure Planet [%s]: aboard %s, reaching %s in %.0f s",
-                     backend, ship->name, place, ship->flight_seconds - ship->timer);
+            snprintf(text, sizeof(text), "%s: aboard %s, reaching %s in %.0f s",
+                     prefix, ship->name, place, ship->flight_seconds - ship->timer);
         else
-            snprintf(text, sizeof(text), "Treasure Planet [%s]: %s %s at %s, leaves in %.0f s",
-                     backend, aboard != CW_INVALID_ENTITY ? "aboard" : "nearest:", ship->name, place,
+            snprintf(text, sizeof(text), "%s: %s %s at %s, leaves in %.0f s",
+                     prefix, aboard != CW_INVALID_ENTITY ? "aboard" : "nearest:", ship->name, place,
                      ship->dock_seconds - ship->timer);
     }
     plat_window_set_title(window, text);
@@ -160,16 +170,25 @@ static r_draw *draw_push(draw_list *list) {
     return &list->items[list->count++];
 }
 
+// Where a player's eyes are, from their feet.
+static v3 eye_of(v3 feet) { return v3_add(feet, v3_make(0, PLAYER_EYE, 0)); }
+
+// Draws the world from `player`'s eyes (or from the spawn while there is no player
+// yet). Other players are their capsule plus a small block at the eyes, pointing
+// where they look. `net`, when set, hides replicas the server stopped updating.
 static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id player, float yaw, float pitch,
-                       float alpha, const r_mesh *meshes, r_mesh stars, draw_list *list, uint8_t **capture) {
+                       float alpha, const r_mesh *meshes, r_mesh stars, draw_list *list, const net_client *net,
+                       uint8_t **capture) {
     cw_world *w = &g->world;
     int width, height;
     plat_window_size(window, &width, &height);
     if (width <= 0 || height <= 0) return;
 
-    const Transform *pt = CW_GET(w, player, g->c_transform, Transform);
-    v3 eye = v3_lerp(pt->previous, pt->position, alpha);
-    eye.y += PLAYER_EYE;
+    v3 eye = eye_of(g->spawn);
+    if (cw_world_is_valid(w, player)) {
+        const Transform *pt = CW_GET(w, player, g->c_transform, Transform);
+        eye = eye_of(v3_lerp(pt->previous, pt->position, alpha));
+    }
     m4 view = m4_look_to(eye, look_direction(yaw, pitch));
     m4 projection = m4_perspective(70.0f * TP_PI / 180.0f, (float)width / (float)height, 0.1f);
 
@@ -200,15 +219,27 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
     cw_query visuals = cw_query_iter(w, cw_mask(drawn, 2));
     cw_entity_id id;
     while (cw_query_next(&visuals, &id)) {
+        if (id == player) continue;                              // first person: no body in view
+        if (net && !net_client_entity_visible(net, id)) continue;
         const Transform *t = CW_GET(w, id, g->c_transform, Transform);
         const Visual *visual = CW_GET(w, id, g->c_visual, Visual);
+        v3 at = v3_lerp(t->previous, t->position, alpha);
         r_draw *draw = draw_push(list);
         draw->mesh = meshes[visual->mesh];
-        draw->model = m4_translate_scale(v3_lerp(t->previous, t->position, alpha), visual->half);
+        draw->model = m4_translate_scale(at, visual->half);
         draw->color[0] = visual->color.x;
         draw->color[1] = visual->color.y;
         draw->color[2] = visual->color.z;
         draw->color[3] = 1.0f;
+        if (cw_comp_has(w, id, g->c_player)) {
+            const Player *p = CW_GET(w, id, g->c_player, Player);
+            v3 nose = v3_add(eye_of(at), v3_scale(look_direction(p->yaw, p->pitch), PLAYER_RADIUS));
+            r_draw *face = draw_push(list);
+            face->mesh = meshes[MESH_CUBE];
+            face->model = m4_translate_scale(nose, v3_make(0.08f, 0.08f, 0.08f));
+            face->color[0] = face->color[1] = face->color[2] = 0.1f;
+            face->color[3] = 1.0f;
+        }
     }
     frame.draws = list->items;
     frame.draw_count = list->count;
@@ -217,6 +248,94 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
         frame.capture_rgba = *capture;
     }
     renderer_submit(r, &frame, width, height);
+}
+
+// Mouse look and the keys, into one tick's worth of input. Yaw and pitch are the
+// camera's and persist between frames.
+static PlayerInput read_input(plat_window *window, float *yaw, float *pitch) {
+    const plat_input *input = plat_window_input(window);
+    if (input->keys[KEY_ESCAPE]) plat_window_capture_mouse(window, false);
+    if (input->clicked) plat_window_capture_mouse(window, true);
+    if (input->mouse_captured) {
+        *yaw -= input->mouse_dx * MOUSE_RADIANS_PER_COUNT;
+        *pitch -= input->mouse_dy * MOUSE_RADIANS_PER_COUNT;
+        if (*pitch > MAX_PITCH) *pitch = MAX_PITCH;
+        if (*pitch < -MAX_PITCH) *pitch = -MAX_PITCH;
+    }
+    PlayerInput in = {};
+    in.forward = (input->keys['W'] ? 1.0f : 0.0f) - (input->keys['S'] ? 1.0f : 0.0f);
+    in.strafe = (input->keys['D'] ? 1.0f : 0.0f) - (input->keys['A'] ? 1.0f : 0.0f);
+    in.jump = input->keys[KEY_SPACE];
+    in.yaw = *yaw;
+    in.pitch = *pitch;
+    return in;
+}
+
+static const char *net_state_name(net_client_state state) {
+    switch (state) {
+    case NC_CONNECTING: return "connecting";
+    case NC_LOADING: return "loading the world";
+    case NC_CONNECTED: return "online";
+    default: return "disconnected";
+    }
+}
+
+// Online: the world is the server's. Input goes out every tick, snapshots come back,
+// and what is drawn is the replica interpolated a little behind the server's clock.
+static int run_online(const options *o, plat_window *window, renderer *r, const char *backend,
+                      const r_mesh *meshes, r_mesh stars, draw_list *list, float *yaw, float *pitch) {
+    if (!net_init()) {
+        fputs("the network could not be initialised\n", stderr);
+        return 1;
+    }
+    game *g = (game *)malloc(sizeof(game));
+    game_init(g, CW_CLIENT);
+    net_client *net = (net_client *)malloc(sizeof(net_client));
+    if (!net_client_init(net, g, o->connect, NET_INTERP_DELAY)) {
+        fprintf(stderr, "could not resolve %s\n", o->connect);
+        game_destroy(g);
+        free(g);
+        free(net);
+        net_shutdown();
+        return 1;
+    }
+    char address[32];
+    net_address_format(net->server, address, sizeof(address));
+    fprintf(stderr, "connecting to %s\n", address);
+
+    double last_status = 0.0;
+    int status = 0;
+    plat_window_capture_mouse(window, true);
+    while (plat_window_poll(window)) {
+        PlayerInput in = read_input(window, yaw, pitch);
+        double now = net_seconds();
+        net_client_send_input(net, &in, now);
+        net_client_update(net, now);
+        if (net->state == NC_DISCONNECTED) {
+            fprintf(stderr, "disconnected: %s\n", net->failure);
+            status = 1;
+            break;
+        }
+        if (net->state == NC_CONNECTED) {
+            net_client_resolve(net, now);
+            game_client_frame(g);
+        }
+        if (now - last_status > 0.25) {
+            char prefix[160];
+            snprintf(prefix, sizeof(prefix), "Treasure Planet [%s] %s %s, %zu players, %.0f ms", backend, address,
+                     net_state_name(net->state), cw_query_count(g->q_players), net->rtt * 1000.0f);
+            set_status(window, g, net->state == NC_CONNECTED ? net->player : CW_INVALID_ENTITY, prefix);
+            last_status = now;
+        }
+        draw_world(r, window, g, net->state == NC_CONNECTED ? net->player : CW_INVALID_ENTITY, *yaw, *pitch, 1.0f,
+                   meshes, stars, list, net, NULL);
+    }
+    net_client_destroy(net);
+    free(net);
+    game_destroy(g);
+    free(g);
+    net_shutdown();
+    return status;
 }
 
 static int run(const options *o) {
@@ -237,16 +356,27 @@ static int run(const options *o) {
     r_mesh meshes[MESH_COUNT];
     meshes[MESH_CUBE] = renderer_mesh_cube(r);
     meshes[MESH_SPHERE] = renderer_mesh_sphere(r, 96, 64);
+    meshes[MESH_CAPSULE] = renderer_mesh_capsule(r, PLAYER_RADIUS, PLAYER_HEIGHT, 24, 8);
     r_mesh stars = create_stars(r);
-
-    game *g = (game *)malloc(sizeof(game));
-    game_init(g);
-    game_build_universe(g);
-    cw_entity_id player = game_spawn_player(g, o->has_position ? o->position : g->spawn);
 
     float yaw = o->yaw, pitch = o->pitch;
     draw_list list = {};
     int status = 0;
+
+    if (o->connect) {
+        status = run_online(o, window, r, backend, meshes, stars, &list, &yaw, &pitch);
+        free(list.items);
+        renderer_destroy(r);
+        plat_window_destroy(window);
+        return status;
+    }
+
+    game *g = (game *)malloc(sizeof(game));
+    game_init(g, CW_HOST);
+    game_build_universe(g);
+    cw_entity_id player = game_spawn_player(g, o->has_position ? o->position : g->spawn);
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "Treasure Planet [%s]", backend);
 
     if (o->capture_path) {
         // Scripted: no clock and no input, so every run produces the same picture.
@@ -254,9 +384,9 @@ static int run(const options *o) {
         uint8_t *pixels = NULL;
         // A few frames first, so a fresh swapchain has settled on the window's size.
         for (int i = 0; i < 4 && plat_window_poll(window); ++i)
-            draw_world(r, window, g, player, yaw, pitch, 1.0f, meshes, stars, &list, NULL);
+            draw_world(r, window, g, player, yaw, pitch, 1.0f, meshes, stars, &list, NULL, NULL);
         plat_window_poll(window);
-        draw_world(r, window, g, player, yaw, pitch, 1.0f, meshes, stars, &list, &pixels);
+        draw_world(r, window, g, player, yaw, pitch, 1.0f, meshes, stars, &list, NULL, &pixels);
         int width, height;
         plat_window_size(window, &width, &height);
         if (!pixels || !write_bmp(o->capture_path, pixels, width, height)) {
@@ -271,22 +401,8 @@ static int run(const options *o) {
         double last = plat_seconds(), last_status = 0.0;
         plat_window_capture_mouse(window, true);
         while (plat_window_poll(window)) {
-            const plat_input *input = plat_window_input(window);
-            if (input->keys[KEY_ESCAPE]) plat_window_capture_mouse(window, false);
-            if (input->clicked) plat_window_capture_mouse(window, true);
-            if (input->mouse_captured) {
-                yaw -= input->mouse_dx * MOUSE_RADIANS_PER_COUNT;
-                pitch -= input->mouse_dy * MOUSE_RADIANS_PER_COUNT;
-                if (pitch > MAX_PITCH) pitch = MAX_PITCH;
-                if (pitch < -MAX_PITCH) pitch = -MAX_PITCH;
-            }
-
             PlayerInput *in = CW_GET(&g->world, player, g->c_input, PlayerInput);
-            in->forward = (input->keys['W'] ? 1.0f : 0.0f) - (input->keys['S'] ? 1.0f : 0.0f);
-            in->strafe = (input->keys['D'] ? 1.0f : 0.0f) - (input->keys['A'] ? 1.0f : 0.0f);
-            in->jump = input->keys[KEY_SPACE];
-            in->yaw = yaw;
-            in->pitch = pitch;
+            *in = read_input(window, &yaw, &pitch);
 
             double now = plat_seconds();
             int steps = cw_clock_advance(&clock, (float)(now - last));
@@ -294,10 +410,10 @@ static int run(const options *o) {
             for (int i = 0; i < steps; ++i) game_tick(g);
 
             if (now - last_status > 0.25) {
-                set_status(window, g, player, backend);
+                set_status(window, g, player, prefix);
                 last_status = now;
             }
-            draw_world(r, window, g, player, yaw, pitch, cw_clock_alpha(&clock), meshes, stars, &list, NULL);
+            draw_world(r, window, g, player, yaw, pitch, cw_clock_alpha(&clock), meshes, stars, &list, NULL, NULL);
         }
     }
 
@@ -312,7 +428,7 @@ static int run(const options *o) {
 int main(int argc, char **argv) {
     options o;
     if (!parse_options(argc, argv, &o)) {
-        fputs("usage: treasure_planet [--renderer vulkan|gl]\n"
+        fputs("usage: treasure_planet [--renderer vulkan|gl] [--connect host[:port]]\n"
               "                       [--capture out.bmp [--ticks N] [--at X Y Z] [--look YAW PITCH]]\n", stderr);
         return 2;
     }

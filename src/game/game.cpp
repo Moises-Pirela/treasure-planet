@@ -84,12 +84,22 @@ static void system_ships(cw_world *w, cw_phase, float dt) {
             }
         }
     }
+}
+
+// Ship parts are derived state: hull transform plus a fixed offset, for both the
+// current and the previous position. Shared with clients, who receive only the hull
+// over the network and place the dozen parts of each ship themselves.
+static void system_attachments(cw_world *w, cw_phase, float) {
+    game *g = game_of(w);
     cw_query parts = cw_query_begin(g->q_attachments);
+    cw_entity_id id;
     while (cw_query_next(&parts, &id)) {
         const Attachment *a = CW_GET(w, id, g->c_attachment, Attachment);
         const Transform *ship_t = CW_GET(w, a->ship, g->c_transform, Transform);
         Transform *t = CW_GET(w, id, g->c_transform, Transform);
-        if (ship_t) t->position = v3_add(ship_t->position, a->offset);
+        if (!ship_t) continue;
+        t->position = v3_add(ship_t->position, a->offset);
+        t->previous = v3_add(ship_t->previous, a->offset);
     }
 }
 
@@ -205,11 +215,12 @@ static void system_remember_positions(cw_world *w, cw_phase, float) {
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
-void game_init(game *g) {
+void game_init(game *g, cw_sim_role role) {
     memset(g, 0, sizeof(*g));
+    g->role = role;
     cw_world *w = &g->world;
     cw_world_init(w, g);
-    cw_sim_init(&g->sim, CW_HOST);
+    cw_sim_init(&g->sim, role);
 
     cw_component_id base = cw_comp_block(w, 8);
     g->c_transform = cw_cid(base, 0);
@@ -238,6 +249,8 @@ void game_init(game *g) {
     g->q_players = cw_query_create(w, cw_filter_all(cw_mask(players, 3)));
     g->q_ships = cw_query_create(w, cw_filter_all(cw_mask(ships, 2)));
     g->q_attachments = cw_query_create(w, cw_filter_all(cw_mask(parts, 2)));
+    cw_component_id movers[] = {g->c_player, g->c_ship};
+    g->q_dynamic = cw_query_create(w, cw_filter_make(cw_mask(&g->c_transform, 1), cw_mask(movers, 2), cw_signature{}));
 
     cw_system_desc d = {};
     d.name = "remember_positions";
@@ -251,8 +264,14 @@ void game_init(game *g) {
     d.fn = system_ships;
     d.order = 10;
     cw_sim_register(&g->sim, d);
+    d.name = "attachments";
+    d.fn = system_attachments;
+    d.authority = CW_SHARED;
+    d.order = 15;
+    cw_sim_register(&g->sim, d);
     d.name = "players";
     d.fn = system_players;
+    d.authority = CW_HOST_ONLY;
     d.order = 20;
     cw_sim_register(&g->sim, d);
 }
@@ -264,17 +283,43 @@ void game_destroy(game *g) {
 
 void game_tick(game *g) { cw_sim_tick(&g->sim, &g->world, 1.0f / (float)GAME_TICK_HZ); }
 
+void game_client_frame(game *g) {
+    cw_sim_dispatch(&g->sim, &g->world, CW_UPDATE, 0.0f);   // shared systems only: attachments
+    cw_sim_entity_lifecycle(&g->sim, &g->world, 0.0f);
+}
+
+v3 game_player_color(cw_entity_id id) {
+    // A hue from the id, at a saturation and brightness that reads well against stone.
+    uint32_t h = (uint32_t)id * 2654435761u;
+    float hue = (float)(h >> 8) / 16777216.0f * 6.0f;
+    int sector = (int)hue;
+    float f = hue - (float)sector, lo = 0.25f, hi = 0.9f;
+    float up = lo + (hi - lo) * f, down = hi - (hi - lo) * f;
+    switch (sector % 6) {
+    case 0: return v3_make(hi, up, lo);
+    case 1: return v3_make(down, hi, lo);
+    case 2: return v3_make(lo, hi, up);
+    case 3: return v3_make(lo, down, hi);
+    case 4: return v3_make(up, lo, hi);
+    default: return v3_make(hi, lo, down);
+    }
+}
+
 cw_entity_id game_spawn_player(game *g, v3 position) {
     cw_world *w = &g->world;
     cw_entity_id id = cw_world_create_entity(w);
     Transform t = {position, position};
     Player p = {};
     PlayerInput in = {};
+    Visual visual = {MESH_CAPSULE, v3_make(1, 1, 1), game_player_color(id)};
     cw_comp_set(w, id, g->c_transform, &t, sizeof(t));
     cw_comp_set(w, id, g->c_player, &p, sizeof(p));
     cw_comp_set(w, id, g->c_input, &in, sizeof(in));
+    cw_comp_set(w, id, g->c_visual, &visual, sizeof(visual));
     return id;
 }
+
+void game_despawn_player(game *g, cw_entity_id id) { cw_world_mark_destroy(&g->world, id); }
 
 cw_entity_id game_ship_at(game *g, v3 point) {
     cw_world *w = &g->world;

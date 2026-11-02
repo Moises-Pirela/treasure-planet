@@ -36,7 +36,7 @@ static void run_seconds(game *g, float seconds) {
 
 static void test_players_stand_and_walls_block(void) {
     game *g = (game *)malloc(sizeof(game));
-    game_init(g);
+    game_init(g, CW_HOST);
     game_build_universe(g);
     cw_entity_id p = game_spawn_player(g, v3_add(g->spawn, v3_make(0, 2, 0)));
     run_seconds(g, 1.0f);
@@ -72,7 +72,7 @@ static void test_players_stand_and_walls_block(void) {
 // The whole loop, with two players boarding and one staying behind.
 static void test_boarding_and_flight(void) {
     game *g = (game *)malloc(sizeof(game));
-    game_init(g);
+    game_init(g, CW_HOST);
     game_build_universe(g);
 
     cw_entity_id ship_id = game_find_ship(g, "Emerald Skiff");
@@ -145,7 +145,7 @@ static void test_boarding_and_flight(void) {
 // Each planet has its own distinct ship, and they do not interfere.
 static void test_every_planet_has_a_ship(void) {
     game *g = (game *)malloc(sizeof(game));
-    game_init(g);
+    game_init(g, CW_HOST);
     game_build_universe(g);
     const char *names[] = {"Emerald Skiff", "Rust Hauler", "Blue Clipper"};
     cw_entity_id seen_planets[3];
@@ -163,7 +163,7 @@ static void test_every_planet_has_a_ship(void) {
 // The whole game state survives a save: the persistence an MMO stands on.
 static void test_save_and_restore(void) {
     game *a = (game *)malloc(sizeof(game));
-    game_init(a);
+    game_init(a, CW_HOST);
     game_build_universe(a);
     cw_entity_id player = game_spawn_player(a, a->spawn);
     run_seconds(a, 25.0f);     // the skiff is mid-flight by now
@@ -177,7 +177,7 @@ static void test_save_and_restore(void) {
     CHECK(cw_snapshot_save(&a->world, &save, &out, &error));
 
     game *b = (game *)malloc(sizeof(game));
-    game_init(b);
+    game_init(b, CW_HOST);
     cw_snapshot_load_config load = cw_snapshot_load_defaults();
     load.allow_raw = true;
     CHECK(cw_snapshot_load(&b->world, out.data, out.size, &load, &error));
