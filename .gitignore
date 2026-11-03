@@ -3,3 +3,4 @@ build/
 .vscode/
 *.bmp
 *.user
+.DS_Store

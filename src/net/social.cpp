@@ -214,7 +214,7 @@ bool social_load(social *s, const char *path) {
     for (uint32_t i = 0; ok && i < count; ++i) {
         uint64_t account = 0;
         char name[ACCOUNT_NAME_CAPACITY], platform[ACCOUNT_PLATFORM_CAPACITY];
-        character gear;
+        character gear = {};
         cw_reader_u64(&r, &account);
         ok = read_text(&r, name, sizeof(name)) && read_text(&r, platform, sizeof(platform)) && character_read(&r, &gear);
         if (!ok) break;

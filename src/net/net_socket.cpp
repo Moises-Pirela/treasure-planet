@@ -10,6 +10,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <timeapi.h>
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
@@ -54,6 +55,8 @@ struct net_socket {
 
 bool net_init(void) {
 #ifdef _WIN32
+    // By default Sleep rounds up to about 15 ms, nearly a whole tick; net_sleep asks for less.
+    timeBeginPeriod(1);
     WSADATA data;
     return WSAStartup(MAKEWORD(2, 2), &data) == 0;
 #else
@@ -64,6 +67,7 @@ bool net_init(void) {
 void net_shutdown(void) {
 #ifdef _WIN32
     WSACleanup();
+    timeEndPeriod(1);
 #endif
 }
 

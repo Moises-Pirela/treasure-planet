@@ -737,34 +737,6 @@ bool net_connection_receive(net_connection *c, const void *packet, size_t size, 
             }
             break;
         }
-<<<<<<< Updated upstream
-        uint16_t sequence = 0;
-        cw_reader_u16(&r, &sequence);
-        const unsigned char *payload = (const unsigned char *)cw_reader_view(&r, length);
-        if (!payload) break;
-        int distance = net_sequence_compare(sequence, c->receive_expected);
-        if (distance < 0 || distance >= NET_RELIABLE_WINDOW) continue;   // duplicate, or beyond the window
-        net_reliable_message *slot = &c->receive_slots[sequence % NET_RELIABLE_WINDOW];
-        if (slot->data) continue;                                        // already holding this one
-        slot->data = (unsigned char *)malloc(length ? length : 1);
-        memcpy(slot->data, payload, length);
-        slot->size = length;
-        slot->type = (uint8_t)(type & ~NET_RELIABLE_FLAG);
-
-        // Deliver everything that is now contiguous, in order.
-        for (;;) {
-            net_reliable_message *next = &c->receive_slots[c->receive_expected % NET_RELIABLE_WINDOW];
-            if (!next->data) break;
-            unsigned char *data = next->data;
-            size_t data_size = next->size;
-            uint8_t next_type = next->type;
-            next->data = NULL;
-            next->size = 0;
-            ++c->receive_expected;
-            deliver(c, next_type, data, data_size);
-            free(data);
-=======
->>>>>>> Stashed changes
         }
     }
     return true;

@@ -280,12 +280,8 @@ static PlayerInput read_input(plat_window *window, float *yaw, float *pitch) {
     PlayerInput in = {};
     in.forward = (input->keys['W'] ? 1.0f : 0.0f) - (input->keys['S'] ? 1.0f : 0.0f);
     in.strafe = (input->keys['D'] ? 1.0f : 0.0f) - (input->keys['A'] ? 1.0f : 0.0f);
-<<<<<<< Updated upstream
     in.jump = input->keys[PLAT_KEY_SPACE];
-=======
-    in.jump = input->keys[KEY_SPACE];
     in.act = input->clicked && input->mouse_captured;   // a click while playing is a swing
->>>>>>> Stashed changes
     in.yaw = *yaw;
     in.pitch = *pitch;
     return in;
@@ -322,7 +318,7 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
 
     double last_status = 0.0;
     int status = 0;
-    bool keys_before[256] = {};
+    bool keys_before[PLAT_KEY_COUNT] = {};
     plat_window_capture_mouse(window, true);
     while (plat_window_poll(window)) {
         PlayerInput in = read_input(window, yaw, pitch);
@@ -330,15 +326,15 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
         // Party keys, on the press: F1 create, I invite whoever is in view, F2 accept,
         // F3 leave, F4 decline.
         const plat_input *input = plat_window_input(window);
-        bool pressed[256];
-        for (int k = 0; k < 256; ++k) {
+        bool pressed[PLAT_KEY_COUNT];
+        for (int k = 0; k < PLAT_KEY_COUNT; ++k) {
             pressed[k] = input->keys[k] && !keys_before[k];
             keys_before[k] = input->keys[k];
         }
-        if (pressed[0x70]) net_session_party_request(&session, PARTY_CREATE, NULL);
-        if (pressed[0x71]) net_session_party_request(&session, PARTY_ACCEPT, NULL);
-        if (pressed[0x72]) net_session_party_request(&session, PARTY_LEAVE, NULL);
-        if (pressed[0x73]) net_session_party_request(&session, PARTY_DECLINE, NULL);
+        if (pressed[PLAT_KEY_F1]) net_session_party_request(&session, PARTY_CREATE, NULL);
+        if (pressed[PLAT_KEY_F2]) net_session_party_request(&session, PARTY_ACCEPT, NULL);
+        if (pressed[PLAT_KEY_F3]) net_session_party_request(&session, PARTY_LEAVE, NULL);
+        if (pressed[PLAT_KEY_F4]) net_session_party_request(&session, PARTY_DECLINE, NULL);
         if (pressed['I'] && session.link) {
             char name[ACCOUNT_NAME_CAPACITY];
             if (net_client_player_in_view(session.link, 6.0f, name)) net_session_party_request(&session, PARTY_INVITE, name);

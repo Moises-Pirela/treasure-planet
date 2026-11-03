@@ -1,6 +1,8 @@
-"""Compares two captures written by `treasure_planet --capture`, exiting 1 if they differ.
+"""Compares two captures written by `treasure_planet --capture`, exiting 1 if more
+than MAX_PIXELS pixels differ (default 0). Rasterisers break ties along triangle edges
+differently, so comparing two backends needs a small allowance.
 
-    python tools/compare_captures.py a.bmp b.bmp
+    python tools/compare_captures.py a.bmp b.bmp [MAX_PIXELS]
 """
 import struct
 import sys
@@ -32,7 +34,8 @@ def main():
     total = width_a * height_a
     print(f"{width_a}x{height_a}: {different} of {total} pixels differ, worst channel delta {worst}, "
           f"{len(distinct)} distinct colours")
-    return 1 if different else 0
+    allowed = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+    return 1 if different > allowed else 0
 
 
 if __name__ == "__main__":

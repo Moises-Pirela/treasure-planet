@@ -18,15 +18,16 @@ function(tp_strict target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /WX /permissive- /GR- /EHs-c- /utf-8)
         target_compile_definitions(${target} PRIVATE _HAS_EXCEPTIONS=0 _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    elseif(WIN32)
+        target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-missing-field-initializers
+                               $<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-truncation>
+                               -fno-exceptions -fno-rtti)
     else()
-<<<<<<< Updated upstream
         # Partial aggregate initialisation is the C idiom here: the rest is zero by definition.
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-missing-field-initializers
+                               $<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-truncation>
                                -fno-exceptions -fno-rtti)
-=======
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti
-            -Wno-missing-field-initializers -Wno-stringop-truncation)
->>>>>>> Stashed changes
     endif()
 endfunction()
 
@@ -41,7 +42,7 @@ tp_strict(tp_ecs)
 add_library(tp_game STATIC src/game/game.cpp src/game/universe.cpp src/game/dungeon.cpp src/game/items.cpp)
 target_link_libraries(tp_game PUBLIC tp_ecs)
 tp_strict(tp_game)
-if(NOT MSVC)
+if(NOT WIN32)
     target_link_libraries(tp_ecs PUBLIC m)
 endif()
 
@@ -55,7 +56,7 @@ add_library(tp_net STATIC
     src/net/process.cpp src/net/orchestrator.cpp)
 target_link_libraries(tp_net PUBLIC tp_game)
 if(WIN32)
-    target_link_libraries(tp_net PUBLIC ws2_32 bcrypt)
+    target_link_libraries(tp_net PUBLIC ws2_32 bcrypt winmm)
 endif()
 tp_strict(tp_net)
 
@@ -117,12 +118,8 @@ if(TP_BUILD_CLIENT)
 
     add_executable(treasure_planet
         src/client/main.cpp
-<<<<<<< Updated upstream
-        src/platform/platform_glfw.cpp
-=======
         src/client/hud.cpp
-        src/platform/platform_win32.cpp
->>>>>>> Stashed changes
+        src/platform/platform_glfw.cpp
         src/render/renderer.cpp
         src/render/backend_gl.cpp
         src/render/backend_vk.cpp)

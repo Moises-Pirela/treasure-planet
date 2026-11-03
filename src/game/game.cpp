@@ -126,9 +126,8 @@ static bool overlaps(v3 feet, v3 center, v3 half) {
         && feet.z + PLAYER_RADIUS > center.z - half.z && feet.z - PLAYER_RADIUS < center.z + half.z;
 }
 
-<<<<<<< Updated upstream
 static float *axis_of(v3 *v, int axis) { return axis == 0 ? &v->x : axis == 1 ? &v->y : &v->z; }
-=======
+
 // ---------------------------------------------------------------------------
 // The solid grid: every solid listed under each 2D cell (x, z) it touches, sorted
 // by cell key so a cell's solids are one binary search away. Rebuilt every tick,
@@ -183,7 +182,6 @@ static int solids_near(const game *g, v3 at, cw_entity_id *out) {
     for (int i = lo; i < g->grid_count && g->grid[i].key == key && n < GAME_GRID_MAX_NEARBY; ++i) out[n++] = g->grid[i].id;
     return n;
 }
->>>>>>> Stashed changes
 
 // Moves along one axis and stops at the first solid crossed. A solid the player is
 // well inside (a ship landed on them) is ignored, so nobody can get stuck; "well"

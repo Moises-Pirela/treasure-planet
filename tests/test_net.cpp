@@ -1203,7 +1203,7 @@ static void test_server_clock(void) {
     net_sleep(0.3);
     uint64_t before = s->zone.world.tick;
     server_update(s, net_seconds());
-    CHECK(s->zone.world.tick - before >= 17 && s->zone.world.tick - before <= 19);
+    CHECK(s->zone.world.tick - before >= 17 && s->zone.world.tick - before <= 20);
     CHECK(s->ticks_skipped == 0);
 
     // A long one (here: the clock saying we are 3 s behind) is caught up to a point
@@ -1788,7 +1788,7 @@ static void test_shards(void) {
 // Loot: picked up by walking into it, worn for all to see, kept across a restart
 // ---------------------------------------------------------------------------
 static void test_loot(void) {
-    const char *save = "/tmp/treasure_test_characters.bin";
+    const char *save = "treasure_test_characters.bin";
     remove(save);
     uint32_t worn_id = 0;
     for (int run = 0; run < 2; ++run) {

@@ -21,7 +21,7 @@ item item_roll(uint32_t seed, int level) {
     it.slot = (uint8_t)(r % SLOT_COUNT);
     // Rarity: half common, then a quarter, an eighth, a sixteenth, and the rest legendary.
     uint32_t roll = mix(r) % 1000;
-    it.rarity = roll < 500 ? RARITY_COMMON : roll < 750 ? RARITY_UNCOMMON : roll < 875 ? RARITY_RARE : roll < 970 ? RARITY_EPIC : RARITY_LEGENDARY;
+    it.rarity = (uint8_t)(roll < 500 ? RARITY_COMMON : roll < 750 ? RARITY_UNCOMMON : roll < 875 ? RARITY_RARE : roll < 970 ? RARITY_EPIC : RARITY_LEGENDARY);
     it.power = (uint16_t)(10 * (level < 1 ? 1 : level) + 5 * it.rarity + (int)(mix(r + 1) % 10));
     return it;
 }
