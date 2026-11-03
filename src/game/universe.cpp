@@ -109,13 +109,22 @@ static void spawn_ship(game *g, const planet_row *row, cw_entity_id planet, v3 h
 }
 
 static void declare_place(game *g, const char *name, v3 center, v3 half, v3 spawn) {
-    if (g->place_count == GAME_MAX_PLACES) return;
-    game_place *place = &g->places[g->place_count++];
-    memset(place, 0, sizeof(*place));
-    strncpy(place->name, name, GAME_NAME_CAPACITY - 1);
-    place->center = center;
-    place->half = half;
-    place->spawn = spawn;
+    game_declare_place(g, name, PLACE_ZONE, center, half, spawn, NULL);
+}
+
+// The door to the planet's dungeon, at the far side of the pad: two posts, a lintel
+// and a dark slab, with the entrance place inside the frame.
+static void spawn_dungeon_door(game *g, const planet_row *row, v3 pad) {
+    v3 door = v3_add(pad, v3_make(0, 1.0f, PAD_HALF - 6.0f));   // on the pad's surface
+    v3 post_color = v3_scale(row->color, 0.5f), dark = v3_make(0.03f, 0.02f, 0.06f);
+    spawn_block(g, v3_add(door, v3_make(-2.2f, 2.0f, 0)), v3_make(0.4f, 2.0f, 0.6f), post_color);
+    spawn_block(g, v3_add(door, v3_make(2.2f, 2.0f, 0)), v3_make(0.4f, 2.0f, 0.6f), post_color);
+    spawn_block(g, v3_add(door, v3_make(0, 4.4f, 0)), v3_make(2.6f, 0.4f, 0.6f), post_color);
+    spawn_block(g, v3_add(door, v3_make(0, 2.0f, 1.2f)), v3_make(1.8f, 2.0f, 0.2f), dark);   // what you walk into
+    char dungeon[GAME_NAME_CAPACITY];
+    game_dungeon_name(row->planet, dungeon, sizeof(dungeon));
+    game_declare_place(g, dungeon, PLACE_ENTRANCE, v3_add(door, v3_make(0, 2.0f, 0.3f)), v3_make(1.6f, 2.0f, 0.7f),
+                       v3_add(door, v3_make(0, 0, -4.0f)), row->planet);
 }
 
 static void spawn_planet(game *g, const planet_row *row) {
@@ -127,6 +136,7 @@ static void spawn_planet(game *g, const planet_row *row) {
     // is not, so a passenger who stays aboard rides back.
     declare_place(g, row->planet, v3_add(pad, v3_make(0, 20.0f, 0)), v3_make(PAD_HALF, 21.0f, PAD_HALF),
                   v3_add(pad, v3_make(0, 1.0f, 10.0f)));
+    spawn_dungeon_door(g, row, pad);
     spawn_block(g, v3_add(pad, v3_make(10, 2.0f, 8)), v3_make(2, 1, 2), v3_scale(row->color, 0.8f));
     spawn_block(g, v3_add(pad, v3_make(-14, 2.5f, 15)), v3_make(3, 1.5f, 2), v3_scale(row->color, 0.7f));
 

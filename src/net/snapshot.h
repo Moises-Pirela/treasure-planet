@@ -31,6 +31,7 @@ struct snapshot_entry {
     uint16_t yaw;
     int16_t pitch;
     uint8_t flags;
+    uint16_t hits_made, hits_taken;
     float priority;              // sender only: distance to the receiving player
 };
 
@@ -62,7 +63,7 @@ snapshot *snapshot_ring_push(snapshot_ring *ring, uint16_t count);
 
 // Quantisation.
 snapshot_entry snapshot_entry_make(cw_entity_id id, cw_entity_id aboard, v3 position, v3 velocity, float yaw,
-                                   float pitch, bool grounded);
+                                   float pitch, bool grounded, uint16_t hits_made, uint16_t hits_taken);
 v3 snapshot_position(const snapshot_entry *e);   // relative to the ship when aboard
 v3 snapshot_velocity(const snapshot_entry *e);
 float snapshot_yaw(const snapshot_entry *e);

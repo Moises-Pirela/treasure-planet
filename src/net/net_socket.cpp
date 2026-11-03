@@ -44,8 +44,12 @@ static bool net_transient_error(int error) { return error == ECONNREFUSED || err
 struct net_socket {
     net_handle handle;
     uint16_t port;
-    float loss;
+    float loss, reorder;
     uint32_t loss_seed;
+    // A packet held back for reordering, sent after the next one.
+    unsigned char held[NET_MAX_PACKET];
+    size_t held_size;
+    net_address held_to;
 };
 
 bool net_init(void) {
@@ -138,6 +142,11 @@ net_socket *net_socket_open(uint16_t port) {
 #else
     fcntl(handle, F_SETFL, fcntl(handle, F_GETFL, 0) | O_NONBLOCK);
 #endif
+    // Room for a burst: a server hears from a thousand clients between two reads.
+    // The system caps this (Linux: net.core.rmem_max); whatever it allows is taken.
+    int buffer = 4 * 1024 * 1024;
+    setsockopt(handle, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer, sizeof(buffer));
+    setsockopt(handle, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer, sizeof(buffer));
     struct sockaddr_in bound;
     socklen_t length = sizeof(bound);
     uint16_t bound_port = port;
@@ -163,15 +172,36 @@ void net_socket_close(net_socket *s) {
 uint16_t net_socket_port(const net_socket *s) { return s->port; }
 
 void net_socket_set_loss(net_socket *s, float fraction) { s->loss = fraction; }
+void net_socket_set_reorder(net_socket *s, float fraction) { s->reorder = fraction; }
 
-bool net_socket_send(net_socket *s, net_address to, const void *data, size_t size) {
-    if (s->loss > 0.0f) {
-        s->loss_seed = s->loss_seed * 1664525u + 1013904223u;
-        if ((float)(s->loss_seed >> 8) / 16777216.0f < s->loss) return true;   // "sent", then lost
-    }
+static float roll(net_socket *s) {
+    s->loss_seed = s->loss_seed * 1664525u + 1013904223u;
+    return (float)(s->loss_seed >> 8) / 16777216.0f;
+}
+
+static bool raw_send(net_socket *s, net_address to, const void *data, size_t size) {
     struct sockaddr_in sa = to_sockaddr(to);
     int sent = (int)sendto(s->handle, (const char *)data, (net_length)size, 0, (struct sockaddr *)&sa, sizeof(sa));
     return sent == (int)size;
+}
+
+bool net_socket_send(net_socket *s, net_address to, const void *data, size_t size) {
+    if (s->loss > 0.0f && roll(s) < s->loss) return true;   // "sent", then lost
+    if (s->reorder > 0.0f) {
+        if (s->held_size) {   // the one held back leaves behind this one
+            bool ok = raw_send(s, to, data, size);
+            raw_send(s, s->held_to, s->held, s->held_size);
+            s->held_size = 0;
+            return ok;
+        }
+        if (size <= sizeof(s->held) && roll(s) < s->reorder) {
+            memcpy(s->held, data, size);
+            s->held_size = size;
+            s->held_to = to;
+            return true;
+        }
+    }
+    return raw_send(s, to, data, size);
 }
 
 int net_socket_recv(net_socket *s, net_address *from, void *data, size_t capacity) {

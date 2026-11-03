@@ -20,9 +20,11 @@
 
 #include "../ecs/clockwork.h"
 #include "../tp_math.h"
+#include "items.h"
 
 #define GAME_TICK_HZ 60
 #define GAME_NAME_CAPACITY 32
+#define GAME_GRID_CELL 16.0f     // metres; a solid is listed in every cell it touches
 
 // Components. Plain data, zero is a valid "unset" for every field.
 struct Transform {
@@ -44,12 +46,18 @@ struct PlayerInput {             // what a client sends each tick
     float forward, strafe;       // -1..1
     float yaw, pitch;
     bool jump;
+    bool act;                    // swing: tag whoever is within reach in front
 };
 struct Player {
     v3 velocity;
     float yaw, pitch;
     bool grounded;
+    float swing_cooldown;        // seconds until the next swing counts
+    uint16_t hits_made, hits_taken;
+    char name[GAME_NAME_CAPACITY];   // the display name, as the account service has it
 };
+#define PLAYER_REACH 3.0f        // metres a swing carries, from the eyes
+#define PLAYER_SWING_COOLDOWN 0.5f
 enum ship_state { SHIP_DOCKED, SHIP_FLYING };
 enum ship_stop { STOP_HUB, STOP_PLANET };
 struct Ship {
@@ -68,19 +76,40 @@ struct Ship {
 struct Planet {
     char name[GAME_NAME_CAPACITY];
 };
+struct Equipment {               // what a player wears, for everyone to see
+    item items[SLOT_COUNT];
+};
+struct Loot {                    // an item lying in the world, taken by walking into it
+    item it;
+};
+struct Owned {                   // who an entity belongs to: the account whose player it is (later:
+    uint64_t account;            // whose loot, whose ship). Only the owner's client may drive it, and it
+};                               // outlives the owner's connection for a while
+#define LOOT_REACH 0.9f          // metres from a player's feet at which loot is taken
 
 // MESH_CAPSULE is a player: PLAYER_RADIUS wide and PLAYER_HEIGHT tall with its feet
 // at the origin, so it is drawn unscaled (Visual.half of 1) at the Transform.
 enum visual_mesh { MESH_CUBE, MESH_SPHERE, MESH_CAPSULE, MESH_COUNT };
 
-// A place is somewhere players stand still long enough to belong to: the hub, a
-// planet's landing pad. Zone servers own places; a player who walks into a place
-// another server owns is handed over. Ships in flight are between places.
-#define GAME_MAX_PLACES 8
+// A place is a box a player can be "at", and walking into one may move them to
+// another world:
+//   PLACE_ZONE      the hub, a planet's landing pad. Zone servers own these, and a
+//                   player who walks into one another server owns is handed over.
+//                   `spawn` is where a player arriving fresh stands.
+//   PLACE_ENTRANCE  a dungeon door. `name` is the dungeon, `destination` the zone
+//                   place it stands in, `spawn` the spot in front of it a player
+//                   comes back to.
+//   PLACE_EXIT      the way out of a dungeon. `destination` and `spawn` are the
+//                   place and position to return to.
+// Ships in flight are between places.
+#define GAME_MAX_PLACES 12
+enum place_kind { PLACE_ZONE, PLACE_ENTRANCE, PLACE_EXIT };
 struct game_place {
     char name[GAME_NAME_CAPACITY];
+    int kind;                    // place_kind
     v3 center, half;             // the box a player must be inside to be "at" the place
-    v3 spawn;                    // where a player arriving fresh stands
+    v3 spawn;
+    char destination[GAME_NAME_CAPACITY];
 };
 
 struct game {
@@ -88,12 +117,21 @@ struct game {
     cw_sim sim;
     cw_sim_role role;
     cw_component_id c_transform, c_solid, c_attachment, c_visual, c_input, c_player, c_ship, c_planet;
+    cw_component_id c_equipment, c_loot, c_owned;
     cw_cached_query *q_solids, *q_players, *q_ships, *q_attachments;
     cw_cached_query *q_all_players;   // every player, with or without an input
+    cw_cached_query *q_loot;
+    // Broadphase for the solids: rebuilt every tick, so that a player's collision
+    // test touches the few solids around it rather than every one in the world.
+    struct { int32_t key; cw_entity_id id; } *grid;
+    int grid_count, grid_capacity;
     v3 spawn;
     double universe_base;        // universe time at tick zero
     game_place places[GAME_MAX_PLACES];
     int place_count;
+    char dungeon[GAME_NAME_CAPACITY];   // set when this world is a dungeon
+    v3 dungeon_path[GAME_MAX_PLACES];   // room centres in order
+    int dungeon_rooms;
 };
 
 void game_init(game *g, cw_sim_role role);
@@ -109,8 +147,24 @@ double game_time_of_tick(const game *g, uint64_t tick);
 // previous position included, carrying nobody: for a replica whose tick just moved.
 void game_place_ships(game *g);
 
-// Builds the hub, the planets and one ship per planet, and declares the places.
+// Builds the hub, the planets and one ship per planet, and declares the places: each
+// planet has a dungeon whose door stands on its landing pad.
 void game_build_universe(game *g);
+// Builds a dungeon instead: rooms and corridors generated from the name, with the
+// spawn in the first room and an exit in the last that returns to `return_place`
+// at `return_position`, and a few chests of loot rolled from `loot_seed` (different
+// every run). A world holds one or the other, never both.
+void game_build_dungeon(game *g, const char *name, const char *return_place, v3 return_position, uint32_t loot_seed);
+// Loot lying within reach of a player standing at `feet`, or CW_INVALID_ENTITY.
+cw_entity_id game_loot_at(game *g, v3 feet);
+cw_entity_id game_spawn_loot(game *g, v3 position, const item *it);
+void game_set_owner(game *g, cw_entity_id id, uint64_t account);
+uint64_t game_owner(game *g, cw_entity_id id);   // 0 when unowned
+// The dungeon of a zone place, as named on its door ("Verdant" -> "Verdant Depths").
+void game_dungeon_name(const char *place, char *out, size_t capacity);
+// The rooms of a dungeon in walking order (for bots and tests); returns the count.
+int game_dungeon_path(const game *g, v3 *out, int capacity);
+void game_declare_place(game *g, const char *name, int kind, v3 center, v3 half, v3 spawn, const char *destination);
 // Players are capsules, coloured by their id so two players never look alike. The
 // input component is what makes a player simulated: a replica leaves it off every
 // player but its own.
@@ -126,6 +180,9 @@ cw_entity_id game_find_ship(game *g, const char *name);
 int game_place_at(const game *g, v3 point);
 int game_find_place(const game *g, const char *name);
 v3 game_ship_position(const Ship *ship, float t01, bool to_planet);
+// Whether a swing from `eye` along `direction` (unit) reaches a player standing at
+// `feet`: a ray of PLAYER_REACH against their capsule.
+bool game_swing_hits(v3 eye, v3 direction, v3 feet);
 // Where the timetable puts a ship at a universe time; fills the derived fields.
 v3 game_ship_at_time(Ship *ship, double universe_time);
 

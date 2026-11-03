@@ -43,6 +43,56 @@ int net_zones_owner(const net_zone_table *t, const char *place) {
     return -1;
 }
 
+static bool has_room(const net_zone *z) { return !z->draining && (z->capacity == 0 || z->clients < z->capacity); }
+
+int net_zones_choose(const net_zone_table *t, const char *place, const char *region, const char *const *with,
+                     int with_count) {
+    // Party first: the shard the most members are on, if it has room.
+    int best = -1, best_members = 0;
+    for (int i = 0; i < t->count; ++i) {
+        const net_zone *z = &t->zones[i];
+        if (z->instance_host || !has_room(z)) continue;
+        bool owns = false;
+        for (int k = 0; k < z->place_count; ++k) owns = owns || strcmp(z->places[k], place) == 0;
+        if (!owns) continue;
+        int members = 0;
+        for (int k = 0; k < with_count; ++k) members += strcmp(with[k], z->name) == 0;
+        if (members > best_members) {
+            best = i;
+            best_members = members;
+        }
+    }
+    if (best >= 0) return best;
+    // Then the region, then anywhere: fill the fullest shard below its target; when
+    // every one is at or past its target, the emptiest takes the newcomer.
+    for (int pass = 0; pass < 2; ++pass) {
+        int fullest = -1, emptiest = -1;
+        for (int i = 0; i < t->count; ++i) {
+            const net_zone *z = &t->zones[i];
+            if (z->instance_host || !has_room(z)) continue;
+            bool owns = false;
+            for (int k = 0; k < z->place_count; ++k) owns = owns || strcmp(z->places[k], place) == 0;
+            if (!owns) continue;
+            if (pass == 0 && region && *region && strcmp(z->region, region) != 0) continue;
+            if ((z->target == 0 || z->clients < z->target) && (fullest < 0 || z->clients > t->zones[fullest].clients)) fullest = i;
+            if (emptiest < 0 || z->clients < t->zones[emptiest].clients) emptiest = i;
+        }
+        if (fullest >= 0) return fullest;
+        if (emptiest >= 0) return emptiest;
+    }
+    return -1;
+}
+
+int net_zones_instance_host(const net_zone_table *t, uint64_t key) {
+    int hosts = 0;
+    for (int i = 0; i < t->count; ++i) hosts += t->zones[i].instance_host;
+    if (!hosts) return -1;
+    int pick = (int)(key % (uint64_t)hosts);
+    for (int i = 0; i < t->count; ++i)
+        if (t->zones[i].instance_host && pick-- == 0) return i;
+    return -1;
+}
+
 // The next whitespace-delimited word of a line, NUL-terminated in place; NULL at the end.
 static char *next_word(char **cursor) {
     char *c = *cursor;
@@ -99,8 +149,27 @@ bool net_zones_load(net_zone_table *t, const char *path, char *error, size_t err
             for (;;) {
                 char *place = next_word(&cursor);
                 if (!place) break;
-                net_zone_add_place(&t->zones[index], place);
+                if (strncmp(place, "region=", 7) == 0) strncpy(t->zones[index].region, place + 7, NET_REGION_NAME - 1);
+                else if (strncmp(place, "target=", 7) == 0) t->zones[index].target = (uint16_t)atoi(place + 7);
+                else if (strncmp(place, "capacity=", 9) == 0) t->zones[index].capacity = (uint16_t)atoi(place + 9);
+                else net_zone_add_place(&t->zones[index], place);
             }
+        } else if (strcmp(word, "instances") == 0) {
+            char *name = next_word(&cursor);
+            char *address_text = name ? next_word(&cursor) : NULL;
+            net_address address;
+            if (!name || !address_text || !net_address_parse(address_text, NET_DEFAULT_PORT, &address)) {
+                snprintf(error, error_capacity, "%s:%d: expected instances <name> <host:port>", path, number);
+                fclose(f);
+                return false;
+            }
+            int index = net_zones_add(t, name, address);
+            if (index < 0) {
+                snprintf(error, error_capacity, "%s:%d: more than %d zones", path, number, NET_MAX_ZONES);
+                fclose(f);
+                return false;
+            }
+            t->zones[index].instance_host = true;
         } else {
             snprintf(error, error_capacity, "%s:%d: unknown directive '%s'", path, number, word);
             fclose(f);
@@ -166,42 +235,135 @@ static void write_v3(cw_writer *w, v3 v) {
     cw_writer_f32(w, v.y);
     cw_writer_f32(w, v.z);
 }
+static v3 read_v3(cw_reader *r) {
+    v3 v = {};
+    cw_reader_f32(r, &v.x);
+    cw_reader_f32(r, &v.y);
+    cw_reader_f32(r, &v.z);
+    return v;
+}
+static void write_name(cw_writer *w, const char *name) {
+    uint8_t length = (uint8_t)strnlen(name, NET_ZONE_NAME - 1);
+    cw_writer_u8(w, length);
+    cw_writer_bytes(w, name, length);
+}
+static bool read_name(cw_reader *r, char *name) {
+    uint8_t length = 0;
+    cw_reader_u8(r, &length);
+    if (length >= NET_ZONE_NAME) return false;
+    memset(name, 0, NET_ZONE_NAME);
+    return cw_reader_bytes(r, name, length);
+}
+
+// Encoding: u16 body length, the body, u64 SipHash of the body.
+static void write_text(cw_writer *w, const char *text, size_t capacity) {
+    uint8_t length = (uint8_t)strnlen(text, capacity - 1);
+    cw_writer_u8(w, length);
+    cw_writer_bytes(w, text, length);
+}
+static bool read_text(cw_reader *r, char *text, size_t capacity) {
+    uint8_t length = 0;
+    cw_reader_u8(r, &length);
+    if (length >= capacity) return false;
+    memset(text, 0, capacity);
+    return cw_reader_bytes(r, text, length);
+}
+
+// Signed bodies start with what they are, so that one kind is never read as another.
+enum { SIGNED_TICKET = 1, SIGNED_TOKEN = 2 };
 
 void net_ticket_write(cw_writer *w, const net_ticket *t, const net_zone_table *zones) {
     unsigned char body[NET_TICKET_SIZE];
     cw_writer b;
     cw_writer_init_fixed(&b, body, sizeof(body));
+    cw_writer_u8(&b, SIGNED_TICKET);
     cw_writer_u64(&b, t->account);
+    write_text(&b, t->name, ACCOUNT_NAME_CAPACITY);
+    write_text(&b, t->platform, ACCOUNT_PLATFORM_CAPACITY);
     write_v3(&b, t->position);
     write_v3(&b, t->velocity);
     cw_writer_f32(&b, t->yaw);
     cw_writer_f32(&b, t->pitch);
     cw_writer_f64(&b, t->issued);
+    write_name(&b, t->dungeon);
+    cw_writer_u64(&b, t->key);
+    write_name(&b, t->return_place);
+    write_v3(&b, t->return_position);
     uint64_t k0, k1;
     secret_keys(zones, &k0, &k1);
+    cw_writer_u16(w, (uint16_t)b.size);
     cw_writer_bytes(w, body, b.size);
     cw_writer_u64(w, net_siphash(body, b.size, k0, k1));
 }
 
 bool net_ticket_read(cw_reader *r, net_ticket *t, const net_zone_table *zones) {
-    const size_t body_size = 8 + 12 + 12 + 4 + 4 + 8;
+    uint16_t body_size = 0;
+    cw_reader_u16(r, &body_size);
+    if (!cw_reader_ok(r) || body_size > NET_TICKET_SIZE) return false;
     const unsigned char *body = (const unsigned char *)cw_reader_view(r, body_size);
     uint64_t signature = 0;
     if (!body || !cw_reader_u64(r, &signature)) return false;
     uint64_t k0, k1;
     secret_keys(zones, &k0, &k1);
     if (net_siphash(body, body_size, k0, k1) != signature) return false;
+    memset(t, 0, sizeof(*t));
     cw_reader b = cw_reader_make(body, body_size);
+    uint8_t kind = 0;
+    cw_reader_u8(&b, &kind);
+    if (kind != SIGNED_TICKET) return false;
     cw_reader_u64(&b, &t->account);
-    cw_reader_f32(&b, &t->position.x);
-    cw_reader_f32(&b, &t->position.y);
-    cw_reader_f32(&b, &t->position.z);
-    cw_reader_f32(&b, &t->velocity.x);
-    cw_reader_f32(&b, &t->velocity.y);
-    cw_reader_f32(&b, &t->velocity.z);
+    if (!read_text(&b, t->name, ACCOUNT_NAME_CAPACITY) || !read_text(&b, t->platform, ACCOUNT_PLATFORM_CAPACITY)) return false;
+    t->position = read_v3(&b);
+    t->velocity = read_v3(&b);
     cw_reader_f32(&b, &t->yaw);
     cw_reader_f32(&b, &t->pitch);
     cw_reader_f64(&b, &t->issued);
+    if (!read_name(&b, t->dungeon)) return false;
+    cw_reader_u64(&b, &t->key);
+    if (!read_name(&b, t->return_place)) return false;
+    t->return_position = read_v3(&b);
     t->signature = signature;
-    return cw_reader_ok(&b);
+    return cw_reader_at_end(&b);
+}
+
+void net_token_write(cw_writer *w, const net_connect_token *t, const net_zone_table *zones) {
+    unsigned char body[NET_TOKEN_SIZE];
+    cw_writer b;
+    cw_writer_init_fixed(&b, body, sizeof(body));
+    cw_writer_u8(&b, SIGNED_TOKEN);
+    cw_writer_u64(&b, t->account);
+    write_text(&b, t->name, ACCOUNT_NAME_CAPACITY);
+    write_text(&b, t->platform, ACCOUNT_PLATFORM_CAPACITY);
+    write_text(&b, t->zone, NET_ZONE_NAME);
+    cw_writer_f64(&b, t->expires);
+    cw_writer_u64(&b, t->nonce);
+    uint64_t k0, k1;
+    secret_keys(zones, &k0, &k1);
+    cw_writer_u16(w, (uint16_t)b.size);
+    cw_writer_bytes(w, body, b.size);
+    cw_writer_u64(w, net_siphash(body, b.size, k0, k1));
+}
+
+bool net_token_read(cw_reader *r, net_connect_token *t, const net_zone_table *zones) {
+    uint16_t body_size = 0;
+    cw_reader_u16(r, &body_size);
+    if (!cw_reader_ok(r) || body_size > NET_TOKEN_SIZE) return false;
+    const unsigned char *body = (const unsigned char *)cw_reader_view(r, body_size);
+    uint64_t signature = 0;
+    if (!body || !cw_reader_u64(r, &signature)) return false;
+    uint64_t k0, k1;
+    secret_keys(zones, &k0, &k1);
+    if (net_siphash(body, body_size, k0, k1) != signature) return false;
+    memset(t, 0, sizeof(*t));
+    cw_reader b = cw_reader_make(body, body_size);
+    uint8_t kind = 0;
+    cw_reader_u8(&b, &kind);
+    if (kind != SIGNED_TOKEN) return false;
+    cw_reader_u64(&b, &t->account);
+    if (!read_text(&b, t->name, ACCOUNT_NAME_CAPACITY) || !read_text(&b, t->platform, ACCOUNT_PLATFORM_CAPACITY)
+        || !read_text(&b, t->zone, NET_ZONE_NAME)) return false;
+    cw_reader_f64(&b, &t->expires);
+    cw_reader_u64(&b, &t->nonce);
+    t->signature = signature;
+    return cw_reader_at_end(&b);
 }

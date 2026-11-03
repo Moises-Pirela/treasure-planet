@@ -5,7 +5,8 @@
 // Per-entry change bits, after the id.
 enum {
     CHANGE_ABOARD = 1, CHANGE_POSITION = 2, CHANGE_VELOCITY = 4, CHANGE_ANGLES = 8, CHANGE_FLAGS = 16,
-    CHANGE_NEW = 32              // not in the base: every field follows, coded against zero
+    CHANGE_NEW = 32,             // not in the base: every field follows, coded against zero
+    CHANGE_STATS = 64
 };
 
 void snapshot_reserve(snapshot *s, uint16_t count) {
@@ -51,10 +52,12 @@ static int32_t quantize(float value, float scale) {
 }
 
 snapshot_entry snapshot_entry_make(cw_entity_id id, cw_entity_id aboard, v3 position, v3 velocity, float yaw,
-                                   float pitch, bool grounded) {
+                                   float pitch, bool grounded, uint16_t hits_made, uint16_t hits_taken) {
     snapshot_entry e = {};
     e.id = id;
     e.aboard = aboard;
+    e.hits_made = hits_made;
+    e.hits_taken = hits_taken;
     e.position[0] = quantize(position.x, SNAPSHOT_POSITION_SCALE);
     e.position[1] = quantize(position.y, SNAPSHOT_POSITION_SCALE);
     e.position[2] = quantize(position.z, SNAPSHOT_POSITION_SCALE);
@@ -119,13 +122,14 @@ bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w) {
         uint8_t change = 0;
         if (!b) {
             b = &zero;
-            change = CHANGE_NEW | CHANGE_ABOARD | CHANGE_POSITION | CHANGE_VELOCITY | CHANGE_ANGLES | CHANGE_FLAGS;
+            change = CHANGE_NEW | CHANGE_ABOARD | CHANGE_POSITION | CHANGE_VELOCITY | CHANGE_ANGLES | CHANGE_FLAGS | CHANGE_STATS;
         } else {
             if (e->aboard != b->aboard) change |= CHANGE_ABOARD;
             if (memcmp(e->position, b->position, sizeof(e->position)) != 0) change |= CHANGE_POSITION;
             if (memcmp(e->velocity, b->velocity, sizeof(e->velocity)) != 0) change |= CHANGE_VELOCITY;
             if (e->yaw != b->yaw || e->pitch != b->pitch) change |= CHANGE_ANGLES;
             if (e->flags != b->flags) change |= CHANGE_FLAGS;
+            if (e->hits_made != b->hits_made || e->hits_taken != b->hits_taken) change |= CHANGE_STATS;
         }
         write_id(w, e->id);
         cw_writer_u8(w, change);
@@ -139,6 +143,10 @@ bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w) {
             net_write_svarint(w, (int64_t)e->pitch - b->pitch);
         }
         if (change & CHANGE_FLAGS) cw_writer_u8(w, e->flags);
+        if (change & CHANGE_STATS) {
+            net_write_uvarint(w, e->hits_made);
+            net_write_uvarint(w, e->hits_taken);
+        }
     }
     return cw_writer_ok(w);
 }
@@ -196,6 +204,12 @@ bool snapshot_decode(cw_reader *r, const snapshot *base, snapshot *out) {
             e->pitch = (int16_t)(b->pitch + dpitch);
         }
         if (change & CHANGE_FLAGS) cw_reader_u8(r, &e->flags);
+        if (change & CHANGE_STATS) {
+            uint64_t made = 0, taken = 0;
+            if (!net_read_uvarint(r, &made) || !net_read_uvarint(r, &taken)) return false;
+            e->hits_made = (uint16_t)made;
+            e->hits_taken = (uint16_t)taken;
+        }
         if (!cw_reader_ok(r)) return false;
         ++out->count;
     }

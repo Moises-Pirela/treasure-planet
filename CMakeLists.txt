@@ -19,9 +19,14 @@ function(tp_strict target)
         target_compile_options(${target} PRIVATE /W4 /WX /permissive- /GR- /EHs-c- /utf-8)
         target_compile_definitions(${target} PRIVATE _HAS_EXCEPTIONS=0 _CRT_SECURE_NO_WARNINGS NOMINMAX)
     else()
+<<<<<<< Updated upstream
         # Partial aggregate initialisation is the C idiom here: the rest is zero by definition.
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-missing-field-initializers
                                -fno-exceptions -fno-rtti)
+=======
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti
+            -Wno-missing-field-initializers -Wno-stringop-truncation)
+>>>>>>> Stashed changes
     endif()
 endfunction()
 
@@ -33,7 +38,7 @@ add_library(tp_ecs STATIC
     src/ecs/cw_snapshot.cpp src/ecs/cw_file.cpp src/ecs/cw_sim.cpp)
 tp_strict(tp_ecs)
 
-add_library(tp_game STATIC src/game/game.cpp src/game/universe.cpp)
+add_library(tp_game STATIC src/game/game.cpp src/game/universe.cpp src/game/dungeon.cpp src/game/items.cpp)
 target_link_libraries(tp_game PUBLIC tp_ecs)
 tp_strict(tp_game)
 if(NOT MSVC)
@@ -45,11 +50,12 @@ endif()
 # headless, so the server runs on Linux and the tests run the whole stack in-process.
 # ---------------------------------------------------------------------------
 add_library(tp_net STATIC
-    src/net/net_socket.cpp src/net/net_connection.cpp src/net/snapshot.cpp src/net/zones.cpp
-    src/net/protocol.cpp src/net/server.cpp src/net/client.cpp)
+    src/net/net_socket.cpp src/net/net_connection.cpp src/net/crypto.cpp src/net/accounts.cpp src/net/snapshot.cpp
+    src/net/zones.cpp src/net/social.cpp src/net/directory.cpp src/net/protocol.cpp src/net/server.cpp src/net/client.cpp
+    src/net/process.cpp src/net/orchestrator.cpp)
 target_link_libraries(tp_net PUBLIC tp_game)
 if(WIN32)
-    target_link_libraries(tp_net PUBLIC ws2_32)
+    target_link_libraries(tp_net PUBLIC ws2_32 bcrypt)
 endif()
 tp_strict(tp_net)
 
@@ -57,13 +63,21 @@ add_executable(treasure_server src/server/main.cpp)
 target_link_libraries(treasure_server PRIVATE tp_net)
 tp_strict(treasure_server)
 
+add_executable(treasure_directory src/directory/main.cpp)
+target_link_libraries(treasure_directory PRIVATE tp_net)
+tp_strict(treasure_directory)
+
+add_executable(treasure_orchestrator src/orchestrator/main.cpp)
+target_link_libraries(treasure_orchestrator PRIVATE tp_net)
+tp_strict(treasure_orchestrator)
+
 add_executable(treasure_bots src/tools/bots.cpp)
 target_link_libraries(treasure_bots PRIVATE tp_net)
 tp_strict(treasure_bots)
 
 if(TP_BUILD_TESTS)
     enable_testing()
-    foreach(name test_ecs test_game test_net)
+    foreach(name test_ecs test_game test_net test_hud)
         add_executable(${name} tests/${name}.cpp)
         tp_strict(${name})
         add_test(NAME ${name} COMMAND ${name})
@@ -71,6 +85,11 @@ if(TP_BUILD_TESTS)
     target_link_libraries(test_ecs PRIVATE tp_game)
     target_link_libraries(test_game PRIVATE tp_game)
     target_link_libraries(test_net PRIVATE tp_net)
+    target_sources(test_hud PRIVATE src/client/hud.cpp)
+    target_link_libraries(test_hud PRIVATE tp_net)
+    # The orchestrator test starts real shard servers.
+    target_compile_definitions(test_net PRIVATE TP_SERVER_PATH="$<TARGET_FILE:treasure_server>")
+    add_dependencies(test_net treasure_server)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -98,7 +117,12 @@ if(TP_BUILD_CLIENT)
 
     add_executable(treasure_planet
         src/client/main.cpp
+<<<<<<< Updated upstream
         src/platform/platform_glfw.cpp
+=======
+        src/client/hud.cpp
+        src/platform/platform_win32.cpp
+>>>>>>> Stashed changes
         src/render/renderer.cpp
         src/render/backend_gl.cpp
         src/render/backend_vk.cpp)

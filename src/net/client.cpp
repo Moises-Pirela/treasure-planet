@@ -25,7 +25,7 @@ static void replica_push(Replica *r, const net_sample *s) {
     if (r->count) {
         int32_t gap = (int32_t)(s->tick - sample_at(r, r->count - 1)->tick);
         if (gap <= 0) return;                                   // old news
-        if (gap > GAME_TICK_HZ) r->count = 0;                   // back after a long absence: no sliding over
+        if (gap > 2 * GAME_TICK_HZ) r->count = 0;               // back after a long absence: no sliding over
     }
     if (r->count == NET_SAMPLE_HISTORY) {
         r->head = (r->head + 1) % NET_SAMPLE_HISTORY;
@@ -46,10 +46,19 @@ static v3 sample_world(const net_client *c, const net_sample *s, bool previous) 
 }
 
 // Where the samples put the player at `tick`, placed against the ship's position
-// or its previous one, so a deck and those on it interpolate together.
+// or its previous one, so a deck and those on it interpolate together. Past the
+// newest sample they walk on along their velocity for a while, then stand: a far
+// player is refreshed every few seconds, and this is what keeps them moving.
 static v3 replica_position(const net_client *c, const Replica *r, double tick, bool previous) {
     const net_sample *newest = sample_at(r, r->count - 1);
-    if (r->count == 1 || tick >= (double)newest->tick) return sample_world(c, newest, previous);
+    if (r->count == 1 || tick >= (double)newest->tick) {
+        float ahead = (float)(tick - (double)newest->tick) / (float)GAME_TICK_HZ;
+        if (ahead > NET_EXTRAPOLATE) ahead = NET_EXTRAPOLATE;
+        if (ahead < 0.0f) ahead = 0.0f;
+        v3 velocity = newest->velocity;
+        velocity.y = 0.0f;   // gravity is the server's business
+        return v3_add(sample_world(c, newest, previous), v3_scale(velocity, ahead));
+    }
     const net_sample *oldest = sample_at(r, 0);
     if (tick <= (double)oldest->tick) return sample_world(c, oldest, previous);
     for (int i = r->count - 2; i >= 0; --i) {
@@ -80,6 +89,11 @@ static void reconcile(net_client *c, const snapshot_entry *e, uint32_t tick, uin
     game *g = c->replica;
     cw_world *w = &g->world;
     if (!cw_world_is_valid(w, c->player) || !c->clock_started) return;
+    if (c->lightweight) {   // the server's word, and nothing else
+        CW_GET(w, c->player, g->c_transform, Transform)->position = snapshot_position(e);
+        w->tick = tick;
+        return;
+    }
     Transform *t = CW_GET(w, c->player, g->c_transform, Transform);
     Player *p = CW_GET(w, c->player, g->c_player, Player);
 
@@ -98,6 +112,9 @@ static void reconcile(net_client *c, const snapshot_entry *e, uint32_t tick, uin
     t->position = t->previous = server_position;
     p->velocity = snapshot_velocity(e);
     p->grounded = (e->flags & SNAP_GROUNDED) != 0;
+    if (e->hits_taken != p->hits_taken) c->hit_flash = NET_HIT_FLASH;   // the server's word: we were tagged
+    p->hits_taken = e->hits_taken;
+    p->hits_made = e->hits_made;
     w->tick = tick;
     game_place_ships(g);   // the ships too: the replay's first step carries us by their motion from here
     if (applied != 0 && (int32_t)(c->input_seq - applied) >= 0 && c->input_seq - applied < NET_PREDICTION_HISTORY
@@ -141,12 +158,14 @@ static void send_input(net_client *c, double now) {
     for (uint32_t back = NET_INPUT_REDUNDANCY; back > 0; --back) {
         uint32_t seq = c->input_seq + 1 - back;
         predicted_input *h = seq >= 1 ? history_of(c, seq) : NULL;
-        if (h) m.inputs[m.count++] = h->input;
+        if (!h) continue;
+        m.view_ticks[m.count] = h->view_tick;
+        m.inputs[m.count++] = h->input;
     }
     cw_writer w;
     cw_writer_init_fixed(&w, c->scratch, sizeof(c->scratch));
     net_input_write(&w, &m);
-    net_connection_send(&c->connection, MSG_INPUT, false, c->scratch, w.size);
+    net_connection_send(&c->connection, MSG_INPUT, NET_SEQUENCED, c->scratch, w.size);
     c->input_sent_at[c->input_seq % 64] = now;
 }
 
@@ -158,8 +177,10 @@ static void predict_tick(net_client *c, const PlayerInput *in, double now) {
     predicted_input *h = &c->history[c->input_seq % NET_PREDICTION_HISTORY];
     h->seq = c->input_seq;
     h->input = *in;
-    *CW_GET(w, c->player, g->c_input, PlayerInput) = *in;
-    game_tick(g);
+    net_input_quantize(&h->input);   // what the wire carries is what both sides simulate
+    h->view_tick = (float)c->render_tick;
+    *CW_GET(w, c->player, g->c_input, PlayerInput) = h->input;
+    if (!c->lightweight) game_tick(g);
     h->position = CW_GET(w, c->player, g->c_transform, Transform)->position;
     send_input(c, now);
 }
@@ -195,6 +216,10 @@ static void on_snapshot(net_client *c, cw_reader *r, double now) {
     for (int i = 1; i < c->offset_count; ++i)
         if (c->offsets[i] > c->tick_offset) c->tick_offset = c->offsets[i];
     c->has_offset = true;
+    if (c->latest_tick) {
+        float interval = (float)(tick - c->latest_tick) / (float)GAME_TICK_HZ;
+        c->snapshot_interval = c->snapshot_interval > 0.0f ? c->snapshot_interval * 0.8f + interval * 0.2f : interval;
+    }
     c->latest_tick = tick;
 
     // Our tick rate follows the server's: too many inputs queued there means our
@@ -221,21 +246,55 @@ static void on_snapshot(net_client *c, cw_reader *r, double now) {
             reconcile(c, e, tick, snap->last_input_seq);
             continue;
         }
-        net_sample s = {tick, e->aboard, snapshot_position(e), snapshot_yaw(e), snapshot_pitch(e)};
-        replica_push(replica_of(c, e->id), &s);
+        net_sample s = {tick, e->aboard, snapshot_position(e), snapshot_velocity(e), snapshot_yaw(e), snapshot_pitch(e)};
+        Replica *replica = replica_of(c, e->id);
+        replica_push(replica, &s);
         if (cw_comp_has(w, e->id, g->c_player)) {
             Player *p = CW_GET(w, e->id, g->c_player, Player);
             p->yaw = s.yaw;
             p->pitch = s.pitch;
+            if (e->hits_taken != p->hits_taken) replica->flash = NET_HIT_FLASH;
+            p->hits_taken = e->hits_taken;
+            p->hits_made = e->hits_made;
         }
     }
 }
 
+static void send_connect(net_client *c, double now);
 static void on_message(void *user, net_connection *, uint8_t type, cw_reader payload) {
     net_client *c = (net_client *)user;
     game *g = c->replica;
     cw_world *w = &g->world;
     switch (type) {
+    case MSG_KEYS: {
+        net_keys_message m;
+        if (!net_keys_read(&payload, &m) || c->state != NC_CONNECTING || c->connection.encrypted) return;
+        if (memcmp(m.client_public, c->public_key, CRYPTO_KEY_SIZE) != 0) return;   // an older attempt's
+        uint8_t shared[CRYPTO_KEY_SIZE], to_server[CRYPTO_KEY_SIZE], to_client[CRYPTO_KEY_SIZE];
+        crypto_x25519(shared, c->secret, m.server_public);
+        crypto_session_keys(shared, c->public_key, m.server_public, to_server, to_client);
+        c->connection.session = m.session;
+        net_connection_set_keys(&c->connection, to_server, to_client);
+        memset(shared, 0, sizeof(shared));
+        memset(c->secret, 0, sizeof(c->secret));
+        break;
+    }
+    case MSG_KEEPALIVE:
+        if (c->state == NC_CONNECTING) ++c->punches_received;
+        break;
+    case MSG_CHALLENGE: {
+        // The server wants proof that we receive at our address: the connect
+        // again, with the challenge. At once, not at the next retry.
+        uint32_t nonce = 0;
+        uint64_t challenge = 0;
+        cw_reader_u32(&payload, &nonce);
+        cw_reader_u64(&payload, &challenge);
+        if (!cw_reader_ok(&payload) || c->state != NC_CONNECTING || nonce != c->nonce || c->connection.encrypted) return;
+        c->challenge = challenge;
+        ++c->challenges_received;
+        send_connect(c, net_seconds());
+        break;
+    }
     case MSG_WELCOME: {
         net_welcome m;
         if (!net_welcome_read(&payload, &m) || c->state != NC_CONNECTING) return;
@@ -246,6 +305,8 @@ static void on_message(void *user, net_connection *, uint8_t type, cw_reader pay
         c->player = m.player;
         c->account = m.account;
         c->input_target = m.input_target;
+        memcpy(c->world_name, m.world, sizeof(c->world_name));
+        memcpy(c->zone, m.zone, sizeof(c->zone));
         g->universe_base = m.universe_base;
         g->spawn = m.spawn;
         g->place_count = m.place_count;
@@ -259,15 +320,21 @@ static void on_message(void *user, net_connection *, uint8_t type, cw_reader pay
         cw_reader_u8(&payload, &reason);
         fail(c, reason == REJECT_VERSION ? "the server speaks another protocol version"
              : reason == REJECT_FULL ? "the server is full"
-             : reason == REJECT_TICKET ? "the server did not accept the ticket" : "the server refused");
+             : reason == REJECT_TICKET ? "the server did not accept the ticket"
+             : reason == REJECT_NO_WORLD ? "the server hosts instances only"
+             : reason == REJECT_IDENTITY ? "the server did not accept who we said we are"
+             : reason == REJECT_TOKEN ? "the server admits only those the directory sent" : "the server refused");
         break;
     }
-    case MSG_SPAWN: {
+    case MSG_SPAWN:
+    case MSG_UPDATE: {
+        // An update carries only the components that changed, of an entity we have;
+        // a spawn the whole record, of one we may not.
         uint16_t count = 0;
         cw_reader_u16(&payload, &count);
         for (uint16_t i = 0; i < count; ++i) {
             // Our own player is predicted: a record about it (the server repeating a
-            // spawn we already had) must not overwrite the prediction.
+            // spawn we already had, new gear) must not overwrite the prediction.
             cw_reader peek = payload;
             cw_entity_id id = CW_INVALID_ENTITY;
             cw_reader_i64(&peek, &id);
@@ -278,14 +345,15 @@ static void on_message(void *user, net_connection *, uint8_t type, cw_reader pay
                 t = *CW_GET(w, id, g->c_transform, Transform);
                 p = *CW_GET(w, id, g->c_player, Player);
             }
-            if (!net_entity_read(&payload, g, &id)) {
-                fail(c, "a spawn could not be decoded");
+            if (!net_entity_read_masked(&payload, g, &id, type == MSG_SPAWN)) {
+                fail(c, type == MSG_SPAWN ? "a spawn could not be decoded" : "an update could not be decoded");
                 return;
             }
             if (own) {
                 *CW_GET(w, id, g->c_transform, Transform) = t;
                 *CW_GET(w, id, g->c_player, Player) = p;
             }
+            if (type == MSG_UPDATE) ++c->updates_received;
         }
         break;
     }
@@ -320,10 +388,47 @@ static void on_message(void *user, net_connection *, uint8_t type, cw_reader pay
         unsigned char ticket[NET_TICKET_SIZE];
         size_t size = 0;
         if (!net_redirect_read(&payload, &address, ticket, &size)) return;
+        if (address.ip == 0) {   // "where you are": the same server, another world
+            address.ip = c->server.ip;
+            if (address.port == 0) address.port = c->server.port;
+        }
         c->redirect_pending = true;
         c->redirect_address = address;
         memcpy(c->redirect_ticket, ticket, size);
         c->redirect_ticket_size = size;
+        break;
+    }
+    case MSG_PARTY: {
+        party_view view;
+        if (!party_view_read(&payload, &view)) return;
+        c->party = view;
+        ++c->party_updates;
+        break;
+    }
+    case MSG_CHARACTER: {
+        character gear;
+        if (!character_read(&payload, &gear)) return;
+        // Reliable but unordered: an older copy overtaken by a newer one is ignored.
+        if (c->gear_known && gear.version < c->gear.version) return;
+        // Whatever is here now and was not before is what we just picked up.
+        if (c->gear_known) {
+            for (int i = 0; i < SLOT_COUNT + STASH_SIZE; ++i) {
+                const item *it = i < SLOT_COUNT ? &gear.equipment[i] : &gear.stash[i - SLOT_COUNT];
+                if (!item_exists(it)) continue;
+                bool had = false;
+                for (int k = 0; k < SLOT_COUNT + STASH_SIZE && !had; ++k) {
+                    const item *old = k < SLOT_COUNT ? &c->gear.equipment[k] : &c->gear.stash[k - SLOT_COUNT];
+                    had = old->id == it->id;
+                }
+                if (!had) {
+                    c->last_pickup = *it;
+                    c->pickup_flash = 3.0f;
+                }
+            }
+        }
+        c->gear = gear;
+        c->gear_known = true;
+        ++c->gear_updates;
         break;
     }
     case MSG_DISCONNECT:
@@ -334,15 +439,113 @@ static void on_message(void *user, net_connection *, uint8_t type, cw_reader pay
     }
 }
 
+void net_client_party_request(net_client *c, int op, const char *target_name) {
+    if (c->state != NC_CONNECTED) return;
+    cw_writer w;
+    cw_writer_init_fixed(&w, c->scratch, sizeof(c->scratch));
+    cw_writer_u8(&w, (uint8_t)op);
+    uint8_t length = (uint8_t)(target_name ? strnlen(target_name, ACCOUNT_NAME_CAPACITY - 1) : 0);
+    cw_writer_u8(&w, length);
+    cw_writer_bytes(&w, target_name ? target_name : "", length);
+    net_connection_send(&c->connection, MSG_PARTY_REQUEST, NET_RELIABLE_ORDERED, c->scratch, w.size);
+}
+
+void net_client_equip(net_client *c, int index) {
+    if (c->state != NC_CONNECTED || index < 0 || index >= STASH_SIZE) return;
+    uint8_t payload = (uint8_t)index;
+    net_connection_send(&c->connection, MSG_EQUIP, NET_RELIABLE_ORDERED, &payload, 1);
+}
+
+bool net_client_loot_in_view(const net_client *c, float reach, item *out) {
+    game *g = c->replica;
+    cw_world *w = &g->world;
+    if (!cw_world_is_valid(w, c->player)) return false;
+    v3 eye = v3_add(CW_GET(w, c->player, g->c_transform, Transform)->position, v3_make(0, PLAYER_EYE, 0));
+    const Player *self = CW_GET(w, c->player, g->c_player, Player);
+    v3 direction = look_direction(self->yaw, self->pitch);
+    float best = reach;
+    bool found = false;
+    cw_query loot = cw_query_begin(g->q_loot);
+    cw_entity_id id;
+    while (cw_query_next(&loot, &id)) {
+        v3 at = CW_GET(w, id, g->c_transform, Transform)->position;
+        v3 to = v3_sub(at, eye);
+        float along = v3_dot(to, direction);
+        if (along < 0.0f || along > reach) continue;
+        float off = v3_length(v3_sub(to, v3_scale(direction, along)));
+        if (off < 0.6f && along < best) {
+            best = along;
+            *out = CW_GET(w, id, g->c_loot, Loot)->it;
+            found = true;
+        }
+    }
+    return found;
+}
+
+bool net_client_player_in_view(const net_client *c, float reach, char name[ACCOUNT_NAME_CAPACITY]) {
+    game *g = c->replica;
+    cw_world *w = &g->world;
+    if (!cw_world_is_valid(w, c->player)) return false;
+    const Transform *me = CW_GET(w, c->player, g->c_transform, Transform);
+    const Player *self = CW_GET(w, c->player, g->c_player, Player);
+    v3 eye = v3_add(me->position, v3_make(0, PLAYER_EYE, 0));
+    v3 direction = look_direction(self->yaw, self->pitch);
+    cw_entity_id best = CW_INVALID_ENTITY;
+    float best_distance = reach;
+    cw_query players = cw_query_begin(g->q_all_players);
+    cw_entity_id id;
+    while (cw_query_next(&players, &id)) {
+        if (id == c->player || !net_client_entity_visible(c, id)) continue;
+        v3 feet = CW_GET(w, id, g->c_transform, Transform)->position;
+        float distance = v3_length(v3_sub(feet, me->position));
+        if (distance < best_distance && game_swing_hits(eye, direction, feet)) {
+            best_distance = distance;
+            best = id;
+        }
+    }
+    if (best == CW_INVALID_ENTITY) return false;
+    strncpy(name, CW_GET(w, best, g->c_player, Player)->name, ACCOUNT_NAME_CAPACITY - 1);
+    name[ACCOUNT_NAME_CAPACITY - 1] = '\0';
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // The client
 // ---------------------------------------------------------------------------
 bool net_client_init(net_client *c, game *g, net_address server, const unsigned char *ticket, size_t ticket_size,
                      float interp_delay) {
+    net_client_options o = {};
+    o.server = server;
+    o.ticket = ticket;
+    o.ticket_size = ticket_size;
+    o.interp_delay = interp_delay;
+    return net_client_init_options(c, g, &o);
+}
+
+net_identity net_identity_local(const char *name) {
+    net_identity id = {};
+    char clean[ACCOUNT_NAME_CAPACITY];
+    if (!account_clean_name(name, clean)) {
+        uint16_t tag = 0;
+        crypto_random(&tag, sizeof(tag));   // two sessions made up in the same instant must not be one account
+        snprintf(clean, sizeof(clean), "player%04x", (unsigned)tag);
+    }
+    snprintf(id.platform, sizeof(id.platform), "local:%s", clean);
+    memcpy(id.name, clean, sizeof(id.name));
+    return id;
+}
+
+bool net_client_init_options(net_client *c, game *g, const net_client_options *o) {
     memset(c, 0, sizeof(*c));
-    c->server = server;
-    c->socket = net_socket_open(0);
+    c->server = o->server;
+    c->identity = o->identity ? *o->identity : net_identity_local(NULL);
+    c->socket = o->socket ? o->socket : net_socket_open(0);
     if (!c->socket) return false;
+    c->introducer = o->introducer;
+    c->lightweight = o->lightweight;
+    const unsigned char *ticket = o->ticket;
+    size_t ticket_size = o->ticket_size;
+    float interp_delay = o->interp_delay;
     c->replica = g;
     c->interp_delay = interp_delay > 0.0f ? interp_delay : NET_INTERP_DELAY;
     c->state = NC_CONNECTING;
@@ -350,6 +553,10 @@ bool net_client_init(net_client *c, game *g, net_address server, const unsigned 
     c->started = net_seconds();
     c->last_connect_sent = -1.0;
     c->nonce = (uint32_t)(c->started * 1e6) ^ 0xa5a5a5a5u;
+    if (o->token && o->token_size && o->token_size <= NET_TOKEN_SIZE) {
+        memcpy(c->token, o->token, o->token_size);
+        c->token_size = o->token_size;
+    }
     if (ticket && ticket_size && ticket_size <= NET_TICKET_SIZE) {
         memcpy(c->ticket, ticket, ticket_size);
         c->ticket_size = ticket_size;
@@ -357,6 +564,11 @@ bool net_client_init(net_client *c, game *g, net_address server, const unsigned 
     c->clock = cw_clock_make(GAME_TICK_HZ);
     c->rate = 1.0f;
     snapshot_ring_init(&c->received);
+    if (!crypto_keypair(c->secret, c->public_key)) {
+        net_socket_close(c->socket);
+        memset(c, 0, sizeof(*c));
+        return false;
+    }
 
     cw_world *w = &g->world;
     c->c_replica = cw_comp_block(w, 1);
@@ -376,20 +588,21 @@ bool net_client_connect(net_client *c, game *g, const char *address, float inter
 }
 
 void net_client_destroy(net_client *c) {
-    if (c->state != NC_DISCONNECTED) net_client_disconnect(c);
+    if (c->state != NC_DISCONNECTED) net_client_disconnect(c, LEAVE_QUIT);
     net_connection_destroy(&c->connection);
     snapshot_ring_destroy(&c->received);
     net_socket_close(c->socket);
     memset(c, 0, sizeof(*c));
 }
 
-void net_client_disconnect(net_client *c) {
+void net_client_disconnect(net_client *c, int reason) {
     if (c->state == NC_DISCONNECTED) return;
     if (c->state != NC_CONNECTING) {
         // Unreliable by nature (we are leaving), so said three times: a lost notice
         // would leave a frozen ghost on the server until its timeout.
+        uint8_t why = (uint8_t)reason;
         for (int i = 0; i < 3; ++i) {
-            net_connection_send(&c->connection, MSG_DISCONNECT, false, NULL, 0);
+            net_connection_send(&c->connection, MSG_DISCONNECT, NET_UNRELIABLE, &why, 1);
             net_connection_flush(&c->connection, net_seconds(), false);
         }
     }
@@ -399,22 +612,49 @@ void net_client_disconnect(net_client *c) {
 void net_client_handoff_failed(net_client *c) {
     if (!c->redirect_pending) return;
     c->redirect_pending = false;
-    if (c->state == NC_CONNECTED) net_connection_send(&c->connection, MSG_HANDOFF_FAILED, true, NULL, 0);
+    if (c->state == NC_CONNECTED) net_connection_send(&c->connection, MSG_HANDOFF_FAILED, NET_RELIABLE, NULL, 0);
+}
+
+// Asks the directory to have the server send us a packet, so that a NAT in front
+// of the server lets ours through.
+static void ask_introduction(net_client *c, double now) {
+    if (!c->introducer.ip || c->connection.encrypted || now - c->last_introduction_asked < DIRECTORY_QUERY_EVERY) return;
+    c->last_introduction_asked = now;
+    cw_writer w;
+    cw_writer_init_fixed(&w, c->scratch, sizeof(c->scratch));
+    directory_query q = {};
+    q.introduce = true;
+    q.introduce_to = c->server;
+    memcpy(q.region, c->identity.region, sizeof(q.region));
+    q.account = account_id_for(c->identity.platform);
+    directory_query_write(&w, &q);
+    net_connection tmp;
+    net_connection_init(&tmp, c->socket, c->introducer, 0, NULL, NULL);
+    net_connection_send(&tmp, MSG_DIR_QUERY, NET_UNRELIABLE, c->scratch, w.size);
+    net_connection_flush(&tmp, now, false);
+    net_connection_destroy(&tmp);
 }
 
 static void send_connect(net_client *c, double now) {
+    // Sent in the clear on session 0 until MSG_KEYS arrives; after that the
+    // connection is encrypted and repeating this would be pointless. The ticket
+    // and the token are opaque here: signed by those who hold the secret, copied
+    // through rather than re-encoded.
+    if (c->connection.encrypted) return;
     net_connect_message m = {};
     m.version = NET_PROTOCOL_VERSION;
     m.nonce = c->nonce;
+    memcpy(m.public_key, c->public_key, CRYPTO_KEY_SIZE);
+    memcpy(m.platform, c->identity.platform, sizeof(m.platform));
+    memcpy(m.name, c->identity.name, sizeof(m.name));
+    memcpy(m.region, c->identity.region, sizeof(m.region));
+    memcpy(m.proof, c->identity.proof, c->identity.proof_size);
+    m.proof_size = c->identity.proof_size;
+    m.challenge = c->challenge;
     cw_writer w;
     cw_writer_init_fixed(&w, c->scratch, sizeof(c->scratch));
-    // The ticket is opaque here: it was signed by the zone that issued it, so it is
-    // copied through rather than re-encoded.
-    cw_writer_u32(&w, m.version);
-    cw_writer_u32(&w, m.nonce);
-    cw_writer_u16(&w, (uint16_t)c->ticket_size);
-    cw_writer_bytes(&w, c->ticket, c->ticket_size);
-    net_connection_send(&c->connection, MSG_CONNECT, false, c->scratch, w.size);
+    net_connect_write(&w, &m, c->ticket, c->ticket_size, c->token, c->token_size);
+    net_connection_send(&c->connection, MSG_CONNECT, NET_UNRELIABLE, c->scratch, w.size);
     c->last_connect_sent = now;
 }
 
@@ -428,14 +668,15 @@ static void receive(net_client *c, double now) {
         }
         if (size == 0) break;
         if (!net_address_equal(from, c->server)) continue;
-        if (c->state == NC_CONNECTING) {
-            // No session yet: adopt whatever the server stamped on this packet, and
-            // keep it only if it turned out to carry our welcome.
-            uint32_t session;
-            if (!net_packet_peek(c->scratch, (size_t)size, &session)) continue;
-            c->connection.session = session;
-            net_connection_receive(&c->connection, c->scratch, (size_t)size, now);
-            if (c->state == NC_CONNECTING) c->connection.session = 0;
+        uint32_t session;
+        if (!net_packet_peek(c->scratch, (size_t)size, &session)) continue;
+        if (session == 0 && c->connection.session != 0) {
+            // The handshake in the clear (keys, a rejection, a NAT punch) once we
+            // already hold a session: read it on the side, without touching ours.
+            net_connection clear;
+            net_connection_init(&clear, c->socket, c->server, 0, on_message, c);
+            net_connection_receive(&clear, c->scratch, (size_t)size, now);
+            net_connection_destroy(&clear);
         } else {
             net_connection_receive(&c->connection, c->scratch, (size_t)size, now);
         }
@@ -454,6 +695,7 @@ void net_client_frame(net_client *c, const PlayerInput *in, double now) {
             return;
         }
         if (now - c->last_connect_sent >= NET_CONNECT_RETRY) send_connect(c, now);
+        ask_introduction(c, now);
     } else if (now - c->connection.last_received > NET_TIMEOUT) {
         fail(c, "the server stopped answering");
         return;
@@ -466,6 +708,10 @@ void net_client_frame(net_client *c, const PlayerInput *in, double now) {
         }
         float frame_dt = (float)(now - c->last_frame);
         c->last_frame = now;
+        // Drawn between two samples: the delay is the longer of the configured one
+        // and one and a half snapshot intervals, whatever rate the server manages.
+        float delay = c->interp_delay > 1.5f * c->snapshot_interval ? c->interp_delay : 1.5f * c->snapshot_interval;
+        if (c->has_offset) c->render_tick = now * GAME_TICK_HZ + c->tick_offset - (double)delay * GAME_TICK_HZ;
         int steps = cw_clock_advance(&c->clock, frame_dt);
         PlayerInput applied = *in;
         if (c->redirect_pending) {
@@ -473,24 +719,35 @@ void net_client_frame(net_client *c, const PlayerInput *in, double now) {
             // up exactly where the ticket says, and nothing rubber-bands meanwhile.
             applied.forward = applied.strafe = 0.0f;
             applied.jump = false;
+            applied.act = false;
         }
-        for (int i = 0; i < steps; ++i) predict_tick(c, &applied, now);
+        // A swing is an edge, seen in one frame; ticks are rarer than frames, so it
+        // is kept until the next tick and applied to that one alone.
+        if (applied.act) c->act_latched = true;
+        for (int i = 0; i < steps; ++i) {
+            applied.act = c->act_latched;
+            c->act_latched = false;
+            predict_tick(c, &applied, now);
+        }
 
-        // The correction fades by half every NET_CORRECTION_HALF_LIFE.
+        // The correction fades by half every NET_CORRECTION_HALF_LIFE; flashes run down.
         float keep = powf(0.5f, frame_dt / NET_CORRECTION_HALF_LIFE);
         c->correction = v3_scale(c->correction, keep);
         if (v3_length(c->correction) < 0.0005f) c->correction = v3_make(0, 0, 0);
+        if (c->hit_flash > 0.0f) c->hit_flash -= frame_dt;
+        if (c->pickup_flash > 0.0f) c->pickup_flash -= frame_dt;
 
         // The other players, between the two samples around the render time.
-        if (c->has_offset) {
+        if (c->has_offset && !c->lightweight) {
             game *g = c->replica;
             cw_world *w = &g->world;
-            double render_tick = now * GAME_TICK_HZ + c->tick_offset - (double)c->interp_delay * GAME_TICK_HZ;
+            double render_tick = c->render_tick;
             cw_component_id needed[] = {g->c_transform, c->c_replica};
             cw_query replicas = cw_query_iter(w, cw_mask(needed, 2));
             cw_entity_id id;
             while (cw_query_next(&replicas, &id)) {
-                const Replica *r = CW_GET(w, id, c->c_replica, Replica);
+                Replica *r = CW_GET(w, id, c->c_replica, Replica);
+                if (r->flash > 0.0f) r->flash -= frame_dt;
                 if (!r->count || id == c->player) continue;
                 Transform *t = CW_GET(w, id, g->c_transform, Transform);
                 t->position = replica_position(c, r, render_tick, false);
@@ -513,18 +770,29 @@ bool net_client_entity_visible(const net_client *c, cw_entity_id id) {
         return !cw_comp_has(w, id, c->replica->c_player);
     }
     const Replica *r = CW_GET(w, id, c->c_replica, Replica);
-    return r->count > 0 && c->latest_tick - r->last_seen_tick < GAME_TICK_HZ;
+    return r->count > 0 && c->latest_tick - r->last_seen_tick < NET_UNSEEN_HIDE;
 }
 
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
 static bool session_open(net_session *s, game **world, net_client **link, net_address address,
-                         const unsigned char *ticket, size_t ticket_size) {
+                         const unsigned char *ticket, size_t ticket_size, net_socket *socket) {
     *world = (game *)malloc(sizeof(game));
     game_init(*world, CW_CLIENT);
     *link = (net_client *)malloc(sizeof(net_client));
-    if (!net_client_init(*link, *world, address, ticket, ticket_size, s->interp_delay)) {
+    net_client_options o = {};
+    o.server = address;
+    o.ticket = ticket;
+    o.ticket_size = ticket_size;
+    o.token = s->token_size ? s->token : NULL;   // a ticket takes precedence at the server; both may travel
+    o.token_size = s->token_size;
+    o.interp_delay = s->interp_delay;
+    o.socket = socket;
+    o.introducer = s->directory;
+    o.identity = &s->identity;
+    o.lightweight = s->lightweight;
+    if (!net_client_init_options(*link, *world, &o)) {
         game_destroy(*world);
         free(*world);
         free(*link);
@@ -535,8 +803,14 @@ static bool session_open(net_session *s, game **world, net_client **link, net_ad
     return true;
 }
 
-static void session_close(game **world, net_client **link) {
+// A lost connection is worth trying again; a refusal or a deliberate close is not.
+static bool lost(const net_client *c) {
+    return c->failure && (strcmp(c->failure, "the server stopped answering") == 0 || strcmp(c->failure, "the socket failed") == 0);
+}
+
+static void session_close(game **world, net_client **link, int reason) {
     if (*link) {
+        net_client_disconnect(*link, reason);
         net_client_destroy(*link);
         free(*link);
         *link = NULL;
@@ -548,33 +822,189 @@ static void session_close(game **world, net_client **link) {
     }
 }
 
-bool net_session_init(net_session *s, const char *address, float interp_delay) {
+bool net_session_init(net_session *s, const char *address, float interp_delay, const net_identity *identity) {
     memset(s, 0, sizeof(*s));
     s->interp_delay = interp_delay;
+    s->identity = identity ? *identity : net_identity_local(NULL);
     net_address server;
     if (!net_address_parse(address, NET_DEFAULT_PORT, &server)) {
         s->failure = "the address could not be resolved";
         return false;
     }
-    if (!session_open(s, &s->world, &s->link, server, NULL, 0)) {
+    if (!session_open(s, &s->world, &s->link, server, NULL, 0, NULL)) {
         s->failure = "no socket could be opened";
         return false;
     }
     return true;
 }
 
+bool net_session_init_directory(net_session *s, const char *address, const char *place, float interp_delay,
+                                const net_identity *identity) {
+    memset(s, 0, sizeof(*s));
+    s->interp_delay = interp_delay;
+    s->identity = identity ? *identity : net_identity_local(NULL);
+    if (!net_address_parse(address, NET_DIRECTORY_PORT, &s->directory)) {
+        s->failure = "the directory's address could not be resolved";
+        return false;
+    }
+    strncpy(s->place, place && *place ? place : "hub", NET_ZONE_NAME - 1);
+    s->resolver = net_socket_open(0);
+    if (!s->resolver) {
+        s->failure = "no socket could be opened";
+        return false;
+    }
+    s->resolve_started = net_seconds();
+    s->last_query = -1.0;
+    return true;
+}
+
 void net_session_destroy(net_session *s) {
-    session_close(&s->next_world, &s->next_link);
-    session_close(&s->world, &s->link);
+    session_close(&s->next_world, &s->next_link, LEAVE_QUIT);
+    session_close(&s->world, &s->link, LEAVE_QUIT);
+    net_socket_close(s->resolver);
     memset(s, 0, sizeof(*s));
 }
 
-net_client_state net_session_state(const net_session *s) { return s->link ? s->link->state : NC_DISCONNECTED; }
+struct resolve_answer {
+    net_session *s;
+    bool got_table;
+};
+static void on_resolve_message(void *user, net_connection *, uint8_t type, cw_reader payload) {
+    resolve_answer *a = (resolve_answer *)user;
+    net_session *s = a->s;
+    if (type == MSG_DIR_TOKEN) {
+        size_t size = 0;
+        if (!directory_token_read(&payload, s->token, sizeof(s->token), &size)) return;
+        s->token_size = size;
+        s->token_at = net_seconds();
+        s->token_refused = size == 0;
+        return;
+    }
+    if (type != MSG_DIR_TABLE) return;
+    net_zones_init(&s->table);
+    if (directory_table_read(&payload, &s->table, NULL)) a->got_table = true;   // unsigned: we hold no secret
+}
+
+// Asks the directory until it answers, then connects to the owner of the place
+// from the same socket, which the directory has just had that server punch towards.
+static void session_resolve(net_session *s, double now) {
+    if (now - s->resolve_started > NET_CONNECT_TIMEOUT) {
+        net_socket_close(s->resolver);
+        s->resolver = NULL;
+        if (s->reconnect_zone[0]) {   // one try fewer; the next frame asks again, or gives up
+            s->reconnect_zone[0] = 0;
+            ++s->reconnect_failures;
+        } else {
+            s->failure = "the directory did not answer";
+        }
+        return;
+    }
+    if (now - s->last_query >= DIRECTORY_QUERY_EVERY) {
+        s->last_query = now;
+        unsigned char payload[96];
+        cw_writer w;
+        cw_writer_init_fixed(&w, payload, sizeof(payload));
+        directory_query q = {};
+        if (s->reconnect_zone[0]) memcpy(q.zone, s->reconnect_zone, sizeof(q.zone));   // a token for where we were
+        else memcpy(q.place, s->place, sizeof(q.place));
+        memcpy(q.region, s->identity.region, sizeof(q.region));
+        q.account = account_id_for(s->identity.platform);
+        // Who we are, for the token: the directory verifies it and the zone takes its word.
+        q.has_identity = true;
+        memcpy(q.platform, s->identity.platform, sizeof(q.platform));
+        memcpy(q.name, s->identity.name, sizeof(q.name));
+        memcpy(q.proof, s->identity.proof, s->identity.proof_size);
+        q.proof_size = s->identity.proof_size;
+        s->token_size = 0;   // whatever comes back is for this query
+        directory_query_write(&w, &q);
+        net_connection tmp;
+        net_connection_init(&tmp, s->resolver, s->directory, 0, NULL, NULL);
+        net_connection_send(&tmp, MSG_DIR_QUERY, NET_UNRELIABLE, payload, w.size);
+        net_connection_flush(&tmp, now, false);
+        net_connection_destroy(&tmp);
+    }
+    unsigned char packet[NET_MAX_PACKET];
+    for (;;) {
+        net_address from;
+        int size = net_socket_recv(s->resolver, &from, packet, sizeof(packet));
+        if (size <= 0) break;
+        if (!net_address_equal(from, s->directory)) continue;
+        resolve_answer answer = {s, false};
+        net_connection tmp;
+        net_connection_init(&tmp, s->resolver, from, 0, on_resolve_message, &answer);
+        net_connection_receive(&tmp, packet, (size_t)size, now);
+        net_connection_destroy(&tmp);
+        if (s->token_refused) {
+            s->failure = "the directory did not accept who we said we are";
+            net_socket_close(s->resolver);
+            s->resolver = NULL;
+            return;
+        }
+        // Both halves of the answer (the table, then the token) must be in.
+        if (!s->token_size || !s->table.count) continue;
+        // The directory put the shard it chose for us first; after a lost
+        // connection it is the zone we were on, at the address we had.
+        net_address to;
+        if (s->reconnect_zone[0]) {
+            if (net_zones_find(&s->table, s->reconnect_zone) < 0) continue;   // gone: keep asking until the timeout
+            to = s->reconnect_to;
+        } else {
+            int owner = net_zones_owner(&s->table, s->place);
+            if (owner < 0) continue;   // not yet: a zone may still be registering
+            to = s->table.zones[owner].address;
+        }
+        net_socket *socket = s->resolver;
+        s->resolver = NULL;
+        bool reconnecting = s->reconnect_zone[0] != 0;
+        s->reconnect_zone[0] = 0;
+        if (!session_open(s, reconnecting ? &s->next_world : &s->world, reconnecting ? &s->next_link : &s->link, to, NULL, 0, socket)) {
+            s->failure = "no socket could be opened";
+            net_socket_close(socket);
+        }
+        return;
+    }
+}
+
+// Starts resolving a fresh token for the zone the lost link was on.
+static bool session_reresolve(net_session *s, double now) {
+    s->resolver = net_socket_open(0);
+    if (!s->resolver) return false;
+    memcpy(s->reconnect_zone, s->link->zone, sizeof(s->reconnect_zone));
+    s->reconnect_to = s->link->server;
+    s->resolve_started = now;
+    s->last_query = -1.0;
+    return true;
+}
+
+net_client_state net_session_state(const net_session *s) {
+    if (s->resolver) return NC_CONNECTING;
+    if (!s->link) return NC_DISCONNECTED;
+    // While the next zone is being joined the session is alive whatever became of
+    // the current link (the old world stays on show, frozen, until the switch).
+    if (s->link->state == NC_DISCONNECTED && s->next_link) return NC_CONNECTED;
+    return s->link->state;
+}
 
 void net_session_frame(net_session *s, const PlayerInput *in, double now) {
+    if (s->resolver) {
+        session_resolve(s, now);
+        return;
+    }
     if (!s->link) return;
     net_client_frame(s->link, in, now);
     if (s->link->state == NC_DISCONNECTED && !s->next_link) {
+        // Lost the server: back to it, where our body is waiting, a few times over.
+        // Through a directory that takes a fresh token for that zone (ours may be
+        // stale, or for the zone before a hand-off), resolved first.
+        if (lost(s->link) && s->link->state == NC_DISCONNECTED && s->reconnect_failures < NET_RECONNECT_ATTEMPTS
+            && (s->link->player != CW_INVALID_ENTITY || s->reconnects)) {
+            bool ok = s->directory.ip && s->link->zone[0] ? session_reresolve(s, now)
+                                                          : session_open(s, &s->next_world, &s->next_link, s->link->server, NULL, 0, NULL);
+            if (ok) {
+                ++s->reconnects;
+                return;
+            }
+        }
         s->failure = s->link->failure;
         return;
     }
@@ -582,10 +1012,15 @@ void net_session_frame(net_session *s, const PlayerInput *in, double now) {
     if (s->next_link) {
         net_client_frame(s->next_link, in, now);
         if (s->next_link->state == NC_DISCONNECTED) {
-            // The new zone would not have us; stay here, unfrozen. The old zone asks again later.
-            session_close(&s->next_world, &s->next_link);
-            net_client_handoff_failed(s->link);
-            ++s->handoffs_failed;
+            // The new zone would not have us; stay here, unfrozen. The old zone asks
+            // again later. (After a lost connection: one try fewer.)
+            bool was_reconnect = !s->link->redirect_pending;
+            session_close(&s->next_world, &s->next_link, LEAVE_QUIT);
+            if (was_reconnect) ++s->reconnect_failures;
+            else {
+                net_client_handoff_failed(s->link);
+                ++s->handoffs_failed;
+            }
         } else if (s->next_link->state == NC_CONNECTED && s->next_link->snapshots_received > 0) {
             // The new zone is ready. Bridge the two predictions with the view offset
             // so the switch does not show, then let the old zone go.
@@ -597,18 +1032,41 @@ void net_session_frame(net_session *s, const PlayerInput *in, double now) {
             v3 new_position = CW_GET(&new_world->world, s->next_link->player, new_world->c_transform, Transform)->position;
             v3 delta = v3_sub(old_position, new_position);
             s->next_link->correction = v3_length(delta) < NET_CORRECTION_SNAP ? delta : v3_make(0, 0, 0);
-            session_close(&s->world, &s->link);
+            if (!s->next_link->party_updates) s->next_link->party = s->link->party;   // until the new zone is told
+            if (!s->next_link->gear_known) {
+                s->next_link->gear = s->link->gear;
+                s->next_link->gear_known = s->link->gear_known;
+            }
+            bool handoff = s->link->redirect_pending;
+            session_close(&s->world, &s->link, handoff ? LEAVE_HANDOFF : LEAVE_QUIT);
             s->world = new_world;
             s->link = s->next_link;
             s->next_world = NULL;
             s->next_link = NULL;
-            ++s->handoffs;
-            s->last_handoff_seconds = (float)(now - s->handoff_started);
+            if (handoff) {
+                ++s->handoffs;
+                s->last_handoff_seconds = (float)(now - s->handoff_started);
+            } else {
+                s->reconnect_failures = 0;
+            }
         }
     } else if (s->link->redirect_pending) {
         s->handoff_started = now;
         if (!session_open(s, &s->next_world, &s->next_link, s->link->redirect_address, s->link->redirect_ticket,
-                          s->link->redirect_ticket_size))
+                          s->link->redirect_ticket_size, NULL))
             net_client_handoff_failed(s->link);
     }
+}
+
+void net_session_party_request(net_session *s, int op, const char *target_name) {
+    if (s->link) net_client_party_request(s->link, op, target_name);
+}
+
+const party_view *net_session_party(const net_session *s) {
+    static const party_view none = {};
+    return s->link ? &s->link->party : &none;
+}
+
+void net_session_equip(net_session *s, int stash_index) {
+    if (s->link) net_client_equip(s->link, stash_index);
 }

@@ -1,6 +1,5 @@
 // Vulkan 1.1, loaded at runtime through volk: a machine with no Vulkan driver starts
-// fine and falls back to OpenGL. On macOS this runs on MoltenVK, which implements
-// Vulkan over Metal. One render pass, one pipeline, frames in flight.
+// fine and falls back to OpenGL. One render pass, one pipeline, frames in flight.
 // The viewport has a negative height (core in 1.1), which gives the y-up clip space
 // the backend contract asks for.
 #include "backend.h"
@@ -19,7 +18,6 @@ static const uint32_t MESH_FRAG_SPV[] =
 #define VK_FRAMES_IN_FLIGHT 2
 #define VK_MAX_MESHES 256
 #define VK_MAX_SWAPCHAIN_IMAGES 8
-#define VK_MAX_INSTANCE_EXTENSIONS 8
 // What the shader's Draw block holds: r_draw up to its mesh handle.
 #define VK_PUSH_SIZE ((uint32_t)offsetof(r_draw, mesh))
 
@@ -172,29 +170,8 @@ static bool create_instance(vk_state *s) {
     app.pApplicationName = "Treasure Planet";
     app.apiVersion = VK_API_VERSION_1_1;
 
-    uint32_t required = 0;
-    const char **required_names = plat_vk_instance_extensions(&required);
-    if (!required_names || required > VK_MAX_INSTANCE_EXTENSIONS - 2) {
-        fprintf(stderr, "vulkan: this window system cannot present through Vulkan\n");
-        return false;
-    }
-    const char *extensions[VK_MAX_INSTANCE_EXTENSIONS];
-    uint32_t extension_count = required;
-    memcpy(extensions, required_names, required * sizeof(const char *));
-
-    // MoltenVK is a "portability" implementation: the loader hides those unless asked.
-    VkInstanceCreateFlags instance_flags = 0;
-    uint32_t available_extensions = 0;
-    vkEnumerateInstanceExtensionProperties(NULL, &available_extensions, NULL);
-    VkExtensionProperties *extension_properties = (VkExtensionProperties *)malloc(available_extensions * sizeof(VkExtensionProperties) + 1);
-    vkEnumerateInstanceExtensionProperties(NULL, &available_extensions, extension_properties);
-    for (uint32_t i = 0; i < available_extensions; ++i)
-        if (strcmp(extension_properties[i].extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0) {
-            extensions[extension_count++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
-            instance_flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-        }
-    free(extension_properties);
-
+    const char *extensions[3] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    uint32_t extension_count = 2;
     const char *layers[1] = {"VK_LAYER_KHRONOS_validation"};
     uint32_t layer_count = 0;
 #ifndef NDEBUG
@@ -211,7 +188,6 @@ static bool create_instance(vk_state *s) {
     fprintf(stderr, "vulkan: validation layers %s\n", layer_count ? "on" : "off");
 
     VkInstanceCreateInfo info = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    info.flags = instance_flags;
     info.pApplicationInfo = &app;
     info.enabledExtensionCount = extension_count;
     info.ppEnabledExtensionNames = extensions;
@@ -273,21 +249,11 @@ static bool pick_device(vk_state *s) {
     queue.queueFamilyIndex = s->queue_family;
     queue.queueCount = 1;
     queue.pQueuePriorities = &priority;
-    // A portability implementation requires its subset extension to be enabled when offered.
-    const char *extensions[2] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    uint32_t extension_count = 1, offered = 0;
-    vkEnumerateDeviceExtensionProperties(s->physical, NULL, &offered, NULL);
-    VkExtensionProperties *offered_extensions = (VkExtensionProperties *)malloc(offered * sizeof(VkExtensionProperties) + 1);
-    vkEnumerateDeviceExtensionProperties(s->physical, NULL, &offered, offered_extensions);
-    for (uint32_t i = 0; i < offered; ++i)
-        if (strcmp(offered_extensions[i].extensionName, "VK_KHR_portability_subset") == 0)
-            extensions[extension_count++] = "VK_KHR_portability_subset";
-    free(offered_extensions);
-
+    const char *extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkDeviceCreateInfo info = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.queueCreateInfoCount = 1;
     info.pQueueCreateInfos = &queue;
-    info.enabledExtensionCount = extension_count;
+    info.enabledExtensionCount = 1;
     info.ppEnabledExtensionNames = extensions;
     if (!vk_ok(vkCreateDevice(s->physical, &info, NULL, &s->device), "vkCreateDevice")) return false;
     volkLoadDevice(s->device);
@@ -540,8 +506,7 @@ static bool create_swapchain(vk_state *s, int width, int height) {
     info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = caps.currentTransform;
-    info.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
-        ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR : VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
     info.clipped = VK_TRUE;
     info.oldSwapchain = s->swapchain;
@@ -644,16 +609,18 @@ static void vk_destroy(void *state) {
 }
 
 static void *vk_create(plat_window *window) {
-    if (!plat_vk_available()) {
-        fprintf(stderr, "vulkan: no loader or driver on this machine\n");
+    if (volkInitialize() != VK_SUCCESS) {
+        fprintf(stderr, "vulkan: no loader on this machine\n");
         return NULL;
     }
     vk_state *s = (vk_state *)calloc(1, sizeof(vk_state));
     s->window = window;
     bool ok = create_instance(s);
-    if (ok && !plat_vk_create_surface(window, s->instance, &s->surface)) {
-        fprintf(stderr, "vulkan: could not create a surface on the window\n");
-        ok = false;
+    if (ok) {
+        VkWin32SurfaceCreateInfoKHR surface = {VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+        surface.hinstance = (HINSTANCE)plat_instance_native();
+        surface.hwnd = (HWND)plat_window_native(window);
+        ok = vk_ok(vkCreateWin32SurfaceKHR(s->instance, &surface, NULL, &s->surface), "vkCreateWin32SurfaceKHR");
     }
     ok = ok && pick_device(s) && create_pipeline(s) && create_frame_slots(s);
     if (!ok) {

@@ -1,4 +1,5 @@
 #include "game.h"
+#include <stdlib.h>
 #include <string.h>
 
 // World data reachable from a system. Systems get only the world, and the world's
@@ -125,7 +126,64 @@ static bool overlaps(v3 feet, v3 center, v3 half) {
         && feet.z + PLAYER_RADIUS > center.z - half.z && feet.z - PLAYER_RADIUS < center.z + half.z;
 }
 
+<<<<<<< Updated upstream
 static float *axis_of(v3 *v, int axis) { return axis == 0 ? &v->x : axis == 1 ? &v->y : &v->z; }
+=======
+// ---------------------------------------------------------------------------
+// The solid grid: every solid listed under each 2D cell (x, z) it touches, sorted
+// by cell key so a cell's solids are one binary search away. Rebuilt every tick,
+// since ship parts move; it is a few dozen entries.
+// ---------------------------------------------------------------------------
+static int32_t cell_key(int cx, int cz) { return (int32_t)((cx & 0xffff) << 16) | (int32_t)(cz & 0xffff); }
+static int cell_of(float v) { return (int)floorf(v / GAME_GRID_CELL); }
+
+static int compare_grid(const void *a, const void *b) {
+    int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void grid_push(game *g, int32_t key, cw_entity_id id) {
+    if (g->grid_count == g->grid_capacity) {
+        g->grid_capacity = g->grid_capacity ? g->grid_capacity * 2 : 256;
+        g->grid = (decltype(g->grid))realloc(g->grid, (size_t)g->grid_capacity * sizeof(*g->grid));
+    }
+    g->grid[g->grid_count].key = key;
+    g->grid[g->grid_count].id = id;
+    ++g->grid_count;
+}
+
+static void system_solid_grid(cw_world *w, cw_phase, float) {
+    game *g = game_of(w);
+    g->grid_count = 0;
+    cw_query solids = cw_query_begin(g->q_solids);
+    cw_entity_id id;
+    while (cw_query_next(&solids, &id)) {
+        const Solid *solid = CW_GET(w, id, g->c_solid, Solid);
+        v3 c = CW_GET(w, id, g->c_transform, Transform)->position;
+        int x0 = cell_of(c.x - solid->half.x - PLAYER_RADIUS), x1 = cell_of(c.x + solid->half.x + PLAYER_RADIUS);
+        int z0 = cell_of(c.z - solid->half.z - PLAYER_RADIUS), z1 = cell_of(c.z + solid->half.z + PLAYER_RADIUS);
+        for (int x = x0; x <= x1; ++x)
+            for (int z = z0; z <= z1; ++z) grid_push(g, cell_key(x, z), id);
+    }
+    if (g->grid_count > 1) qsort(g->grid, (size_t)g->grid_count, sizeof(*g->grid), compare_grid);
+}
+
+// Visits every solid listed in the cell of `at` (each solid is listed in all the
+// cells its padded box touches, so one cell is enough).
+#define GAME_GRID_MAX_NEARBY 64
+static int solids_near(const game *g, v3 at, cw_entity_id *out) {
+    int32_t key = cell_key(cell_of(at.x), cell_of(at.z));
+    int lo = 0, hi = g->grid_count;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (g->grid[mid].key < key) lo = mid + 1;
+        else hi = mid;
+    }
+    int n = 0;
+    for (int i = lo; i < g->grid_count && g->grid[i].key == key && n < GAME_GRID_MAX_NEARBY; ++i) out[n++] = g->grid[i].id;
+    return n;
+}
+>>>>>>> Stashed changes
 
 // Moves along one axis and stops at the first solid crossed. A solid the player is
 // well inside (a ship landed on them) is ignored, so nobody can get stuck; "well"
@@ -137,9 +195,10 @@ static bool move_axis(game *g, Transform *t, int axis, float amount, bool can_st
     v3 from = t->position, to = from;
     *axis_of(&to, axis) += amount;
     bool blocked = false;
-    cw_query solids = cw_query_begin(g->q_solids);
-    cw_entity_id id;
-    while (cw_query_next(&solids, &id)) {
+    cw_entity_id nearby[GAME_GRID_MAX_NEARBY];
+    int count = solids_near(g, to, nearby);
+    for (int k = 0; k < count; ++k) {
+        cw_entity_id id = nearby[k];
         const Solid *solid = CW_GET(w, id, g->c_solid, Solid);
         v3 center = CW_GET(w, id, g->c_transform, Transform)->position;
         v3 core = v3_make(solid->half.x - INSIDE_SKIN, solid->half.y - INSIDE_SKIN, solid->half.z - INSIDE_SKIN);
@@ -149,11 +208,9 @@ static bool move_axis(game *g, Transform *t, int axis, float amount, bool can_st
             v3 stepped = to;
             stepped.y = top;
             bool clear = true;
-            cw_query others = cw_query_begin(g->q_solids);
-            cw_entity_id other;
-            while (clear && cw_query_next(&others, &other)) {
-                const Solid *s = CW_GET(w, other, g->c_solid, Solid);
-                clear = !overlaps(stepped, CW_GET(w, other, g->c_transform, Transform)->position, s->half);
+            for (int m = 0; clear && m < count; ++m) {
+                const Solid *s = CW_GET(w, nearby[m], g->c_solid, Solid);
+                clear = !overlaps(stepped, CW_GET(w, nearby[m], g->c_transform, Transform)->position, s->half);
             }
             if (clear) {
                 to.y = top;
@@ -202,6 +259,7 @@ static void system_players(cw_world *w, cw_phase, float dt) {
             p->velocity.z += dz;
         }
         p->velocity.y -= GRAVITY * dt;
+        if (p->swing_cooldown > 0.0f) p->swing_cooldown -= dt;   // the swing itself is the server's call
 
         bool was_grounded = p->grounded;
         if (move_axis(g, t, 0, p->velocity.x * dt, was_grounded)) p->velocity.x = 0.0f;
@@ -238,7 +296,7 @@ void game_init(game *g, cw_sim_role role) {
     cw_world_init(w, g);
     cw_sim_init(&g->sim, role);
 
-    cw_component_id base = cw_comp_block(w, 8);
+    cw_component_id base = cw_comp_block(w, 11);
     g->c_transform = cw_cid(base, 0);
     g->c_solid = cw_cid(base, 1);
     g->c_attachment = cw_cid(base, 2);
@@ -247,6 +305,9 @@ void game_init(game *g, cw_sim_role role) {
     g->c_player = cw_cid(base, 5);
     g->c_ship = cw_cid(base, 6);
     g->c_planet = cw_cid(base, 7);
+    g->c_equipment = cw_cid(base, 8);
+    g->c_loot = cw_cid(base, 9);
+    g->c_owned = cw_cid(base, 10);
     CW_REGISTER(w, g->c_transform, Transform);
     CW_REGISTER(w, g->c_solid, Solid);
     CW_REGISTER(w, g->c_attachment, Attachment);
@@ -255,6 +316,9 @@ void game_init(game *g, cw_sim_role role) {
     CW_REGISTER(w, g->c_player, Player);
     CW_REGISTER(w, g->c_ship, Ship);
     CW_REGISTER(w, g->c_planet, Planet);
+    CW_REGISTER(w, g->c_equipment, Equipment);
+    CW_REGISTER(w, g->c_loot, Loot);
+    CW_REGISTER(w, g->c_owned, Owned);
     cw_comp_set_transient(w, g->c_input, true);
 
     cw_component_id solids[] = {g->c_transform, g->c_solid};
@@ -267,6 +331,8 @@ void game_init(game *g, cw_sim_role role) {
     g->q_attachments = cw_query_create(w, cw_filter_all(cw_mask(parts, 2)));
     cw_component_id all_players[] = {g->c_transform, g->c_player};
     g->q_all_players = cw_query_create(w, cw_filter_all(cw_mask(all_players, 2)));
+    cw_component_id loot[] = {g->c_transform, g->c_loot};
+    g->q_loot = cw_query_create(w, cw_filter_all(cw_mask(loot, 2)));
 
     // Every movement system is shared: a client runs them on its own player and on
     // the ships, which is prediction. Only what a server adds is host-only.
@@ -286,6 +352,10 @@ void game_init(game *g, cw_sim_role role) {
     d.fn = system_attachments;
     d.order = 15;
     cw_sim_register(&g->sim, d);
+    d.name = "solid_grid";
+    d.fn = system_solid_grid;
+    d.order = 17;
+    cw_sim_register(&g->sim, d);
     d.name = "players";
     d.fn = system_players;
     d.order = 20;
@@ -293,6 +363,7 @@ void game_init(game *g, cw_sim_role role) {
 }
 
 void game_destroy(game *g) {
+    free(g->grid);
     cw_sim_destroy(&g->sim);
     cw_world_destroy(&g->world);   // releases the cached queries with it
 }
@@ -340,11 +411,47 @@ cw_entity_id game_spawn_player(game *g, v3 position, bool with_input) {
     Player p = {};
     PlayerInput in = {};
     Visual visual = {MESH_CAPSULE, v3_make(1, 1, 1), game_player_color(id)};
+    Equipment equipment = {};
     cw_comp_set(w, id, g->c_transform, &t, sizeof(t));
     cw_comp_set(w, id, g->c_player, &p, sizeof(p));
     if (with_input) cw_comp_set(w, id, g->c_input, &in, sizeof(in));
     cw_comp_set(w, id, g->c_visual, &visual, sizeof(visual));
+    cw_comp_set(w, id, g->c_equipment, &equipment, sizeof(equipment));
     return id;
+}
+
+cw_entity_id game_spawn_loot(game *g, v3 position, const item *it) {
+    cw_world *w = &g->world;
+    cw_entity_id id = cw_world_create_entity(w);
+    Transform t = {position, position};
+    Loot loot = {*it};
+    float rgb[3];
+    item_rarity_color(it->rarity, rgb);
+    Visual visual = {MESH_CUBE, v3_make(0.25f, 0.25f, 0.25f), v3_make(rgb[0], rgb[1], rgb[2])};
+    cw_comp_set(w, id, g->c_transform, &t, sizeof(t));
+    cw_comp_set(w, id, g->c_loot, &loot, sizeof(loot));
+    cw_comp_set(w, id, g->c_visual, &visual, sizeof(visual));
+    return id;
+}
+
+void game_set_owner(game *g, cw_entity_id id, uint64_t account) {
+    Owned owned = {account};
+    cw_comp_set(&g->world, id, g->c_owned, &owned, sizeof(owned));
+}
+uint64_t game_owner(game *g, cw_entity_id id) {
+    return cw_comp_has(&g->world, id, g->c_owned) ? CW_GET(&g->world, id, g->c_owned, Owned)->account : 0;
+}
+
+cw_entity_id game_loot_at(game *g, v3 feet) {
+    cw_world *w = &g->world;
+    cw_query loot = cw_query_begin(g->q_loot);
+    cw_entity_id id;
+    while (cw_query_next(&loot, &id)) {
+        v3 at = CW_GET(w, id, g->c_transform, Transform)->position;
+        float dx = at.x - feet.x, dz = at.z - feet.z;
+        if (dx * dx + dz * dz <= LOOT_REACH * LOOT_REACH && fabsf(at.y - feet.y) < 1.5f) return id;
+    }
+    return CW_INVALID_ENTITY;
 }
 
 void game_despawn_player(game *g, cw_entity_id id) { cw_world_mark_destroy(&g->world, id); }
@@ -370,8 +477,11 @@ cw_entity_id game_find_ship(game *g, const char *name) {
 }
 
 int game_place_at(const game *g, v3 point) {
+    // Doors and exits stand inside zone places, so they are looked for first.
     for (int i = 0; i < g->place_count; ++i)
-        if (inside_box(point, g->places[i].center, g->places[i].half)) return i;
+        if (g->places[i].kind != PLACE_ZONE && inside_box(point, g->places[i].center, g->places[i].half)) return i;
+    for (int i = 0; i < g->place_count; ++i)
+        if (g->places[i].kind == PLACE_ZONE && inside_box(point, g->places[i].center, g->places[i].half)) return i;
     return -1;
 }
 
@@ -379,4 +489,56 @@ int game_find_place(const game *g, const char *name) {
     for (int i = 0; i < g->place_count; ++i)
         if (strcmp(g->places[i].name, name) == 0) return i;
     return -1;
+}
+
+void game_declare_place(game *g, const char *name, int kind, v3 center, v3 half, v3 spawn, const char *destination) {
+    if (g->place_count == GAME_MAX_PLACES) return;
+    game_place *place = &g->places[g->place_count++];
+    memset(place, 0, sizeof(*place));
+    strncpy(place->name, name, GAME_NAME_CAPACITY - 1);
+    place->kind = kind;
+    place->center = center;
+    place->half = half;
+    place->spawn = spawn;
+    if (destination) strncpy(place->destination, destination, GAME_NAME_CAPACITY - 1);
+}
+
+static float clamp01(float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+
+// Closest distance between segments p1-q1 and p2-q2 (Ericson, Real-Time Collision
+// Detection, 5.1.9).
+static float segment_distance(v3 p1, v3 q1, v3 p2, v3 q2) {
+    const float eps = 1e-6f;
+    v3 d1 = v3_sub(q1, p1), d2 = v3_sub(q2, p2), r = v3_sub(p1, p2);
+    float a = v3_dot(d1, d1), e = v3_dot(d2, d2), f = v3_dot(d2, r);
+    float s, t;
+    if (a <= eps && e <= eps) return v3_length(r);
+    if (a <= eps) {
+        s = 0.0f;
+        t = clamp01(f / e);
+    } else {
+        float c = v3_dot(d1, r);
+        if (e <= eps) {
+            t = 0.0f;
+            s = clamp01(-c / a);
+        } else {
+            float b = v3_dot(d1, d2), denominator = a * e - b * b;
+            s = denominator != 0.0f ? clamp01((b * f - c * e) / denominator) : 0.0f;
+            t = (b * s + f) / e;
+            if (t < 0.0f) {
+                t = 0.0f;
+                s = clamp01(-c / a);
+            } else if (t > 1.0f) {
+                t = 1.0f;
+                s = clamp01((b - c) / a);
+            }
+        }
+    }
+    return v3_length(v3_sub(v3_add(p1, v3_scale(d1, s)), v3_add(p2, v3_scale(d2, t))));
+}
+
+bool game_swing_hits(v3 eye, v3 direction, v3 feet) {
+    v3 reach = v3_add(eye, v3_scale(direction, PLAYER_REACH));
+    v3 bottom = v3_add(feet, v3_make(0, PLAYER_RADIUS, 0)), top = v3_add(feet, v3_make(0, PLAYER_HEIGHT - PLAYER_RADIUS, 0));
+    return segment_distance(eye, reach, bottom, top) <= PLAYER_RADIUS + 0.05f;
 }

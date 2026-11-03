@@ -1,4 +1,7 @@
-# Zone servers and the places each one owns (see src/net/zones.h).
+# Zone servers and the places each one owns (see src/net/zones.h). The alternative
+# to this file is the directory: treasure_directory, and each server started with
+# --directory HOST:PORT --zone NAME --owns PLACE,... (or --instances) and the same
+# --secret; then the table keeps itself.
 # Every server is started with this same file:
 #   treasure_server --zones zones.txt --zone hub
 #   treasure_server --zones zones.txt --zone planets
@@ -10,3 +13,17 @@ secret change-me-before-anyone-can-reach-these-ports
 
 zone hub      127.0.0.1:27500  hub
 zone planets  127.0.0.1:27501  Verdant Ember Azure
+
+# Shards: several zones may own the same place, each a full copy. A player is sent
+# to the shard their party is on, else to one in their region, else anywhere; among
+# those, to the fullest still below its target, so that no shard feels empty, and
+# to the emptiest once all are past it. The words after the places set these:
+# zone hub-eu-1  10.0.0.1:27500  hub  region=eu target=800 capacity=1000
+# zone hub-eu-2  10.0.0.2:27500  hub  region=eu target=800 capacity=1000
+# zone hub-na-1  10.0.1.1:27500  hub  region=na target=800 capacity=1000
+
+# Dungeon instances are opened on the zone whose door was walked through, unless
+# instance hosts are listed; then they are spread over these instead:
+#   treasure_server --zones zones.txt --zone dungeons-1
+# instances dungeons-1  127.0.0.1:27510
+# instances dungeons-2  127.0.0.1:27511

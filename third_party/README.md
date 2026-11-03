@@ -5,6 +5,5 @@
 | `gl/` | Khronos OpenGL core profile headers (`glcorearb.h`, `khrplatform.h`) | as vendored by clockwork-c | MIT, in each file's header |
 | `vulkan/` | Khronos Vulkan headers | 1.3.283 | Apache-2.0 / MIT, see `vulkan/LICENSE.md` |
 | `volk/` | Vulkan function loader | 283 | MIT, see `volk/LICENSE.md` |
-| `glfw/` | Window, input and context creation | 3.4 (`7b6aead`) | zlib, see `glfw/LICENSE.md` |
 
-The Vulkan headers and volk were copied from `override-engine/thirdparty`, and only the headers this project includes were kept. GLFW comes from its 3.4 release tag, without its docs, examples, tests and Windows-cross-compile headers.
+The Vulkan headers and volk were copied from `override-engine/thirdparty`, and only the headers this project includes were kept.

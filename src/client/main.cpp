@@ -6,6 +6,7 @@
 #include "../net/client.h"
 #include "../platform/platform.h"
 #include "../render/renderer.h"
+#include "hud.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,10 @@
 struct options {
     r_backend_kind backend;
     const char *connect;         // host[:port] of a zone server; NULL plays alone
+    const char *directory;       // host[:port] of a directory to find the zone through instead
+    const char *place;           // the place to ask the directory for; NULL: the hub
+    const char *name;            // our display name online; NULL makes one up
+    const char *region;          // "eu", "na"...: the shards to prefer
     const char *capture_path;    // render one scripted frame, write it and exit
     int capture_ticks;
     bool has_position;
@@ -37,6 +42,14 @@ static bool parse_options(int argc, char **argv, options *o) {
             else return false;
         } else if (!strcmp(arg, "--connect") && more) {
             o->connect = argv[++i];
+        } else if (!strcmp(arg, "--directory") && more) {
+            o->directory = argv[++i];
+        } else if (!strcmp(arg, "--place") && more) {
+            o->place = argv[++i];
+        } else if (!strcmp(arg, "--name") && more) {
+            o->name = argv[++i];
+        } else if (!strcmp(arg, "--region") && more) {
+            o->region = argv[++i];
         } else if (!strcmp(arg, "--capture") && more) {
             o->capture_path = argv[++i];
         } else if (!strcmp(arg, "--ticks") && more) {
@@ -155,19 +168,6 @@ static bool write_bmp(const char *path, const uint8_t *rgba, int width, int heig
     return true;
 }
 
-struct draw_list {
-    r_draw *items;
-    size_t count, capacity;
-};
-
-static r_draw *draw_push(draw_list *list) {
-    if (list->count == list->capacity) {
-        list->capacity = list->capacity ? list->capacity * 2 : 256;
-        list->items = (r_draw *)realloc(list->items, list->capacity * sizeof(r_draw));
-    }
-    return &list->items[list->count++];
-}
-
 // Where a player's eyes are, from their feet.
 static v3 eye_of(v3 feet) { return v3_add(feet, v3_make(0, PLAYER_EYE, 0)); }
 
@@ -176,7 +176,7 @@ static v3 eye_of(v3 feet) { return v3_add(feet, v3_make(0, PLAYER_EYE, 0)); }
 // where they look. `net`, when set, hides replicas the server stopped updating.
 static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id player, float yaw, float pitch,
                        float alpha, const r_mesh *meshes, r_mesh stars, draw_list *list, const net_client *net,
-                       uint8_t **capture) {
+                       const party_view *party, const char *my_name, uint8_t **capture) {
     cw_world *w = &g->world;
     int width, height;
     plat_window_size(window, &width, &height);
@@ -230,8 +230,15 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
         draw->color[1] = visual->color.y;
         draw->color[2] = visual->color.z;
         draw->color[3] = 1.0f;
+        if (net && cw_comp_has(w, id, net->c_replica) && CW_GET(w, id, net->c_replica, Replica)->flash > 0.0f) {
+            // Just tagged: a white flash that fades.
+            float f = CW_GET(w, id, net->c_replica, Replica)->flash / NET_HIT_FLASH;
+            for (int k = 0; k < 3; ++k) draw->color[k] += (1.0f - draw->color[k]) * f;
+        }
         if (cw_comp_has(w, id, g->c_player)) {
             const Player *p = CW_GET(w, id, g->c_player, Player);
+            // Their gear, for everyone to see, always.
+            if (cw_comp_has(w, id, g->c_equipment)) hud_draw_gear(list, meshes[MESH_CUBE], at, p->yaw, CW_GET(w, id, g->c_equipment, Equipment));
             v3 nose = v3_add(eye_of(at), v3_scale(look_direction(p->yaw, p->pitch), PLAYER_RADIUS));
             r_draw *face = draw_push(list);
             face->mesh = meshes[MESH_CUBE];
@@ -239,6 +246,15 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
             face->color[0] = face->color[1] = face->color[2] = 0.1f;
             face->color[3] = 1.0f;
         }
+    }
+    if (party) {
+        // The overlay, in the camera's frame: the party panel top right, gear bottom
+        // right, and what loot we are looking at.
+        hud_frame hud = hud_begin(eye, yaw, pitch, (float)width / (float)height, meshes[MESH_CUBE]);
+        hud_party(list, &hud, party, my_name);
+        if (net && net->gear_known) hud_gear(list, &hud, &net->gear, &net->last_pickup, net->pickup_flash);
+        item looked_at;
+        if (net && net_client_loot_in_view(net, 6.0f, &looked_at)) hud_loot(list, &hud, &looked_at);
     }
     frame.draws = list->items;
     frame.draw_count = list->count;
@@ -264,7 +280,12 @@ static PlayerInput read_input(plat_window *window, float *yaw, float *pitch) {
     PlayerInput in = {};
     in.forward = (input->keys['W'] ? 1.0f : 0.0f) - (input->keys['S'] ? 1.0f : 0.0f);
     in.strafe = (input->keys['D'] ? 1.0f : 0.0f) - (input->keys['A'] ? 1.0f : 0.0f);
+<<<<<<< Updated upstream
     in.jump = input->keys[PLAT_KEY_SPACE];
+=======
+    in.jump = input->keys[KEY_SPACE];
+    in.act = input->clicked && input->mouse_captured;   // a click while playing is a swing
+>>>>>>> Stashed changes
     in.yaw = *yaw;
     in.pitch = *pitch;
     return in;
@@ -288,19 +309,42 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
         return 1;
     }
     net_session session;
-    if (!net_session_init(&session, o->connect, NET_INTERP_DELAY)) {
-        fprintf(stderr, "%s: %s\n", o->connect, session.failure);
+    net_identity identity = net_identity_local(o->name);
+    if (o->region) strncpy(identity.region, o->region, NET_REGION_NAME - 1);
+    bool ok = o->directory ? net_session_init_directory(&session, o->directory, o->place, NET_INTERP_DELAY, &identity)
+                           : net_session_init(&session, o->connect, NET_INTERP_DELAY, &identity);
+    if (!ok) {
+        fprintf(stderr, "%s: %s\n", o->directory ? o->directory : o->connect, session.failure);
         net_shutdown();
         return 1;
     }
-    fprintf(stderr, "connecting to %s\n", o->connect);
+    fprintf(stderr, "connecting %s %s\n", o->directory ? "through the directory at" : "to", o->directory ? o->directory : o->connect);
 
     double last_status = 0.0;
     int status = 0;
+    bool keys_before[256] = {};
     plat_window_capture_mouse(window, true);
     while (plat_window_poll(window)) {
         PlayerInput in = read_input(window, yaw, pitch);
         double now = net_seconds();
+        // Party keys, on the press: F1 create, I invite whoever is in view, F2 accept,
+        // F3 leave, F4 decline.
+        const plat_input *input = plat_window_input(window);
+        bool pressed[256];
+        for (int k = 0; k < 256; ++k) {
+            pressed[k] = input->keys[k] && !keys_before[k];
+            keys_before[k] = input->keys[k];
+        }
+        if (pressed[0x70]) net_session_party_request(&session, PARTY_CREATE, NULL);
+        if (pressed[0x71]) net_session_party_request(&session, PARTY_ACCEPT, NULL);
+        if (pressed[0x72]) net_session_party_request(&session, PARTY_LEAVE, NULL);
+        if (pressed[0x73]) net_session_party_request(&session, PARTY_DECLINE, NULL);
+        if (pressed['I'] && session.link) {
+            char name[ACCOUNT_NAME_CAPACITY];
+            if (net_client_player_in_view(session.link, 6.0f, name)) net_session_party_request(&session, PARTY_INVITE, name);
+        }
+        for (int k = 0; k < 9; ++k)
+            if (pressed['1' + k]) net_session_equip(&session, k);   // wear stash item k
         net_session_frame(&session, &in, now);
         net_client_state state = net_session_state(&session);
         if (state == NC_DISCONNECTED) {
@@ -310,17 +354,37 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
         }
         game *g = session.world;
         net_client *link = session.link;
+        if (!link) {   // still asking the directory
+            if (now - last_status > 0.25) {
+                char title[160];
+                snprintf(title, sizeof(title), "Treasure Planet [%s] asking %s for %s", backend, o->directory, o->place ? o->place : "hub");
+                plat_window_set_title(window, title);
+                last_status = now;
+            }
+            continue;
+        }
         cw_entity_id player = state == NC_CONNECTED ? link->player : CW_INVALID_ENTITY;
         if (now - last_status > 0.25) {
             char address[32], prefix[200];
             net_address_format(link->server, address, sizeof(address));
-            snprintf(prefix, sizeof(prefix), "Treasure Planet [%s] %s %s, %zu players, %.0f ms, %d hand-offs (%.0f ms)",
+            const Player *me = cw_world_is_valid(&g->world, player) ? CW_GET(&g->world, player, g->c_player, Player) : NULL;
+            snprintf(prefix, sizeof(prefix), "Treasure Planet [%s] %s %s, %zu players, %.0f ms input / %.1f ms net, %.0f%% loss, %d hand-offs (%.0f ms), tagged %u/%u%s",
                      backend, address, net_state_name(state), cw_query_count(g->q_all_players), link->rtt * 1000.0f,
-                     session.handoffs, session.last_handoff_seconds * 1000.0f);
-            set_status(window, g, player, prefix);
+                     link->connection.rtt * 1000.0, link->connection.loss * 100.0,
+                     session.handoffs, session.last_handoff_seconds * 1000.0f, me ? me->hits_made : 0u,
+                     me ? me->hits_taken : 0u, link->hit_flash > 0.0f ? " HIT" : "");
+            if (link->world_name[0]) {
+                // In a dungeon: no ships to report, only where we are.
+                char title[256];
+                snprintf(title, sizeof(title), "%s: in %s", prefix, link->world_name);
+                plat_window_set_title(window, title);
+            } else {
+                set_status(window, g, player, prefix);
+            }
             last_status = now;
         }
-        draw_world(r, window, g, player, *yaw, *pitch, net_client_alpha(link), meshes, stars, list, link, NULL);
+        draw_world(r, window, g, player, *yaw, *pitch, net_client_alpha(link), meshes, stars, list, link,
+                   net_session_party(&session), session.identity.name, NULL);
     }
     net_session_destroy(&session);
     net_shutdown();
@@ -353,7 +417,7 @@ static int run(const options *o) {
     draw_list list = {};
     int status = 0;
 
-    if (o->connect) {
+    if (o->connect || o->directory) {
         status = run_online(o, window, r, backend, meshes, stars, &list, &yaw, &pitch);
         free(list.items);
         renderer_destroy(r);
@@ -374,9 +438,9 @@ static int run(const options *o) {
         uint8_t *pixels = NULL;
         // A few frames first, so a fresh swapchain has settled on the window's size.
         for (int i = 0; i < 4 && plat_window_poll(window); ++i)
-            draw_world(r, window, g, player, yaw, pitch, 1.0f, meshes, stars, &list, NULL, NULL);
+            draw_world(r, window, g, player, yaw, pitch, 1.0f, meshes, stars, &list, NULL, NULL, NULL, NULL);
         plat_window_poll(window);
-        draw_world(r, window, g, player, yaw, pitch, 1.0f, meshes, stars, &list, NULL, &pixels);
+        draw_world(r, window, g, player, yaw, pitch, 1.0f, meshes, stars, &list, NULL, NULL, NULL, &pixels);
         int width, height;
         plat_window_size(window, &width, &height);
         if (!pixels || !write_bmp(o->capture_path, pixels, width, height)) {
@@ -403,7 +467,7 @@ static int run(const options *o) {
                 set_status(window, g, player, prefix);
                 last_status = now;
             }
-            draw_world(r, window, g, player, yaw, pitch, cw_clock_alpha(&clock), meshes, stars, &list, NULL, NULL);
+            draw_world(r, window, g, player, yaw, pitch, cw_clock_alpha(&clock), meshes, stars, &list, NULL, NULL, NULL, NULL);
         }
     }
 
@@ -418,7 +482,7 @@ static int run(const options *o) {
 int main(int argc, char **argv) {
     options o;
     if (!parse_options(argc, argv, &o)) {
-        fputs("usage: treasure_planet [--renderer vulkan|gl] [--connect host[:port]]\n"
+        fputs("usage: treasure_planet [--renderer vulkan|gl] [--connect host[:port] | --directory host[:port] [--place NAME]] [--name NAME]\n"
               "                       [--capture out.bmp [--ticks N] [--at X Y Z] [--look YAW PITCH]]\n", stderr);
         return 2;
     }

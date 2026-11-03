@@ -505,7 +505,7 @@ static bool filter_matches_sig(const cw_filter *f, bool any_empty, const cw_sign
     return any_hit;
 }
 cw_filter cw_filter_all(cw_signature all) {
-    cw_filter f = {};
+    cw_filter f = {0};
     f.all = all;
     return f;
 }
@@ -555,12 +555,12 @@ cw_access cw_access_make(cw_signature reads, cw_signature writes) {
     return a;
 }
 cw_access cw_access_read(cw_signature reads) {
-    cw_access a = {};
+    cw_access a = {0};
     a.reads = reads;
     return a;
 }
 cw_access cw_access_write(cw_signature writes) {
-    cw_access a = {};
+    cw_access a = {0};
     a.writes = writes;
     return a;
 }
@@ -796,11 +796,11 @@ void cw_query_destroy(cw_cached_query *h) {
 }
 cw_world *cw_query_world(const cw_cached_query *h) { return h ? h->cache->world : NULL; }
 cw_filter cw_query_filter(const cw_cached_query *h) {
-    cw_filter none = {};
+    cw_filter none = {0};
     return h ? h->cache->filter : none;
 }
 cw_access cw_query_access(const cw_cached_query *h) {
-    cw_access none = {};
+    cw_access none = {0};
     return h ? h->access : none;
 }
 size_t cw_query_refs(const cw_cached_query *h) { return h ? h->refs : 0; }
@@ -1127,7 +1127,7 @@ size_t cw_observer_gather(const cw_observer *o, cw_change kind, cw_entity_id *ou
     return n;
 }
 cw_access cw_observer_access(const cw_observer *o) {
-    cw_access a = {};
+    cw_access a = {0};
     if (o) cw_sig_set(&a.reads, o->component);
     return a;
 }
