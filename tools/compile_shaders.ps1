@@ -1,11 +1,13 @@
-# Regenerates the SPIR-V the Vulkan backend embeds, after editing mesh.glsl.
-# Needs glslc from the Vulkan SDK. OpenGL compiles mesh.glsl itself at runtime, so a
-# stale .inl shows up as the two backends disagreeing: tools/compare_captures.py.
+# Commits the SPIR-V the Vulkan backend embeds. The build makes the table itself
+# when it finds glslc (the Vulkan SDK): this configures and builds it, then copies
+# it to src/render/shaders/spirv/table.inl, with the hash of the shader sources it
+# came from, which the backend checks at startup.
 $ErrorActionPreference = 'Stop'
-$glslc = if ($env:VULKAN_SDK) { Join-Path $env:VULKAN_SDK 'Bin\glslc.exe' } else { 'glslc' }
-$dir = Join-Path $PSScriptRoot '..\src\render\shaders'
-foreach ($stage in @(@('vert', 'VERTEX'), @('frag', 'FRAGMENT'))) {
-    $out = Join-Path $dir "mesh.$($stage[0]).spv.inl"
-    & $glslc "-fshader-stage=$($stage[0])" -std=450core --target-env=vulkan1.1 "-D$($stage[1])" -mfmt=c -o $out (Join-Path $dir 'mesh.glsl')
-    if ($LASTEXITCODE -ne 0) { throw "glslc failed on the $($stage[0]) stage." }
-}
+$root = Join-Path $PSScriptRoot '..'
+$dir = Join-Path $root 'build\shaders'
+& cmake -S $root -B $dir -G Ninja -DCMAKE_BUILD_TYPE=Release -DTP_BUILD_TESTS=OFF
+if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
+& cmake --build $dir --target treasure_planet
+if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+Copy-Item (Join-Path $dir 'generated\spirv\table.inl') (Join-Path $root 'src\render\shaders\spirv\table.inl')
+Write-Host "committed the SPIR-V table from $dir"

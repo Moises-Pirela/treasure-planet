@@ -28,6 +28,10 @@ struct plat_input {
 plat_window *plat_window_create(const char *title, int width, int height);
 void plat_window_destroy(plat_window *window);
 void plat_window_show(plat_window *window);
+// Whether a present waits for the display, for a renderer to read when it starts. On
+// by default; off is for measuring what a frame really costs.
+void plat_set_vsync(bool on);
+bool plat_vsync(void);
 bool plat_window_poll(plat_window *window);      // false once the window was closed
 void plat_window_size(const plat_window *window, int *width, int *height);    // in pixels
 void plat_window_set_title(plat_window *window, const char *title);

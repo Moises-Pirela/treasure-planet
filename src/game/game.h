@@ -73,9 +73,29 @@ struct Ship {
     int state;                   // ship_state
     int stop;                    // ship_stop: where it is docked, or flying to
 };
+// A planet's land: the field the renderer displaces its sphere by, and the ground
+// the simulation stands players on, so that what is walked on is what is seen.
+// Continents where noise of `continents` frequency passes `sea_level`, ridged
+// mountains on them up to `relief` metres, and a flat of `pad_radius` metres about
+// the top (the landing pad's).
+struct PlanetLand {
+    float radius;
+    float continents, relief, sea_level, mountains, shore, pad_radius;
+    uint32_t seed;
+};
 struct Planet {
     char name[GAME_NAME_CAPACITY];
+    PlanetLand land;
 };
+
+// Metres the land rises above the sphere in a direction (unit) from the centre.
+float game_planet_height(const PlanetLand *land, v3 direction);
+// The height of the land under a point, on the side of the planet the point is on;
+// -1e30 where the point is past the planet's limb. `centre` is the planet's.
+float game_planet_surface_y(const PlanetLand *land, v3 centre, v3 position);
+// A point on the land `arc` metres from the top of the planet along `heading`
+// (a horizontal direction), for placing what stands on it.
+v3 game_planet_point(const PlanetLand *land, v3 centre, v3 heading, float arc);
 struct Equipment {               // what a player wears, for everyone to see
     item items[SLOT_COUNT];
 };
@@ -103,7 +123,9 @@ enum visual_mesh { MESH_CUBE, MESH_SPHERE, MESH_CAPSULE, MESH_COUNT };
 //                   place and position to return to.
 // Ships in flight are between places.
 #define GAME_MAX_PLACES 12
-enum place_kind { PLACE_ZONE, PLACE_ENTRANCE, PLACE_EXIT };
+// PLACE_LANDMARK is a named spot, not a way anywhere: the client lights it and
+// points at it, the server ignores it.
+enum place_kind { PLACE_ZONE, PLACE_ENTRANCE, PLACE_EXIT, PLACE_LANDMARK };
 struct game_place {
     char name[GAME_NAME_CAPACITY];
     int kind;                    // place_kind
@@ -118,7 +140,7 @@ struct game {
     cw_sim_role role;
     cw_component_id c_transform, c_solid, c_attachment, c_visual, c_input, c_player, c_ship, c_planet;
     cw_component_id c_equipment, c_loot, c_owned;
-    cw_cached_query *q_solids, *q_players, *q_ships, *q_attachments;
+    cw_cached_query *q_solids, *q_players, *q_ships, *q_attachments, *q_planets;
     cw_cached_query *q_all_players;   // every player, with or without an input
     cw_cached_query *q_loot;
     // Broadphase for the solids: rebuilt every tick, so that a player's collision
@@ -175,6 +197,8 @@ v3 game_player_color(cw_entity_id id);
 // Queries the client and the tests use. game_ship_at returns the ship whose volume
 // holds the point, or CW_INVALID_ENTITY. game_place_at returns an index into
 // places, or -1 between places.
+// The highest planet surface under a point, or -1e30 where no planet is under it.
+float game_ground_y(game *g, v3 position);
 cw_entity_id game_ship_at(game *g, v3 point);
 cw_entity_id game_find_ship(game *g, const char *name);
 int game_place_at(const game *g, v3 point);

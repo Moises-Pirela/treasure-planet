@@ -1,6 +1,7 @@
 // The content of the world, as data: the hub, the planets, and the ship that serves
 // each planet. Adding a planet is adding a row to PLANETS.
 #include "game.h"
+#include <stdio.h>
 #include <string.h>
 
 struct ship_part { v3 offset, half, color; };
@@ -27,6 +28,10 @@ struct planet_row {
     const char *planet, *ship;
     v3 color, ship_color;
     float radius;
+    // Its land: how wide the continents are, how high they rise, where the sea
+    // ends, how much of the height is mountains, and the seed it all comes from.
+    float continents, relief, sea_level, mountains;
+    uint32_t seed;
     v3 dock;                     // where its ship lands, relative to the origin
     float pier_x;                // the hub's pier for this ship
     float deck_half_x, deck_half_z;
@@ -39,16 +44,22 @@ struct planet_row {
 
 static const planet_row PLANETS[] = {
     {"Verdant", "Emerald Skiff", {0.25f, 0.55f, 0.3f}, {0.2f, 0.6f, 0.4f}, 260.0f,
+     2.5f, 40.0f, 0.5f, 0.6f, 1,
      {-900, 120, -1400}, -20.0f, 2.5f, 7.0f, SKIFF_PARTS, COUNT_OF(SKIFF_PARTS), 30.0f, 20.0f},
     {"Ember", "Rust Hauler", {0.65f, 0.3f, 0.15f}, {0.75f, 0.45f, 0.2f}, 420.0f,
+     2.5f, 55.0f, 0.42f, 0.8f, 2,
      {0, -200, -2200}, 0.0f, 5.5f, 12.0f, HAULER_PARTS, COUNT_OF(HAULER_PARTS), 40.0f, 25.0f},
     {"Azure", "Blue Clipper", {0.2f, 0.4f, 0.7f}, {0.3f, 0.45f, 0.8f}, 320.0f,
+     2.0f, 45.0f, 0.55f, 0.5f, 3,
      {1100, 300, -1600}, 20.0f, 2.5f, 10.0f, CLIPPER_PARTS, COUNT_OF(CLIPPER_PARTS), 35.0f, 30.0f},
 };
 
 static const float HUB_HALF = 30.0f;
 static const float PIER_LENGTH = 14.0f;
 static const float PAD_HALF = 30.0f;
+static const float PAD_FLAT = 45.0f;          // metres of land about the pole the pad is set into
+static const float MONUMENT_ARC = 85.0f;      // how far from the pad the monument stands, along the land
+static const float MONUMENT_HEIGHT = 52.0f;
 
 static cw_entity_id spawn_block(game *g, v3 center, v3 half, v3 color) {
     cw_world *w = &g->world;
@@ -81,7 +92,7 @@ static void spawn_ship(game *g, const planet_row *row, cw_entity_id planet, v3 h
     ship.hub_dock = hub_dock;
     ship.planet_dock = planet_dock;
     ship.planet = planet;
-    ship.cruise_height = 40.0f;
+    ship.cruise_height = 140.0f;
     ship.flight_seconds = row->flight_seconds;
     ship.dock_seconds = row->dock_seconds;
     ship.phase = 0.0f;           // every ship starts its timetable docked at the hub
@@ -127,6 +138,34 @@ static void spawn_dungeon_door(game *g, const planet_row *row, v3 pad) {
                        v3_add(door, v3_make(0, 0, -4.0f)), row->planet);
 }
 
+// The monument: a stepped spire on the land beyond the pad, in the direction the
+// ship comes in from, so it stands ahead of the deck all the way down. The
+// landmark place is what the client lights it by.
+static void spawn_monument(game *g, const planet_row *row, const PlanetLand *land, v3 centre, v3 approach) {
+    v3 base = game_planet_point(land, centre, approach, MONUMENT_ARC);
+    v3 stone = v3_scale(row->color, 0.55f), facing = v3_scale(row->color, 1.5f);
+    spawn_block(g, v3_add(base, v3_make(0, 2.0f, 0)), v3_make(11.0f, 3.0f, 11.0f), stone);      // the plinth
+    float height = 5.0f;
+    for (int step = 0; step < 4; ++step) {
+        float half = 7.0f - 1.4f * (float)step, tall = MONUMENT_HEIGHT * 0.22f;
+        spawn_block(g, v3_add(base, v3_make(0, height + tall, 0)), v3_make(half, tall, half),
+                    step % 2 ? v3_scale(stone, 1.2f) : stone);
+        height += tall * 2.0f;
+    }
+    spawn_block(g, v3_add(base, v3_make(0, height + 3.0f, 0)), v3_make(2.2f, 3.0f, 2.2f), facing);   // the crown
+    // Two pylons flanking the way from the pad to it.
+    v3 side = v3_normalize(v3_cross(v3_sub(base, centre), approach));
+    for (int k = -1; k <= 1; k += 2) {
+        v3 at = v3_add(base, v3_scale(side, 22.0f * (float)k));
+        at.y = game_planet_surface_y(land, centre, at);
+        spawn_block(g, v3_add(at, v3_make(0, 8.0f, 0)), v3_make(1.6f, 8.0f, 1.6f), stone);
+    }
+    char name[GAME_NAME_CAPACITY];
+    snprintf(name, sizeof(name), "%s Monument", row->planet);
+    game_declare_place(g, name, PLACE_LANDMARK, v3_add(base, v3_make(0, height + 3.0f, 0)),
+                       v3_make(3.0f, 4.0f, 3.0f), base, row->planet);
+}
+
 static void spawn_planet(game *g, const planet_row *row) {
     cw_world *w = &g->world;
     // The landing pad butts against the ship's stern, level with its deck.
@@ -145,12 +184,23 @@ static void spawn_planet(game *g, const planet_row *row) {
     Transform t = {center, center};
     Planet planet = {};
     strncpy(planet.name, row->planet, GAME_NAME_CAPACITY - 1);
+    planet.land.radius = row->radius;
+    planet.land.continents = row->continents;
+    planet.land.relief = row->relief;
+    planet.land.sea_level = row->sea_level;
+    planet.land.mountains = row->mountains;
+    planet.land.shore = 0.04f;
+    planet.land.pad_radius = PAD_FLAT;
+    planet.land.seed = row->seed;
     Visual visual = {MESH_SPHERE, v3_make(row->radius, row->radius, row->radius), row->color};
     cw_comp_set(w, id, g->c_transform, &t, sizeof(t));
     cw_comp_set(w, id, g->c_planet, &planet, sizeof(planet));
     cw_comp_set(w, id, g->c_visual, &visual, sizeof(visual));
 
     v3 hub_dock = v3_make(row->pier_x, 0.0f, -HUB_HALF - PIER_LENGTH - row->deck_half_z);
+    // The way in, from the hub's dock to this one: the monument stands beyond the
+    // pad along it, so a passenger coming down has it ahead of them.
+    spawn_monument(g, row, &planet.land, center, v3_normalize(v3_sub(row->dock, hub_dock)));
     spawn_ship(g, row, id, hub_dock, row->dock);
     v3 pier = v3_make(row->pier_x, -0.5f, -HUB_HALF - PIER_LENGTH * 0.5f);
     spawn_block(g, pier, v3_make(2.0f, 0.5f, PIER_LENGTH * 0.5f), v3_make(0.45f, 0.45f, 0.5f));

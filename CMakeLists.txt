@@ -39,7 +39,7 @@ add_library(tp_ecs STATIC
     src/ecs/cw_snapshot.cpp src/ecs/cw_file.cpp src/ecs/cw_sim.cpp)
 tp_strict(tp_ecs)
 
-add_library(tp_game STATIC src/game/game.cpp src/game/universe.cpp src/game/dungeon.cpp src/game/items.cpp)
+add_library(tp_game STATIC src/game/game.cpp src/game/universe.cpp src/game/planet.cpp src/game/dungeon.cpp src/game/items.cpp)
 target_link_libraries(tp_game PUBLIC tp_ecs)
 tp_strict(tp_game)
 if(NOT WIN32)
@@ -78,7 +78,7 @@ tp_strict(treasure_bots)
 
 if(TP_BUILD_TESTS)
     enable_testing()
-    foreach(name test_ecs test_game test_net test_hud)
+    foreach(name test_ecs test_game test_net test_hud test_render)
         add_executable(${name} tests/${name}.cpp)
         tp_strict(${name})
         add_test(NAME ${name} COMMAND ${name})
@@ -88,6 +88,9 @@ if(TP_BUILD_TESTS)
     target_link_libraries(test_net PRIVATE tp_net)
     target_sources(test_hud PRIVATE src/client/hud.cpp)
     target_link_libraries(test_hud PRIVATE tp_net)
+    # Preparing a frame is pure arithmetic: the test links it without a backend.
+    target_sources(test_render PRIVATE src/render/frame.cpp src/render/obj.cpp)
+    target_link_libraries(test_render PRIVATE tp_game)
     # The orchestrator test starts real shard servers.
     target_compile_definitions(test_net PRIVATE TP_SERVER_PATH="$<TARGET_FILE:treasure_server>")
     add_dependencies(test_net treasure_server)
@@ -97,12 +100,103 @@ endif()
 # The client: window, renderer (OpenGL 4.5 and Vulkan 1.1), game loop
 # ---------------------------------------------------------------------------
 if(TP_BUILD_CLIENT)
-    # The GL backend compiles mesh.glsl at runtime; wrap the file in a raw string.
-    set(MESH_GLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/render/shaders/mesh.glsl)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${MESH_GLSL})
-    file(READ ${MESH_GLSL} MESH_GLSL_TEXT)
-    file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/mesh.glsl.inl
-         CONTENT "R\"GLSL(${MESH_GLSL_TEXT})GLSL\"\n" @ONLY)
+    # The shaders: every file in src/render/shaders (the shared pieces, the stage
+    # programs, and a material shader per file in materials/). Each is embedded as
+    # a byte array (a string literal would hit MSVC's 16 KB limit), 16 bytes a line,
+    # in a table the renderer reads: OpenGL compiles from it at runtime, expanding
+    # the #includes itself. Adding a file is adding a shader, and the build sees it.
+    set(TP_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/render/shaders)
+    file(GLOB_RECURSE TP_SHADER_FILES CONFIGURE_DEPENDS
+         ${TP_SHADER_DIR}/*.glsl ${TP_SHADER_DIR}/*.vert ${TP_SHADER_DIR}/*.frag)
+    list(SORT TP_SHADER_FILES)
+    # Editing one reconfigures too: the sources are read here, into the table.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${TP_SHADER_FILES})
+    set(TP_SHADER_SOURCES "")
+    set(TP_SHADER_TABLE "static const r_shader_file SHADER_FILES[] = {\n")
+    set(TP_SHADER_TEXT "")
+    set(index 0)
+    string(REPEAT "0x[0-9a-f][0-9a-f]," 16 TP_BYTE_LINE)
+    foreach(file ${TP_SHADER_FILES})
+        file(RELATIVE_PATH name ${TP_SHADER_DIR} ${file})
+        file(READ ${file} text)
+        string(REPLACE "\r" "" text "${text}")
+        string(APPEND TP_SHADER_TEXT "${name}\n${text}\n")
+        file(READ ${file} hex HEX)
+        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
+        string(REGEX REPLACE "(${TP_BYTE_LINE})" "\\1\n" bytes "${bytes}")
+        string(APPEND TP_SHADER_SOURCES "static const unsigned char SHADER_SRC_${index}[] = {\n${bytes}0x00};\n")
+        string(APPEND TP_SHADER_TABLE "    {\"${name}\", SHADER_SRC_${index}, sizeof(SHADER_SRC_${index}) - 1},\n")
+        math(EXPR index "${index} + 1")
+    endforeach()
+    string(APPEND TP_SHADER_TABLE "};\n")
+    file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/shader_sources.inl
+         CONTENT "${TP_SHADER_SOURCES}${TP_SHADER_TABLE}" @ONLY)
+    string(SHA256 TP_SHADERS_SHA256 "${TP_SHADER_TEXT}")
+
+    # The Vulkan backend embeds SPIR-V: one blob per program, which is every
+    # .vert and .frag at the top of the directory, and two per material shader
+    # (the lit pass and the shadow pass). With glslc at hand (the Vulkan SDK) the
+    # build compiles them into a table in the build tree; without, the table
+    # committed in src/render/shaders/spirv is used, and the backend checks at
+    # startup that it was built from these very sources (by their hash, line
+    # endings aside) rather than run stale shaders against the wrong layouts.
+    find_program(TP_GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    set(TP_SPIRV_SOURCES)
+    if(TP_GLSLC)
+        set(spirv_dir ${CMAKE_CURRENT_BINARY_DIR}/generated/spirv)
+        file(MAKE_DIRECTORY ${spirv_dir})
+        set(spirv_names)
+        set(spirv_files)
+        foreach(file ${TP_SHADER_FILES})
+            file(RELATIVE_PATH name ${TP_SHADER_DIR} ${file})
+            get_filename_component(suffix ${file} LAST_EXT)
+            string(SUBSTRING ${suffix} 1 -1 stage)
+            if(NOT stage STREQUAL "vert" AND NOT stage STREQUAL "frag")
+                continue()
+            endif()
+            set(variants "")
+            if(name MATCHES "^materials/")
+                set(variants "lit;shadow")
+            else()
+                set(variants "plain")
+            endif()
+            foreach(variant ${variants})
+                set(blob ${name})
+                set(define "")
+                if(variant STREQUAL "lit")
+                    set(blob "${name}:lit")
+                    set(define -DLIT_PASS)
+                elseif(variant STREQUAL "shadow")
+                    set(blob "${name}:shadow")
+                    set(define -DSHADOW_PASS)
+                endif()
+                string(MAKE_C_IDENTIFIER ${blob} safe)
+                set(out ${spirv_dir}/${safe}.spv)
+                add_custom_command(OUTPUT ${out}
+                    COMMAND ${TP_GLSLC} -fshader-stage=${stage} -std=450core --target-env=vulkan1.1
+                            -I ${TP_SHADER_DIR} ${define} -o ${out} ${file}
+                    DEPENDS ${TP_SHADER_FILES} COMMENT "glslc ${blob}" VERBATIM)
+                list(APPEND spirv_names ${blob})
+                list(APPEND spirv_files ${out})
+            endforeach()
+        endforeach()
+        add_custom_command(OUTPUT ${spirv_dir}/table.inl
+            COMMAND ${CMAKE_COMMAND} -DOUT=${spirv_dir}/table.inl -DHASH=${TP_SHADERS_SHA256}
+                    "-DNAMES=${spirv_names}" "-DFILES=${spirv_files}"
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/spirv_table.cmake
+            DEPENDS ${spirv_files} ${CMAKE_CURRENT_SOURCE_DIR}/tools/spirv_table.cmake
+            COMMENT "the SPIR-V table" VERBATIM)
+        set(TP_SPIRV_SOURCES ${spirv_dir}/table.inl)
+        set(TP_SPIRV_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    else()
+        set(TP_SPIRV_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/src/render/shaders)
+        file(READ src/render/shaders/spirv/table.inl committed)
+        if(NOT committed MATCHES "SPIRV_SOURCE_SHA256\\[\\] = \"${TP_SHADERS_SHA256}\"")
+            message(WARNING "The committed SPIR-V in src/render/shaders/spirv was not built from the current "
+                            "shaders, so the Vulkan backend will decline to start and the client will fall "
+                            "back to OpenGL. Install the Vulkan SDK (glslc) and reconfigure, or run tools/compile_shaders.")
+        endif()
+    endif()
 
     add_library(tp_volk STATIC third_party/volk/volk.c)
     target_include_directories(tp_volk PUBLIC third_party/volk third_party/vulkan)
@@ -121,10 +215,15 @@ if(TP_BUILD_CLIENT)
         src/client/hud.cpp
         src/platform/platform_glfw.cpp
         src/render/renderer.cpp
+        src/render/frame.cpp
+        src/render/obj.cpp
+        src/render/shaders.cpp
         src/render/backend_gl.cpp
-        src/render/backend_vk.cpp)
+        src/render/backend_vk.cpp
+        ${TP_SPIRV_SOURCES})
     target_include_directories(treasure_planet SYSTEM PRIVATE third_party/gl)
-    target_include_directories(treasure_planet PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    target_include_directories(treasure_planet PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated ${TP_SPIRV_INCLUDE})
+    target_compile_definitions(treasure_planet PRIVATE TP_SHADERS_SHA256="${TP_SHADERS_SHA256}")
     target_link_libraries(treasure_planet PRIVATE tp_net tp_volk glfw)
     tp_strict(treasure_planet)
 endif()

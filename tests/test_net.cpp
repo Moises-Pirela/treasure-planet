@@ -1184,7 +1184,15 @@ static void test_handoff_failure(void) {
 }
 
 // The server's tick follows the wall clock, through stalls and clock jumps, so
-// universe time means the same thing on every zone.
+// universe time means the same thing on every zone. The clock is read before and
+// after each update, and the tick must land between those two readings: exact,
+// and not a race against how long a sleep or a check took to run.
+static uint64_t update_between(server *s, uint64_t *before, uint64_t *after) {
+    *before = server_target_tick(s);
+    server_update(s, net_seconds());
+    *after = server_target_tick(s);
+    return s->zone.world.tick;
+}
 static void test_server_clock(void) {
     server_config config = server_config_default();
     config.port = 0;
@@ -1195,31 +1203,34 @@ static void test_server_clock(void) {
         server_update(s, net_seconds());
         net_sleep(0.001);
     }
-    uint64_t target = server_target_tick(s);
-    CHECK(s->zone.world.tick <= target && target - s->zone.world.tick <= 1);
-    CHECK(fabs(game_time_of_tick(&s->zone, s->zone.world.tick) - (net_wall_seconds() - config.universe_epoch)) < 0.05);
+    uint64_t lo, hi;
+    uint64_t tick = update_between(s, &lo, &hi);
+    CHECK(tick >= lo && tick <= hi);
+    CHECK(fabs(game_time_of_tick(&s->zone, tick) - (net_wall_seconds() - config.universe_epoch)) < 0.05);
 
     // A stall: time passes, no updates. Short ones are simulated in full.
-    net_sleep(0.3);
     uint64_t before = s->zone.world.tick;
-    server_update(s, net_seconds());
-    CHECK(s->zone.world.tick - before >= 17 && s->zone.world.tick - before <= 20);
+    net_sleep(0.3);
+    tick = update_between(s, &lo, &hi);
+    CHECK(tick >= lo && tick <= hi);
+    CHECK(tick - before >= 17);
     CHECK(s->ticks_skipped == 0);
 
     // A long one (here: the clock saying we are 3 s behind) is caught up to a point
     // and the rest skipped.
+    before = s->zone.world.tick;
     s->tick_base -= 3.0;
-    server_update(s, net_seconds());
-    CHECK(s->ticks_skipped >= 180 - SERVER_MAX_CATCHUP && s->ticks_skipped <= 180 - SERVER_MAX_CATCHUP + 3);
-    target = server_target_tick(s);
-    CHECK(target - s->zone.world.tick <= 3);
+    tick = update_between(s, &lo, &hi);
+    CHECK(tick >= lo && tick <= hi);
+    CHECK(lo - before >= 180);
+    CHECK(s->ticks_skipped >= lo - before - SERVER_MAX_CATCHUP && s->ticks_skipped <= hi - before - SERVER_MAX_CATCHUP);
 
     // A clock jump (10 s) moves universe time instead of the tick.
-    uint64_t tick = s->zone.world.tick;
+    before = s->zone.world.tick;
     s->tick_base -= 10.0;
     server_update(s, net_seconds());
     CHECK(s->rebases == 1);
-    CHECK(s->zone.world.tick - tick <= 2);
+    CHECK(s->zone.world.tick - before <= 2);
     CHECK(fabs(game_time_of_tick(&s->zone, s->zone.world.tick) - (net_wall_seconds() - config.universe_epoch)) < 0.05);
     server_destroy(s);
     free(s);

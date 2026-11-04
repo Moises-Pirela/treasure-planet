@@ -267,6 +267,16 @@ static void system_players(cw_world *w, cw_phase, float dt) {
         p->grounded = hit && falling <= 0.0f;
         if (hit) p->velocity.y = 0.0f;
 
+        // The land of a planet holds a player up like any floor would.
+        float ground = game_ground_y(g, t->position);
+        if (t->position.y < ground) {
+            t->position.y = ground;
+            if (falling <= 0.0f) {
+                p->grounded = true;
+                p->velocity.y = 0.0f;
+            }
+        }
+
         if (t->position.y < KILL_HEIGHT) {
             t->position = t->previous = g->spawn;
             p->velocity = v3_make(0, 0, 0);
@@ -323,10 +333,12 @@ void game_init(game *g, cw_sim_role role) {
     cw_component_id players[] = {g->c_transform, g->c_player, g->c_input};
     cw_component_id ships[] = {g->c_transform, g->c_ship};
     cw_component_id parts[] = {g->c_transform, g->c_attachment};
+    cw_component_id planets[] = {g->c_transform, g->c_planet};
     g->q_solids = cw_query_create(w, cw_filter_all(cw_mask(solids, 2)));
     g->q_players = cw_query_create(w, cw_filter_all(cw_mask(players, 3)));
     g->q_ships = cw_query_create(w, cw_filter_all(cw_mask(ships, 2)));
     g->q_attachments = cw_query_create(w, cw_filter_all(cw_mask(parts, 2)));
+    g->q_planets = cw_query_create(w, cw_filter_all(cw_mask(planets, 2)));
     cw_component_id all_players[] = {g->c_transform, g->c_player};
     g->q_all_players = cw_query_create(w, cw_filter_all(cw_mask(all_players, 2)));
     cw_component_id loot[] = {g->c_transform, g->c_loot};
@@ -474,10 +486,32 @@ cw_entity_id game_find_ship(game *g, const char *name) {
     return CW_INVALID_ENTITY;
 }
 
+// The land under a point: the highest of the planets' surfaces there. Planets the
+// point is nowhere near cost a distance test.
+float game_ground_y(game *g, v3 position) {
+    cw_world *w = &g->world;
+    float best = -1e30f;
+    cw_query planets = cw_query_begin(g->q_planets);
+    cw_entity_id id;
+    while (cw_query_next(&planets, &id)) {
+        const Planet *planet = CW_GET(w, id, g->c_planet, Planet);
+        if (planet->land.radius <= 0.0f) continue;
+        v3 centre = CW_GET(w, id, g->c_transform, Transform)->position;
+        float reach = planet->land.radius + planet->land.relief;
+        v3 away = v3_sub(position, centre);
+        if (v3_dot(away, away) > (reach + 200.0f) * (reach + 200.0f)) continue;
+        float y = game_planet_surface_y(&planet->land, centre, position);
+        if (y > best) best = y;
+    }
+    return best;
+}
+
 int game_place_at(const game *g, v3 point) {
-    // Doors and exits stand inside zone places, so they are looked for first.
+    // Doors and exits stand inside zone places, so they are looked for first; a
+    // landmark is a name for a spot, not a way anywhere.
     for (int i = 0; i < g->place_count; ++i)
-        if (g->places[i].kind != PLACE_ZONE && inside_box(point, g->places[i].center, g->places[i].half)) return i;
+        if (g->places[i].kind != PLACE_ZONE && g->places[i].kind != PLACE_LANDMARK
+            && inside_box(point, g->places[i].center, g->places[i].half)) return i;
     for (int i = 0; i < g->place_count; ++i)
         if (g->places[i].kind == PLACE_ZONE && inside_box(point, g->places[i].center, g->places[i].half)) return i;
     return -1;

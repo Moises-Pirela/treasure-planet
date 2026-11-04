@@ -134,6 +134,14 @@ bool net_component_write(cw_writer *w, game *g, cw_entity_id id, int component) 
         const Planet *p = CW_GET(world, id, g->c_planet, Planet);
         if (!p) return false;
         write_name(w, p->name);
+        cw_writer_f32(w, p->land.radius);
+        cw_writer_f32(w, p->land.continents);
+        cw_writer_f32(w, p->land.relief);
+        cw_writer_f32(w, p->land.sea_level);
+        cw_writer_f32(w, p->land.mountains);
+        cw_writer_f32(w, p->land.shore);
+        cw_writer_f32(w, p->land.pad_radius);
+        cw_writer_u32(w, p->land.seed);
         return true;
     }
     case NET_C_EQUIPMENT: {
@@ -213,6 +221,14 @@ bool net_component_read(cw_reader *r, game *g, cw_entity_id id, int component) {
     case NET_C_PLANET: {
         Planet p = {};
         if (!read_name(r, p.name)) return false;
+        cw_reader_f32(r, &p.land.radius);
+        cw_reader_f32(r, &p.land.continents);
+        cw_reader_f32(r, &p.land.relief);
+        cw_reader_f32(r, &p.land.sea_level);
+        cw_reader_f32(r, &p.land.mountains);
+        cw_reader_f32(r, &p.land.shore);
+        cw_reader_f32(r, &p.land.pad_radius);
+        cw_reader_u32(r, &p.land.seed);
         return cw_reader_ok(r) && cw_comp_set(world, id, g->c_planet, &p, sizeof(p));
     }
     case NET_C_EQUIPMENT: {

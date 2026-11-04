@@ -75,7 +75,7 @@ int main(void) {
             if (!project(&view_proj, &list.items[i], &x, &y, &depth)) continue;
             ++in_front;
             CHECK(depth > 0.3f);                // nearer than the world (reversed depth: near is 1)
-            CHECK(list.items[i].color[3] == 0.0f);   // unlit
+            CHECK(list.items[i].flags == R_DRAW_UNLIT);   // drawn as is, over everything
             if (x < min_x) min_x = x;
             if (x > max_x) max_x = x;
             if (y < min_y) min_y = y;

@@ -5,6 +5,7 @@
 #include "../game/game.h"
 #include "../net/client.h"
 #include "../platform/platform.h"
+#include "../render/materials.h"
 #include "../render/renderer.h"
 #include "hud.h"
 #include <stdio.h>
@@ -12,8 +13,20 @@
 #include <string.h>
 
 #define MOUSE_RADIANS_PER_COUNT 0.0025f
+// A planet's landmass mesh comes in levels of detail, by how far the camera is
+// from its surface in radii: the finest up close, coarser ones further out, each
+// `beyond` its distance. Segments around; half as many from pole to pole.
+struct planet_lod { int segments; float beyond; };
+static const planet_lod PLANET_LODS[] = {{384, 0.0f}, {128, 2.5f}, {48, 6.0f}};
+#define PLANET_LOD_COUNT 3
+#define CLOUD_SEGMENTS 192           // the cloud layer's sphere up close; the game's sphere further out
+#define CLOUD_LOD_BEYOND 2.5f
+// A world casts and takes shadows only while the camera is this close above its
+// surface: its land and its clouds in every cascade are the dearest thing in the
+// shadow pass, and from further away no shadow on them can be seen.
+#define PLANET_SHADOW_ALTITUDE 220.0f
+#define MAX_PLANET_MESHES (8 * PLANET_LOD_COUNT)
 #define MAX_PITCH 1.5f
-#define STAR_COUNT 900
 
 struct options {
     r_backend_kind backend;
@@ -24,8 +37,12 @@ struct options {
     const char *region;          // "eu", "na"...: the shards to prefer
     const char *capture_path;    // render one scripted frame, write it and exit
     int capture_ticks;
+    const char *dungeon;         // alone: walk this dungeon instead of the universe
+    bool stats;                  // print the frame's and the GPU's times every second
+    float bench_seconds;         // hold still (--at, --look) this long without vsync, printing the stats, and exit
     bool has_position;
     v3 position;
+    v3 velocity;                 // --moving: the camera's velocity for a capture, for an atmosphere's entry
     float yaw, pitch;
 };
 
@@ -54,9 +71,19 @@ static bool parse_options(int argc, char **argv, options *o) {
             o->capture_path = argv[++i];
         } else if (!strcmp(arg, "--ticks") && more) {
             o->capture_ticks = atoi(argv[++i]);
+        } else if (!strcmp(arg, "--dungeon") && more) {
+            o->dungeon = argv[++i];
+        } else if (!strcmp(arg, "--stats")) {
+            o->stats = true;
+        } else if (!strcmp(arg, "--bench") && more) {
+            o->bench_seconds = (float)atof(argv[++i]);
+            o->stats = true;
         } else if (!strcmp(arg, "--at") && i + 3 < argc) {
             o->position = v3_make((float)atof(argv[i + 1]), (float)atof(argv[i + 2]), (float)atof(argv[i + 3]));
             o->has_position = true;
+            i += 3;
+        } else if (!strcmp(arg, "--moving") && i + 3 < argc) {
+            o->velocity = v3_make((float)atof(argv[i + 1]), (float)atof(argv[i + 2]), (float)atof(argv[i + 3]));
             i += 3;
         } else if (!strcmp(arg, "--look") && i + 2 < argc) {
             o->yaw = (float)atof(argv[i + 1]) * TP_PI / 180.0f;
@@ -69,36 +96,469 @@ static bool parse_options(int argc, char **argv, options *o) {
     return true;
 }
 
-// A shell of small triangles facing the middle, drawn around the camera.
-static r_mesh create_stars(renderer *r) {
-    r_vertex *vertices = (r_vertex *)calloc(STAR_COUNT * 3, sizeof(r_vertex));
-    uint32_t *indices = (uint32_t *)malloc(STAR_COUNT * 3 * sizeof(uint32_t));
-    uint32_t seed = 12345;     // the same sky on every machine and in every capture
-    for (uint32_t i = 0; i < STAR_COUNT; ++i) {
-        float angles[2];
-        for (int k = 0; k < 2; ++k) {
-            seed = seed * 1664525u + 1013904223u;
-            angles[k] = (float)(seed >> 8) / 16777216.0f;
-        }
-        float z = angles[0] * 2.0f - 1.0f, around = angles[1] * 2.0f * TP_PI, ring = sqrtf(1.0f - z * z);
-        v3 direction = v3_make(ring * cosf(around), z, ring * sinf(around));
-        v3 side = v3_normalize(v3_cross(direction, fabsf(z) < 0.9f ? v3_make(0, 1, 0) : v3_make(1, 0, 0)));
-        v3 up = v3_cross(side, direction);
-        const float distance = 5000.0f, size = 6.0f;
-        v3 center = v3_scale(direction, distance);
-        v3 corners[3] = {v3_add(center, v3_scale(up, size)), v3_add(center, v3_scale(side, -size)), v3_add(center, v3_scale(side, size))};
-        for (uint32_t c = 0; c < 3; ++c) {
-            vertices[i * 3 + c].position[0] = corners[c].x;
-            vertices[i * 3 + c].position[1] = corners[c].y;
-            vertices[i * 3 + c].position[2] = corners[c].z;
-            vertices[i * 3 + c].normal[1] = 1.0f;
-            indices[i * 3 + c] = i * 3 + c;
+// ---------------------------------------------------------------------------
+// The look: how each kind of world is lit, as data. Space has one hard sun and no
+// air to soften it, so the shadows are black but for the starlight; a dungeon is
+// lit by a low sun and whatever glows in it.
+// ---------------------------------------------------------------------------
+static r_sky_layer sky_stars(uint32_t seed, float density, float brightness, float size) {
+    r_sky_layer l = {};
+    l.kind = R_SKY_STARS;
+    l.seed = seed;
+    l.density = density;
+    l.brightness = brightness;
+    l.size = size;
+    return l;
+}
+static r_sky_layer sky_nebula(uint32_t seed, v3 direction, float size, v3 color, v3 color2, float brightness, float density, float detail) {
+    r_sky_layer l = {};
+    l.kind = R_SKY_NEBULA;
+    l.seed = seed;
+    l.direction = direction;
+    l.axis = v3_make(0, 1, 0);
+    l.size = size;
+    l.color = color;
+    l.color2 = color2;
+    l.brightness = brightness;
+    l.density = density;
+    l.detail = detail;
+    l.drift = 0.002f;
+    return l;
+}
+static r_sky_layer sky_body(uint32_t seed, v3 direction, float size, v3 color, v3 color2, float detail, float brightness) {
+    r_sky_layer l = {};
+    l.kind = R_SKY_BODY;
+    l.seed = seed;
+    l.direction = direction;
+    l.axis = v3_make(0, 1, 0);
+    l.size = size;
+    l.color = color;
+    l.color2 = color2;
+    l.detail = detail;
+    l.brightness = brightness;
+    l.drift = 0.01f;
+    return l;
+}
+
+// The sky over space: two nebulae (one about a point, one a faint wash over
+// everything), fine stars and a few bright ones, a ringed giant low on one side,
+// a moon high on the other, and a red dwarf with its glow; all in the order they
+// are drawn, so the bodies stand in front of the rest.
+static void space_sky(r_sky *sky) {
+    uint32_t n = 0;
+    sky->layers[n++] = sky_nebula(7, v3_normalize(v3_make(-0.4f, 0.25f, -0.85f)), 1.2f, v3_make(0.28f, 0.08f, 0.42f), v3_make(0.05f, 0.3f, 0.36f), 1.2f, 0.6f, 2.5f);
+    sky->layers[n++] = sky_nebula(21, v3_make(0, 0, 0), 0.0f, v3_make(0.07f, 0.04f, 0.12f), v3_make(0.02f, 0.06f, 0.1f), 0.8f, 0.5f, 1.6f);
+    sky->layers[n++] = sky_stars(12345, 0.25f, 0.5f, 0.7f);
+    sky->layers[n++] = sky_stars(777, 0.04f, 1.6f, 1.3f);
+    r_sky_layer giant = sky_body(3, v3_normalize(v3_make(0.7f, 0.3f, -0.7f)), 0.09f, v3_make(0.85f, 0.6f, 0.35f), v3_make(0.55f, 0.35f, 0.25f), 4.0f, 0.0f);
+    giant.axis = v3_normalize(v3_make(0.5f, 0.75f, -0.45f));
+    giant.ring_inner = 1.5f;
+    giant.ring_outer = 2.3f;
+    sky->layers[n++] = giant;
+    sky->layers[n++] = sky_body(4, v3_normalize(v3_make(-0.5f, 0.55f, 0.4f)), 0.035f, v3_make(0.7f, 0.7f, 0.75f), v3_make(0.45f, 0.45f, 0.5f), 6.0f, 0.0f);
+    sky->layers[n++] = sky_body(5, v3_normalize(v3_make(-0.8f, -0.1f, -0.5f)), 0.012f, v3_make(1.0f, 0.45f, 0.25f), v3_make(1.0f, 0.45f, 0.25f), 0.0f, 3.0f);
+    sky->layer_count = n;
+}
+
+static r_environment environment_of(const game *g) {
+    r_environment e = {};
+    if (g->dungeon[0]) {
+        e.sun.direction = v3_normalize(v3_make(0.55f, 0.32f, 0.25f));
+        e.sun.color = v3_make(1.0f, 0.55f, 0.3f);
+        e.sun.shadow_distance = 120.0f;
+        e.sun.shadow_resolution = 2048;
+        e.sky.zenith = v3_make(0.008f, 0.008f, 0.025f);
+        e.sky.horizon = v3_make(0.25f, 0.09f, 0.05f);
+        e.sky.ground = v3_make(0.01f, 0.006f, 0.004f);
+        e.sky.sun_disc = 0.03f;
+        e.sky.sun_glow = 0.8f;
+        e.sky.layers[0] = sky_stars(12345, 0.08f, 0.8f, 1.0f);
+        e.sky.layer_count = 1;
+        // The damp: a warm dark haze along the floor, thinning upwards, glowing
+        // towards the low sun.
+        e.haze.color = v3_make(0.12f, 0.06f, 0.05f);
+        e.haze.density = 0.012f;
+        e.haze.base = 1.0f;
+        e.haze.falloff = 0.12f;
+        e.haze.start = 2.0f;
+        e.haze.sky_distance = 150.0f;
+        e.haze.sun_color = v3_make(0.5f, 0.2f, 0.08f);
+        e.haze.sun_power = 6.0f;
+        e.ambient_sky = v3_make(0.11f, 0.08f, 0.10f);
+        e.ambient_ground = v3_make(0.05f, 0.035f, 0.035f);
+        e.shading.ramp_softness = 0.3f;
+        e.shading.ramp_wrap = 0.1f;
+        e.shading.ramp_flatness = 0.6f;
+        e.shading.shadow_tint = v3_make(0.8f, 0.6f, 0.75f);
+        e.shading.rim = v3_make(0.8f, 0.3f, 0.12f);
+        e.shading.rim_strength = 0.4f;
+        e.shading.rim_power = 3.0f;
+    } else {
+        e.sun.direction = v3_normalize(v3_make(0.5f, 0.8f, 0.35f));
+        e.sun.color = v3_make(1.05f, 0.98f, 0.88f);
+        e.sun.shadow_distance = 160.0f;
+        e.sun.shadow_resolution = 2048;
+        e.sky.zenith = v3_make(0.008f, 0.008f, 0.03f);
+        e.sky.horizon = v3_make(0.07f, 0.04f, 0.13f);
+        e.sky.ground = v3_make(0.008f, 0.008f, 0.03f);    // space has no floor: the zenith again
+        e.sky.sun_disc = 0.02f;
+        e.sky.sun_glow = 0.35f;
+        space_sky(&e.sky);
+        // The dust: a faint cold veil that gives the piers their distance.
+        e.haze.color = v3_make(0.04f, 0.05f, 0.09f);
+        e.haze.density = 0.0008f;
+        e.haze.sky_distance = 100.0f;
+        e.ambient_sky = v3_make(0.10f, 0.11f, 0.17f);
+        e.ambient_ground = v3_make(0.05f, 0.035f, 0.05f);
+        e.shading.ramp_softness = 0.25f;
+        e.shading.ramp_wrap = 0.1f;
+        e.shading.ramp_flatness = 0.5f;
+        e.shading.shadow_tint = v3_make(0.7f, 0.72f, 1.0f);
+        e.shading.rim = v3_make(0.45f, 0.35f, 0.8f);
+        e.shading.rim_strength = 0.6f;
+        e.shading.rim_power = 3.0f;
+    }
+    return e;
+}
+
+// What the picture goes through after lighting, as data too. Space is crisp and
+// cold with a hard sun to bloom; a dungeon is warmer, softer and darker at the
+// edges, with its lamps glowing.
+static r_post post_of(const game *g) {
+    r_post p = {};
+    p.tonemap.curve = R_TONEMAP_ACES;
+    p.tonemap.exposure = g->dungeon[0] ? 0.6f : 0.52f;
+    // The drawn line: ink along every silhouette and crease, fading off with distance.
+    p.outline.strength = g->dungeon[0] ? 0.7f : 0.6f;
+    p.outline.width = 1.0f;
+    p.outline.depth_threshold = 0.03f;
+    p.outline.normal_threshold = 0.25f;
+    p.outline.color = v3_make(0.02f, 0.01f, 0.03f);
+    p.outline.fade_distance = 250.0f;
+    p.bloom.threshold = 1.0f;
+    p.bloom.knee = 0.5f;
+    p.bloom.scatter = 0.7f;
+    p.bloom.radius = 1.0f;
+    p.flare.threshold = 4.0f;
+    p.flare.ghosts = 4;
+    p.flare.dispersal = 0.3f;
+    p.flare.falloff = 6.0f;
+    p.flare.halo_width = 0.45f;
+    p.flare.halo_intensity = 0.5f;
+    p.flare.chromatic = 0.004f;
+    p.flare.source_mip = 2;
+    p.entry.blur = 0.06f;
+    p.entry.samples = 8;
+    p.entry.streaks = 22.0f;
+    p.entry.streak_length = 1.5f;
+    p.entry.streak_speed = 1.5f;
+    p.entry.glow = 0.8f;
+    p.antialiasing.mode = R_AA_FXAA;
+    p.antialiasing.edge_threshold_min = 0.0312f;
+    p.antialiasing.edge_threshold = 0.125f;
+    p.antialiasing.subpixel = 0.75f;
+    p.antialiasing.iterations = 12;
+    if (g->dungeon[0]) {
+        p.grading.temperature = 0.25f;
+        p.grading.contrast = 0.1f;
+        p.grading.saturation = 0.1f;
+        p.grading.lift = v3_make(0.01f, 0.005f, 0.0f);
+        p.grading.vignette = 0.5f;
+        p.grading.vignette_radius = 0.45f;
+        p.grading.vignette_softness = 0.6f;
+        p.bloom.intensity = 0.12f;
+        p.bloom.threshold = 0.8f;
+        p.flare.intensity = 0.1f;
+        p.aberration.strength = 0.006f;
+    } else {
+        p.grading.temperature = -0.1f;
+        p.grading.contrast = 0.05f;
+        p.grading.saturation = 0.15f;
+        p.grading.vignette = 0.3f;
+        p.grading.vignette_radius = 0.6f;
+        p.grading.vignette_softness = 0.5f;
+        p.bloom.intensity = 0.08f;
+        p.bloom.threshold = 1.4f;    // the sun and the lamps, not the stars
+        p.flare.intensity = 0.15f;
+        p.aberration.strength = 0.004f;
+    }
+    return p;
+}
+
+// How each planet is made, by name, as data: the tones for its sea, land and
+// peaks (its land itself is the simulation's, in the Planet component, so that
+// both agree), or its bands when it is a gas giant; its clouds, the glow of its atmosphere, what shines
+// on its night side, the tint along its terminator; and its air, as met on the way
+// down: how high it reaches, the sky from inside, the haze and its cloud deck. A
+// planet not listed is made from its colour. (An air's centre and radius are the
+// planet's, filled in per planet, as are its cloud layer's cover and seed, which
+// are the land's. The plasma entry is off, its speed 0: ships here come down
+// slowly, and the air and the land do the arriving.)
+struct planet_look {
+    const char *name;
+    r_planet_params surface;     // its land's numbers are the game's, filled in per planet
+    r_atmosphere air;
+    float entry_shake;           // metres the camera shakes at the entry's full strength
+};
+static const planet_look PLANET_LOOKS[] = {
+    {"Verdant",
+     {{0.06f, 0.2f, 0.3f}, {0.22f, 0.5f, 0.2f}, {0.85f, 0.85f, 0.8f}, 0.0f, 0.0f, 3.0f, 2.5f,
+      {0.9f, 0.93f, 0.95f}, 0.45f, {0.3f, 0.85f, 0.7f}, 1.2f, 3.0f, {0.9f, 0.75f, 0.35f}, 0.12f, {1.0f, 0.6f, 0.4f}, 0.15f,
+      0, 0, 0, 0, 0.92f, 0, 0, 0},
+     {{0, 0, 0}, 0.0f, 520.0f, 1.6f, {0.2f, 0.42f, 0.75f}, {0.55f, 0.7f, 0.8f}, {0.45f, 0.6f, 0.7f}, 0.0015f, 0.9f, 0.6f,
+      45.0f, 24.0f, 0.03f, {0.85f, 0.88f, 0.9f}, 0.0f, 7.0f, 4.0f, 0.55f, 0.004f, 0, 0.0f, {1.0f, 0.55f, 0.2f}}, 0.0f},
+    {"Ember",
+     {{1.0f, 0.3f, 0.05f}, {0.16f, 0.09f, 0.07f}, {0.4f, 0.35f, 0.33f}, 0.0f, 0.0f, 4.0f, 3.0f,
+      {0.3f, 0.2f, 0.17f}, 0.25f, {1.0f, 0.45f, 0.15f}, 1.0f, 4.0f, {1.2f, 0.35f, 0.05f}, 0.5f, {1.0f, 0.5f, 0.3f}, 0.2f,
+      0, 0, 0, 0, 0.85f, 0, 0, 0},
+     {{0, 0, 0}, 0.0f, 640.0f, 1.6f, {0.3f, 0.1f, 0.05f}, {0.8f, 0.35f, 0.12f}, {0.6f, 0.25f, 0.1f}, 0.002f, 0.8f, 1.0f,
+      70.0f, 36.0f, 0.02f, {0.35f, 0.2f, 0.15f}, 0.0f, 6.0f, 3.0f, 0.4f, 0.006f, 0, 0.0f, {1.0f, 0.4f, 0.1f}}, 0.0f},
+    {"Azure",
+     {{0.05f, 0.15f, 0.5f}, {0.45f, 0.62f, 0.8f}, {0.95f, 0.97f, 1.0f}, 0.0f, 0.0f, 2.5f, 2.0f,
+      {0.85f, 0.9f, 1.0f}, 0.2f, {0.4f, 0.6f, 1.0f}, 1.5f, 3.0f, {0.2f, 0.4f, 0.9f}, 0.1f, {0.8f, 0.7f, 1.0f}, 0.15f,
+      0, 0, 0, 0, 0.55f, 0, 0, 0},
+     {{0, 0, 0}, 0.0f, 580.0f, 1.6f, {0.18f, 0.32f, 0.8f}, {0.6f, 0.7f, 0.95f}, {0.45f, 0.55f, 0.85f}, 0.0015f, 0.95f, 0.5f,
+      55.0f, 28.0f, 0.03f, {0.9f, 0.93f, 1.0f}, 0.0f, 8.0f, 3.0f, 0.6f, 0.01f, 0, 0.0f, {0.6f, 0.7f, 1.0f}}, 0.0f},
+};
+
+static const planet_look *planet_look_of(const Planet *planet) {
+    for (size_t i = 0; i < sizeof(PLANET_LOOKS) / sizeof(PLANET_LOOKS[0]); ++i)
+        if (!strcmp(PLANET_LOOKS[i].name, planet->name)) return &PLANET_LOOKS[i];
+    return NULL;
+}
+
+// The look's colours with the game's land: the height field the simulation stands
+// players on is the one the client shaped the planet's mesh by, to the same
+// numbers and the same seed, so what is walked on is what is seen.
+static r_planet_params planet_surface(const Planet *planet, v3 color) {
+    const planet_look *look = planet_look_of(planet);
+    r_planet_params p = {};
+    if (look) {
+        p = look->surface;
+    } else {
+        p.base = v3_scale(color, 0.5f);
+        p.second = color;
+        p.third = v3_add(color, v3_make(0.3f, 0.3f, 0.3f));
+        p.detail = 3.0f;
+        p.contrast = 2.0f;
+        p.snow_line = 0.8f;
+        p.atmosphere = color;
+        p.atmosphere_strength = 1.0f;
+        p.atmosphere_power = 3.0f;
+        p.terminator_tint = v3_make(1.0f, 1.0f, 1.0f);
+    }
+    p.continents = planet->land.continents;
+    p.relief = planet->land.relief;
+    p.sea_level = planet->land.sea_level;
+    p.mountains = planet->land.mountains;
+    p.shore = planet->land.shore;
+    p.pad_radius = planet->land.pad_radius;
+    p.seed = planet->land.seed;
+    return p;
+}
+
+// A planet's landmass, as a mesh: the sphere displaced by the very height field
+// the simulation stands players on (game_planet_height), with the normals taken
+// from the heights a step either way, so the land that is drawn is the land that
+// is walked on.
+struct planet_meshes {
+    struct { uint32_t seed; int level; r_mesh mesh; } items[MAX_PLANET_MESHES];
+    uint32_t count;
+};
+
+static int planet_lod_for(float distance_in_radii) {
+    int level = 0;
+    for (int i = 1; i < PLANET_LOD_COUNT; ++i)
+        if (distance_in_radii >= PLANET_LODS[i].beyond) level = i;
+    return level;
+}
+
+static v3 planet_direction(float polar, float around) {
+    return v3_make(sinf(polar) * sinf(around), cosf(polar), sinf(polar) * cosf(around));
+}
+
+static r_mesh planet_mesh_make(renderer *r, const PlanetLand *land, int level) {
+    const int segments = PLANET_LODS[level].segments, rings = segments / 2;
+    const int stride = segments + 1;
+    uint32_t vertex_count = (uint32_t)(stride * (rings + 1));
+    uint32_t index_count = (uint32_t)(segments * rings * 6);
+    r_vertex *vertices = (r_vertex *)malloc(vertex_count * sizeof(r_vertex));
+    uint32_t *indices = (uint32_t *)malloc(index_count * sizeof(uint32_t));
+    // The field once per vertex, into the grid; the normals then come from the
+    // neighbours in it, so the land costs one evaluation a vertex and no more.
+    v3 *points = (v3 *)malloc(vertex_count * sizeof(v3));
+    for (int ring = 0; ring <= rings; ++ring) {
+        float polar = TP_PI * (float)ring / (float)rings;
+        for (int segment = 0; segment <= segments; ++segment) {
+            v3 dir = planet_direction(polar, 2.0f * TP_PI * (float)segment / (float)segments);
+            points[ring * stride + segment] = v3_scale(dir, land->radius + game_planet_height(land, dir));
         }
     }
-    r_mesh mesh = renderer_mesh_create(r, vertices, STAR_COUNT * 3, indices, STAR_COUNT * 3);
+    r_vertex *v = vertices;
+    for (int ring = 0; ring <= rings; ++ring) {
+        for (int segment = 0; segment <= segments; ++segment) {
+            v3 here = points[ring * stride + segment];
+            v3 along = points[(ring < rings ? ring + 1 : ring - 1) * stride + segment];
+            v3 across = points[ring * stride + (segment < segments ? segment + 1 : segment - 1)];
+            if (ring == rings) along = v3_sub(v3_scale(here, 2.0f), along);      // at the poles, the other way about
+            if (segment == segments) across = v3_sub(v3_scale(here, 2.0f), across);
+            v3 dir = v3_normalize(here);
+            v3 normal = v3_normalize(v3_cross(v3_sub(along, here), v3_sub(across, here)));
+            if (v3_dot(normal, dir) < 0.0f) normal = v3_scale(normal, -1.0f);
+            if (v3_dot(normal, normal) < 0.5f) normal = dir;                     // a degenerate corner: the sphere's own
+            v3 position = v3_scale(here, 1.0f / land->radius);                   // a unit sphere: the draw scales it
+            v->position[0] = position.x;
+            v->position[1] = position.y;
+            v->position[2] = position.z;
+            v->normal[0] = normal.x;
+            v->normal[1] = normal.y;
+            v->normal[2] = normal.z;
+            ++v;
+        }
+    }
+    free(points);
+    uint32_t *out = indices;
+    for (uint32_t ring = 0; ring < (uint32_t)rings; ++ring)
+        for (uint32_t segment = 0; segment < (uint32_t)segments; ++segment) {
+            uint32_t top = ring * (uint32_t)stride + segment, bottom = top + (uint32_t)stride;
+            *out++ = top;     *out++ = bottom;      *out++ = bottom + 1;
+            *out++ = top;     *out++ = bottom + 1;  *out++ = top + 1;
+        }
+    r_mesh mesh = renderer_mesh_create(r, vertices, vertex_count, indices, index_count);
     free(vertices);
     free(indices);
     return mesh;
+}
+
+// Every level at once, the first time a planet is seen: that is while the world
+// loads, whereas the finest level would otherwise be made in the middle of the
+// flight down, a dropped frame just as the land comes up.
+static r_mesh planet_mesh_of(renderer *r, planet_meshes *cache, const PlanetLand *land, int level) {
+    for (uint32_t i = 0; i < cache->count; ++i)
+        if (cache->items[i].seed == land->seed && cache->items[i].level == level) return cache->items[i].mesh;
+    if (cache->count + PLANET_LOD_COUNT > MAX_PLANET_MESHES) return 0;
+    r_mesh wanted = 0;
+    for (int made = 0; made < PLANET_LOD_COUNT; ++made) {
+        r_mesh mesh = planet_mesh_make(r, land, made);
+        cache->items[cache->count].seed = land->seed;
+        cache->items[cache->count].level = made;
+        cache->items[cache->count].mesh = mesh;
+        ++cache->count;
+        if (made == level) wanted = mesh;
+    }
+    return wanted;
+}
+
+// The cloud layer's parameters: the planet's clouds, as a layer of their own, in
+// the air's colour and pattern.
+static r_cloud_params cloud_layer(const r_atmosphere *air) {
+    r_cloud_params c = {};
+    c.color = air->cloud_color;
+    c.cover = air->cloud_cover;
+    c.detail = air->cloud_detail;
+    c.sharpness = air->cloud_sharpness;
+    c.drift = air->cloud_drift;
+    c.translucency = air->cloud_translucency;
+    c.seed = air->cloud_seed;
+    return c;
+}
+
+// A planet's air about it, from its look, or made from its colour.
+static r_atmosphere planet_air(const Planet *planet, v3 centre, float radius, v3 color) {
+    const planet_look *look = planet_look_of(planet);
+    r_atmosphere a;
+    if (look) {
+        a = look->air;
+    } else {
+        memset(&a, 0, sizeof(a));
+        a.height = radius * 1.2f;
+        a.zenith = v3_scale(color, 0.4f);
+        a.horizon = v3_scale(color, 0.8f);
+        a.haze = v3_scale(color, 0.7f);
+        a.density = 1.0f / radius;
+        a.star_fade = 0.8f;
+        a.sun_glow = 0.5f;
+        a.cloud_detail = 7.0f;
+        a.cloud_sharpness = 4.0f;
+        a.cloud_translucency = 0.5f;
+        a.cloud_drift = 0.005f;
+        a.entry_glow = color;
+    }
+    a.centre = centre;
+    a.radius = radius;
+    // The cloud layer is the planet's clouds, from the same seed as its land.
+    a.cloud_cover = look ? look->surface.cloud_cover : 0.4f;
+    a.cloud_seed = planet->land.seed;
+    return a;
+}
+
+// The frame's tables: the materials (index 0 is the plain surface, the rest are
+// added as the draws need them) and the atmospheres, one per planet in the world;
+// and the material shaders, looked up once.
+#define MAX_ATMOSPHERES 16
+struct frame_tables {
+    r_shader surface_shader, planet_shader, cloud_shader;
+    r_material materials[R_MAX_MATERIALS];
+    uint32_t material_count;
+    r_atmosphere atmospheres[MAX_ATMOSPHERES];
+    float shakes[MAX_ATMOSPHERES];   // each atmosphere's entry shake, metres
+    uint32_t atmosphere_count;
+    planet_meshes planets;
+};
+
+static uint32_t material_push(frame_tables *tables, const r_material *m) {
+    if (tables->material_count == 0) tables->material_count = 1;
+    if (tables->material_count == R_MAX_MATERIALS) return 0;
+    tables->materials[tables->material_count] = *m;
+    return tables->material_count++;
+}
+
+static void atmosphere_push(frame_tables *tables, const r_atmosphere *a, float shake) {
+    if (tables->atmosphere_count == MAX_ATMOSPHERES) return;
+    tables->shakes[tables->atmosphere_count] = shake;
+    tables->atmospheres[tables->atmosphere_count++] = *a;
+}
+
+// The point lights, derived from what is in the world rather than stored in it:
+// loot glows in its rarity's colour, a dungeon's exit slab and the lantern over a
+// dungeon door are lit, and every ship carries a lantern.
+#define MAX_LIGHTS 128
+struct light_list {
+    r_point_light items[MAX_LIGHTS];
+    uint32_t count;
+};
+
+static void light_push(light_list *lights, v3 at, float radius, v3 color) {
+    if (lights->count == MAX_LIGHTS) return;
+    r_point_light *l = &lights->items[lights->count++];
+    l->position = at;
+    l->radius = radius;
+    l->color = color;
+}
+
+static void collect_lights(game *g, float alpha, const net_client *net, light_list *lights) {
+    cw_world *w = &g->world;
+    lights->count = 0;
+    for (int i = 0; i < g->place_count; ++i) {
+        const game_place *place = &g->places[i];
+        if (place->kind == PLACE_ENTRANCE) light_push(lights, v3_add(place->center, v3_make(0, 1.6f, 0)), 12.0f, v3_make(4.0f, 3.0f, 1.8f));
+        if (place->kind == PLACE_EXIT) light_push(lights, place->center, 12.0f, v3_make(5.0f, 4.5f, 2.5f));
+        if (place->kind == PLACE_LANDMARK) light_push(lights, place->center, 60.0f, v3_make(14.0f, 9.0f, 4.0f));   // the monument's beacon
+    }
+    cw_query ships = cw_query_begin(g->q_ships);
+    cw_entity_id id;
+    while (cw_query_next(&ships, &id)) {
+        const Transform *t = CW_GET(w, id, g->c_transform, Transform);
+        light_push(lights, v3_add(v3_lerp(t->previous, t->position, alpha), v3_make(0, 2.5f, 0)), 14.0f, v3_make(4.0f, 3.2f, 2.0f));
+    }
+    cw_query loot = cw_query_begin(g->q_loot);
+    while (cw_query_next(&loot, &id)) {
+        if (net && !net_client_entity_visible(net, id)) continue;
+        const Transform *t = CW_GET(w, id, g->c_transform, Transform);
+        float rgb[3];
+        item_rarity_color(CW_GET(w, id, g->c_loot, Loot)->it.rarity, rgb);
+        light_push(lights, v3_add(t->position, v3_make(0, 0.5f, 0)), 5.0f, v3_scale(v3_make(rgb[0], rgb[1], rgb[2]), 3.0f));
+    }
 }
 
 // The title bar: where the player stands relative to the ships, after `prefix`.
@@ -168,15 +628,87 @@ static bool write_bmp(const char *path, const uint8_t *rgba, int width, int heig
     return true;
 }
 
+// With --stats, once a second, averaged over the second: the frame (with the worst
+// one), the CPU's time ticking the world and building the frame's draws, and the
+// GPU's time per pass.
+struct stats_log {
+    bool on;
+    double started, previous;
+    double tick_seconds, build_seconds, worst, worst_tick, worst_build;
+    r_timings sum;
+    int frames, timed_frames;
+};
+
+static double frame_build_seconds;    // draw_world's time up to the submit, for the log
+
+static void stats_frame(stats_log *log, renderer *r, double now, double tick_seconds) {
+    if (!log->on) return;
+    if (log->previous == 0.0) {
+        log->started = log->previous = now;
+        return;
+    }
+    double frame = now - log->previous;
+    log->previous = now;
+    if (frame > log->worst) log->worst = frame;
+    if (tick_seconds > log->worst_tick) log->worst_tick = tick_seconds;
+    if (frame_build_seconds > log->worst_build) log->worst_build = frame_build_seconds;
+    log->tick_seconds += tick_seconds;
+    log->build_seconds += frame_build_seconds;
+    ++log->frames;
+    r_timings t = renderer_timings(r);
+    if (t.valid) {
+        for (int p = 0; p < R_PASS_COUNT; ++p) log->sum.ms[p] += t.ms[p];
+        log->sum.total_ms += t.total_ms;
+        ++log->timed_frames;
+    }
+    if (now - log->started < 1.0) return;
+    double per_frame = 1000.0 / log->frames;
+    float per_timed = log->timed_frames ? 1.0f / (float)log->timed_frames : 0.0f;
+    char line[512];
+    int n = snprintf(line, sizeof(line), "frame %.2f ms (worst %.2f), tick %.2f (worst %.2f), build %.2f (worst %.2f), gpu %.2f:",
+                     (now - log->started) * per_frame, log->worst * 1000.0, log->tick_seconds * per_frame, log->worst_tick * 1000.0,
+                     log->build_seconds * per_frame, log->worst_build * 1000.0, log->sum.total_ms * per_timed);
+    for (int p = 0; p < R_PASS_COUNT; ++p)
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " %s %.2f", r_pass_name(p), log->sum.ms[p] * per_timed);
+    fputs(line, stderr);
+    fputc('\n', stderr);
+    double previous = log->previous;
+    bool on = log->on;
+    memset(log, 0, sizeof(*log));
+    log->on = on;
+    log->started = log->previous = previous;
+}
+
 // Where a player's eyes are, from their feet.
 static v3 eye_of(v3 feet) { return v3_add(feet, v3_make(0, PLAYER_EYE, 0)); }
+
+// The camera shakes with an atmosphere's entry: by its strength, the look's
+// amount, hashed from the time so it never repeats.
+static v3 entry_shake(const frame_tables *tables, v3 eye, v3 velocity, double time) {
+    float strength = 0.0f, amount = 0.0f;
+    for (uint32_t i = 0; i < tables->atmosphere_count; ++i) {
+        float e = r_atmosphere_entry(&tables->atmospheres[i], eye, velocity);
+        if (e > strength) {
+            strength = e;
+            amount = tables->shakes[i];
+        }
+    }
+    if (strength <= 0.0f) return v3_make(0, 0, 0);
+    uint32_t t = (uint32_t)(time * 47.0);
+    float x = (float)((t * 1664525u + 1013904223u) >> 8) / 16777216.0f - 0.5f;
+    float y = (float)(((t + 7u) * 1664525u + 1013904223u) >> 8) / 16777216.0f - 0.5f;
+    return v3_scale(v3_make(x, y, 0), strength * amount * 2.0f);
+}
 
 // Draws the world from `player`'s eyes (or from the spawn while there is no player
 // yet). Other players are their capsule plus a small block at the eyes, pointing
 // where they look. `net`, when set, hides replicas the server stopped updating.
+// `velocity` is the camera's, for an atmosphere's entry.
 static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id player, float yaw, float pitch,
-                       float alpha, const r_mesh *meshes, r_mesh stars, draw_list *list, const net_client *net,
-                       const party_view *party, const char *my_name, uint8_t **capture) {
+                       float alpha, double time, v3 velocity, const r_mesh *meshes, r_mesh cloud_mesh, draw_list *list,
+                       light_list *lights, frame_tables *tables, const net_client *net, const party_view *party,
+                       const char *my_name, uint8_t **capture) {
+    double build_start = plat_seconds();
     cw_world *w = &g->world;
     int width, height;
     plat_window_size(window, &width, &height);
@@ -187,33 +719,30 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
         const Transform *pt = CW_GET(w, player, g->c_transform, Transform);
         eye = eye_of(v3_lerp(pt->previous, pt->position, alpha));
         if (net) eye = v3_add(eye, net_client_view_offset(net));   // a fading misprediction
+        if (velocity.x == 0.0f && velocity.y == 0.0f && velocity.z == 0.0f)
+            velocity = v3_scale(v3_sub(pt->position, pt->previous), (float)GAME_TICK_HZ);
     }
-    m4 view = m4_look_to(eye, look_direction(yaw, pitch));
-    m4 projection = m4_perspective(70.0f * TP_PI / 180.0f, (float)width / (float)height, 0.1f);
+    eye = v3_add(eye, entry_shake(tables, eye, velocity, time));   // last frame's atmospheres: a frame late is fine
 
     r_frame frame = {};
-    frame.uniforms.view_proj = m4_mul(projection, view);
-    v3 sun = v3_normalize(v3_make(0.5f, 0.8f, 0.35f));
-    frame.uniforms.sun_dir[0] = sun.x;
-    frame.uniforms.sun_dir[1] = sun.y;
-    frame.uniforms.sun_dir[2] = sun.z;
-    frame.uniforms.sun_color[0] = 1.0f;
-    frame.uniforms.sun_color[1] = 0.96f;
-    frame.uniforms.sun_color[2] = 0.88f;
-    frame.uniforms.ambient[0] = 0.13f;
-    frame.uniforms.ambient[1] = 0.15f;
-    frame.uniforms.ambient[2] = 0.2f;
-    frame.clear[0] = 0.015f;
-    frame.clear[1] = 0.02f;
-    frame.clear[2] = 0.05f;
+    frame.time = (float)time;
+    frame.camera.position = eye;
+    frame.camera.forward = look_direction(yaw, pitch);
+    frame.camera.velocity = velocity;
+    frame.camera.fov_y = HUD_FOV;
+    frame.camera.near_plane = 0.1f;
+    frame.environment = environment_of(g);
+    frame.post = post_of(g);
+    collect_lights(g, alpha, net, lights);
+    frame.lights = lights->items;
+    frame.light_count = lights->count;
+    // Material 0: the plain surface, with the metre checker.
+    r_surface_params plain = {0.08f};
+    tables->materials[0] = r_material_surface(tables->surface_shader, &plain);
+    tables->material_count = 1;
+    tables->atmosphere_count = 0;
 
     list->count = 0;
-    r_draw *sky = draw_push(list);
-    sky->mesh = stars;
-    sky->model = m4_translate_scale(eye, v3_make(1, 1, 1));
-    sky->color[0] = sky->color[1] = sky->color[2] = 0.9f;
-    sky->color[3] = 0.0f;
-
     cw_component_id drawn[] = {g->c_transform, g->c_visual};
     cw_query visuals = cw_query_iter(w, cw_mask(drawn, 2));
     cw_entity_id id;
@@ -230,6 +759,40 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
         draw->color[1] = visual->color.y;
         draw->color[2] = visual->color.z;
         draw->color[3] = 1.0f;
+        draw->flags = 0;
+        if (cw_comp_has(w, id, g->c_planet)) {
+            const Planet *planet = CW_GET(w, id, g->c_planet, Planet);
+            const planet_look *look = planet_look_of(planet);
+            r_atmosphere air = planet_air(planet, at, visual->half.x, visual->color);
+            atmosphere_push(tables, &air, look ? look->entry_shake : 0.0f);
+            float altitude = v3_length(v3_sub(eye, at)) - visual->half.x;
+            float radii = altitude / visual->half.x;
+            uint32_t shadows = altitude < PLANET_SHADOW_ALTITUDE ? 0 : R_DRAW_NO_SHADOW | R_DRAW_UNSHADOWED;
+            draw->flags |= shadows;
+            r_planet_params surface = planet_surface(planet, visual->color);
+            bool layer = air.cloud_altitude > 0.0f && air.cloud_cover > 0.0f;
+            if (layer) {
+                // The clouds are a layer of their own above the land, not painted on
+                // it. It casts no shadow of its own: the lit pass shadows by the
+                // layer's shape, which is far cheaper than the layer in every cascade.
+                r_cloud_params clouds = cloud_layer(&air);
+                surface.cloud_cover = 0.0f;
+                r_material cloud_material = r_material_clouds(tables->cloud_shader, &clouds);
+                r_draw *deck = draw_push(list);
+                deck->mesh = radii < CLOUD_LOD_BEYOND ? cloud_mesh : meshes[MESH_SPHERE];
+                float reach = visual->half.x + air.cloud_altitude;
+                deck->model = m4_translate_scale(at, v3_make(reach, reach, reach));
+                deck->color[0] = deck->color[1] = deck->color[2] = deck->color[3] = 1.0f;
+                deck->flags = R_DRAW_TWO_SIDED | R_DRAW_NO_SHADOW | shadows;
+                deck->material = material_push(tables, &cloud_material);
+            }
+            r_material planet_material = r_material_planet(tables->planet_shader, &surface);
+            draw->material = material_push(tables, &planet_material);
+            if (planet->land.relief > 0.0f) {
+                r_mesh land = planet_mesh_of(r, &tables->planets, &planet->land, planet_lod_for(radii));
+                if (land) draw->mesh = land;
+            }
+        }
         if (net && cw_comp_has(w, id, net->c_replica) && CW_GET(w, id, net->c_replica, Replica)->flash > 0.0f) {
             // Just tagged: a white flash that fades.
             float f = CW_GET(w, id, net->c_replica, Replica)->flash / NET_HIT_FLASH;
@@ -245,6 +808,7 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
             face->model = m4_translate_scale(nose, v3_make(0.08f, 0.08f, 0.08f));
             face->color[0] = face->color[1] = face->color[2] = 0.1f;
             face->color[3] = 1.0f;
+            face->flags = 0;
         }
     }
     if (party) {
@@ -257,11 +821,16 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
         if (net && net_client_loot_in_view(net, 6.0f, &looked_at)) hud_loot(list, &hud, &looked_at);
     }
     frame.draws = list->items;
-    frame.draw_count = list->count;
+    frame.draw_count = (uint32_t)list->count;
+    frame.materials = tables->materials;
+    frame.material_count = tables->material_count;
+    frame.atmospheres = tables->atmospheres;
+    frame.atmosphere_count = tables->atmosphere_count;
     if (capture) {
         *capture = (uint8_t *)malloc((size_t)width * (size_t)height * 4);
         frame.capture_rgba = *capture;
     }
+    frame_build_seconds = plat_seconds() - build_start;
     renderer_submit(r, &frame, width, height);
 }
 
@@ -299,7 +868,10 @@ static const char *net_state_name(net_client_state state) {
 // Online: the world is the server's. The session predicts our player and the ships
 // and interpolates everyone else; we hand it the input and draw what it holds.
 static int run_online(const options *o, plat_window *window, renderer *r, const char *backend,
-                      const r_mesh *meshes, r_mesh stars, draw_list *list, float *yaw, float *pitch) {
+                      const r_mesh *meshes, r_mesh cloud_mesh, draw_list *list, light_list *lights, frame_tables *tables,
+                      float *yaw, float *pitch) {
+    stats_log stats = {};
+    stats.on = o->stats;
     if (!net_init()) {
         fputs("the network could not be initialised\n", stderr);
         return 1;
@@ -342,6 +914,7 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
         for (int k = 0; k < 9; ++k)
             if (pressed['1' + k]) net_session_equip(&session, k);   // wear stash item k
         net_session_frame(&session, &in, now);
+        double tick_seconds = net_seconds() - now;
         net_client_state state = net_session_state(&session);
         if (state == NC_DISCONNECTED) {
             fprintf(stderr, "disconnected: %s\n", session.failure);
@@ -379,8 +952,9 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
             }
             last_status = now;
         }
-        draw_world(r, window, g, player, *yaw, *pitch, net_client_alpha(link), meshes, stars, list, link,
-                   net_session_party(&session), session.identity.name, NULL);
+        draw_world(r, window, g, player, *yaw, *pitch, net_client_alpha(link), now, v3_make(0, 0, 0), meshes, cloud_mesh, list,
+                   lights, tables, link, net_session_party(&session), session.identity.name, NULL);
+        stats_frame(&stats, r, now, tick_seconds);
     }
     net_session_destroy(&session);
     net_shutdown();
@@ -393,6 +967,7 @@ static int run(const options *o) {
         fputs("could not create a window\n", stderr);
         return 1;
     }
+    if (o->bench_seconds > 0.0f) plat_set_vsync(false);
     renderer *r = renderer_create(o->backend, window);
     if (!r) {
         fputs("no renderer could start\n", stderr);
@@ -407,15 +982,24 @@ static int run(const options *o) {
     meshes[MESH_CUBE] = renderer_mesh_cube(r);
     meshes[MESH_SPHERE] = renderer_mesh_sphere(r, 96, 64);
     meshes[MESH_CAPSULE] = renderer_mesh_capsule(r, PLAYER_RADIUS, PLAYER_HEIGHT, 24, 8);
-    r_mesh stars = create_stars(r);
+    r_mesh cloud_mesh = renderer_mesh_sphere(r, CLOUD_SEGMENTS, CLOUD_SEGMENTS / 2);
 
     float yaw = o->yaw, pitch = o->pitch;
     draw_list list = {};
+    light_list *lights = (light_list *)calloc(1, sizeof(light_list));
+    frame_tables *tables = (frame_tables *)calloc(1, sizeof(frame_tables));
+    tables->surface_shader = renderer_shader(r, "surface");
+    tables->planet_shader = renderer_shader(r, "planet");
+    tables->cloud_shader = renderer_shader(r, "clouds");
+    if (!tables->surface_shader || !tables->planet_shader || !tables->cloud_shader)
+        fputs("the built-in material shaders are missing: check src/render/shaders/materials\n", stderr);
     int status = 0;
 
     if (o->connect || o->directory) {
-        status = run_online(o, window, r, backend, meshes, stars, &list, &yaw, &pitch);
+        status = run_online(o, window, r, backend, meshes, cloud_mesh, &list, lights, tables, &yaw, &pitch);
         free(list.items);
+        free(lights);
+        free(tables);
         renderer_destroy(r);
         plat_window_destroy(window);
         return status;
@@ -423,7 +1007,8 @@ static int run(const options *o) {
 
     game *g = (game *)malloc(sizeof(game));
     game_init(g, CW_HOST);
-    game_build_universe(g);
+    if (o->dungeon) game_build_dungeon(g, o->dungeon, "hub", v3_make(0, 0, 12), 1);
+    else game_build_universe(g);
     cw_entity_id player = game_spawn_player(g, o->has_position ? o->position : g->spawn, true);
     char prefix[64];
     snprintf(prefix, sizeof(prefix), "Treasure Planet [%s]", backend);
@@ -434,9 +1019,9 @@ static int run(const options *o) {
         uint8_t *pixels = NULL;
         // A few frames first, so a fresh swapchain has settled on the window's size.
         for (int i = 0; i < 4 && plat_window_poll(window); ++i)
-            draw_world(r, window, g, player, yaw, pitch, 1.0f, meshes, stars, &list, NULL, NULL, NULL, NULL);
+            draw_world(r, window, g, player, yaw, pitch, 1.0f, 0.0, o->velocity, meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, NULL);
         plat_window_poll(window);
-        draw_world(r, window, g, player, yaw, pitch, 1.0f, meshes, stars, &list, NULL, NULL, NULL, &pixels);
+        draw_world(r, window, g, player, yaw, pitch, 1.0f, 0.0, o->velocity, meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, &pixels);
         int width, height;
         plat_window_size(window, &width, &height);
         if (!pixels || !write_bmp(o->capture_path, pixels, width, height)) {
@@ -446,9 +1031,21 @@ static int run(const options *o) {
             fprintf(stderr, "wrote %s (%dx%d, %zu draws)\n", o->capture_path, width, height, list.count);
         }
         free(pixels);
+    } else if (o->bench_seconds > 0.0f) {
+        // Nothing ticks, so the same view is measured for as long as asked.
+        stats_log stats = {};
+        stats.on = true;
+        double start = plat_seconds();
+        while (plat_window_poll(window) && plat_seconds() - start < o->bench_seconds) {
+            double now = plat_seconds();
+            draw_world(r, window, g, player, yaw, pitch, 1.0f, now, o->velocity, meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, NULL);
+            stats_frame(&stats, r, now, 0.0);
+        }
     } else {
         cw_clock clock = cw_clock_make(GAME_TICK_HZ);
         double last = plat_seconds(), last_status = 0.0;
+        stats_log stats = {};
+        stats.on = o->stats;
         plat_window_capture_mouse(window, true);
         while (plat_window_poll(window)) {
             PlayerInput *in = CW_GET(&g->world, player, g->c_input, PlayerInput);
@@ -458,16 +1055,20 @@ static int run(const options *o) {
             int steps = cw_clock_advance(&clock, (float)(now - last));
             last = now;
             for (int i = 0; i < steps; ++i) game_tick(g);
+            double tick_seconds = plat_seconds() - now;
 
             if (now - last_status > 0.25) {
                 set_status(window, g, player, prefix);
                 last_status = now;
             }
-            draw_world(r, window, g, player, yaw, pitch, cw_clock_alpha(&clock), meshes, stars, &list, NULL, NULL, NULL, NULL);
+            draw_world(r, window, g, player, yaw, pitch, cw_clock_alpha(&clock), now, v3_make(0, 0, 0), meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, NULL);
+            stats_frame(&stats, r, now, tick_seconds);
         }
     }
 
     free(list.items);
+    free(lights);
+    free(tables);
     game_destroy(g);
     free(g);
     renderer_destroy(r);
@@ -479,7 +1080,7 @@ int main(int argc, char **argv) {
     options o;
     if (!parse_options(argc, argv, &o)) {
         fputs("usage: treasure_planet [--renderer vulkan|gl] [--connect host[:port] | --directory host[:port] [--place NAME]] [--name NAME]\n"
-              "                       [--capture out.bmp [--ticks N] [--at X Y Z] [--look YAW PITCH]]\n", stderr);
+              "                       [--dungeon NAME] [--stats] [--bench SECONDS | --capture out.bmp [--ticks N]] [--at X Y Z] [--look YAW PITCH] [--moving X Y Z]\n", stderr);
         return 2;
     }
     return run(&o);

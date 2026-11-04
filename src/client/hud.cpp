@@ -8,7 +8,9 @@ r_draw *draw_push(draw_list *list) {
         list->capacity = list->capacity ? list->capacity * 2 : 256;
         list->items = (r_draw *)realloc(list->items, list->capacity * sizeof(r_draw));
     }
-    return &list->items[list->count++];
+    r_draw *d = &list->items[list->count++];
+    memset(d, 0, sizeof(*d));
+    return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +106,8 @@ static void pixel(draw_list *list, const hud_frame *f, float x, float y, float h
     d->color[0] = color.x;
     d->color[1] = color.y;
     d->color[2] = color.z;
-    d->color[3] = 0.0f;   // unlit
+    d->color[3] = 1.0f;
+    d->flags = R_DRAW_UNLIT;
 }
 
 float hud_text_width(const char *text, float pixel_size) {
@@ -233,6 +236,7 @@ static void box(draw_list *list, r_mesh cube, v3 center, v3 half, v3 color) {
     d->color[1] = color.y;
     d->color[2] = color.z;
     d->color[3] = 1.0f;
+    d->flags = 0;
 }
 
 void hud_draw_gear(draw_list *list, r_mesh cube, v3 feet, float yaw, const Equipment *gear) {

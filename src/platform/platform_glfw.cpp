@@ -124,6 +124,10 @@ void plat_window_destroy(plat_window *window) {
 
 void plat_window_show(plat_window *window) { glfwShowWindow(window->handle); }
 
+static bool vsync_on = true;
+void plat_set_vsync(bool on) { vsync_on = on; }
+bool plat_vsync(void) { return vsync_on; }
+
 bool plat_window_poll(plat_window *window) {
     window->input.mouse_dx = window->input.mouse_dy = 0.0f;
     window->input.clicked = false;
@@ -188,7 +192,7 @@ bool plat_gl_create(plat_window *window) {
         return false;
     }
     glfwMakeContextCurrent(window->handle);
-    glfwSwapInterval(1);
+    glfwSwapInterval(vsync_on ? 1 : 0);
     return true;
 }
 

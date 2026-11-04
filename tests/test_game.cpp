@@ -160,6 +160,56 @@ static void test_every_planet_has_a_ship(void) {
     free(g);
 }
 
+// A planet's land is ground: it is flat where the landing pad is set into it, it
+// rises away from there, and a player dropped over it lands on it rather than
+// through it. The monument stands on that same land.
+static void test_planet_land(void) {
+    game *g = (game *)malloc(sizeof(game));
+    game_init(g, CW_HOST);
+    game_build_universe(g);
+
+    cw_entity_id planet = CW_INVALID_ENTITY;
+    cw_component_id needed[] = {g->c_transform, g->c_planet};
+    cw_query planets = cw_query_iter(&g->world, cw_mask(needed, 2));
+    cw_entity_id id;
+    while (cw_query_next(&planets, &id))
+        if (!strcmp(CW_GET(&g->world, id, g->c_planet, Planet)->name, "Verdant")) planet = id;
+    CHECK(planet != CW_INVALID_ENTITY);
+    const Planet *p = CW_GET(&g->world, planet, g->c_planet, Planet);
+    v3 centre = CW_GET(&g->world, planet, g->c_transform, Transform)->position;
+    CHECK(p->land.radius > 0.0f && p->land.relief > 0.0f && p->land.pad_radius > 0.0f);
+
+    // Flat where the pad is, and somewhere higher beyond it.
+    CHECK(game_planet_height(&p->land, v3_make(0, 1, 0)) == 0.0f);
+    float highest = 0.0f;
+    for (int i = 0; i < 64; ++i) {
+        float around = 2.0f * TP_PI * (float)i / 64.0f;
+        v3 at = game_planet_point(&p->land, centre, v3_make(cosf(around), 0, sinf(around)), 120.0f);
+        float height = v3_length(v3_sub(at, centre)) - p->land.radius;
+        CHECK(height >= -0.01f && height <= p->land.relief + 0.01f);   // sea level to the highest peak
+        if (height > highest) highest = height;
+    }
+    CHECK(highest > 1.0f);    // not a smooth ball: there is land out there
+
+    // The ground under a point is the land: a player dropped over it lands on it.
+    v3 spot = game_planet_point(&p->land, centre, v3_make(0.6f, 0, -0.8f), 110.0f);
+    float ground = game_ground_y(g, v3_add(spot, v3_make(0, 40.0f, 0)));
+    CHECK(fabsf(ground - spot.y) < 0.2f);
+    cw_entity_id player = game_spawn_player(g, v3_add(spot, v3_make(0, 25.0f, 0)), true);
+    for (int tick = 0; tick < 180; ++tick) game_tick(g);
+    v3 at = CW_GET(&g->world, player, g->c_transform, Transform)->position;
+    CHECK(CW_GET(&g->world, player, g->c_player, Player)->grounded);
+    CHECK(fabsf(at.y - game_ground_y(g, at)) < 0.05f);
+    CHECK(at.y > centre.y + p->land.radius - 40.0f);    // on the land, not fallen past the world
+
+    // The monument is a landmark place, and it is not a way anywhere.
+    int landmark = game_find_place(g, "Verdant Monument");
+    CHECK(landmark >= 0 && g->places[landmark].kind == PLACE_LANDMARK);
+    CHECK(game_place_at(g, g->places[landmark].center) != landmark);
+    game_destroy(g);
+    free(g);
+}
+
 // The whole game state survives a save: the persistence an MMO stands on.
 static void test_save_and_restore(void) {
     game *a = (game *)malloc(sizeof(game));
@@ -376,6 +426,7 @@ int main(void) {
     test_players_stand_and_walls_block();
     test_boarding_and_flight();
     test_every_planet_has_a_ship();
+    test_planet_land();
     test_save_and_restore();
     if (failures) {
         printf("test_game: %d failed\n", failures);

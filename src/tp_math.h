@@ -61,11 +61,29 @@ static inline m4 m4_perspective(float fov_y, float aspect, float near_plane) {
     r.m[14] = near_plane;
     return r;
 }
+// A point through a matrix, as a position (w = 1), without the divide.
+static inline v3 m4_transform_point(const m4 *m, v3 p) {
+    return v3_make(m->m[0] * p.x + m->m[4] * p.y + m->m[8] * p.z + m->m[12],
+                   m->m[1] * p.x + m->m[5] * p.y + m->m[9] * p.z + m->m[13],
+                   m->m[2] * p.x + m->m[6] * p.y + m->m[10] * p.z + m->m[14]);
+}
+// Orthographic, reversed like m4_perspective: depth 1 at the eye's plane, 0 at
+// `depth` in front of it. x and y map [-half_width, half_width] and
+// [-half_height, half_height] to [-1, 1].
+static inline m4 m4_ortho(float half_width, float half_height, float depth) {
+    m4 r = m4_identity();
+    r.m[0] = 1.0f / half_width;
+    r.m[5] = 1.0f / half_height;
+    r.m[10] = 1.0f / depth;      // view space looks down -z, so z/depth runs 0..-1
+    r.m[14] = 1.0f;
+    return r;
+}
 static inline v3 look_direction(float yaw, float pitch) {
     return v3_make(-sinf(yaw) * cosf(pitch), sinf(pitch), -cosf(yaw) * cosf(pitch));
 }
-static inline m4 m4_look_to(v3 eye, v3 forward) {
-    v3 side = v3_normalize(v3_cross(forward, v3_make(0, 1, 0)));
+// `up` is a hint: the frame's up is rebuilt perpendicular to `forward`.
+static inline m4 m4_look_to_up(v3 eye, v3 forward, v3 up_hint) {
+    v3 side = v3_normalize(v3_cross(forward, up_hint));
     v3 up = v3_cross(side, forward);
     m4 r = m4_identity();
     r.m[0] = side.x;  r.m[4] = side.y;  r.m[8] = side.z;
@@ -76,5 +94,6 @@ static inline m4 m4_look_to(v3 eye, v3 forward) {
     r.m[14] = v3_dot(forward, eye);
     return r;
 }
+static inline m4 m4_look_to(v3 eye, v3 forward) { return m4_look_to_up(eye, forward, v3_make(0, 1, 0)); }
 
 #endif
