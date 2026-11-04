@@ -26,11 +26,10 @@ build/debug/treasure_planet
 
 A VM without GPU passthrough still runs the game, slowly, on Mesa's software drivers. For a machine that only runs the server, the simulation and the tests, `./build.sh --headless` needs just a compiler and CMake. Configure with `-DTP_WAYLAND=ON` for native Wayland, which also needs `libwayland-dev` and `libxkbcommon-dev`.
 
-**macOS:** the Xcode command line tools, plus CMake and MoltenVK, which implements Vulkan on top of Metal.
+**macOS:** the Xcode command line tools, plus CMake and MoltenVK, which implements Vulkan on top of Metal. `build_mac.sh` says what is missing, and `--deps` installs it with Homebrew; it takes the same flags as `build.sh`.
 
 ```sh
-brew install cmake molten-vk
-./build.sh
+./build_mac.sh --deps  # debug build, then the tests. --release for optimised
 build/debug/treasure_planet
 ```
 
