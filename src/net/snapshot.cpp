@@ -6,7 +6,10 @@
 enum {
     CHANGE_ABOARD = 1, CHANGE_POSITION = 2, CHANGE_VELOCITY = 4, CHANGE_ANGLES = 8, CHANGE_FLAGS = 16,
     CHANGE_NEW = 32,             // not in the base: every field follows, coded against zero
-    CHANGE_STATS = 64
+    CHANGE_STATS = 64,
+    CHANGE_ROTATION = 128,       // a craft's orientation and spin
+    CHANGE_PILOT = 256,
+    CHANGE_ALL = 511
 };
 
 void snapshot_reserve(snapshot *s, uint16_t count) {
@@ -73,6 +76,43 @@ snapshot_entry snapshot_entry_make(cw_entity_id id, cw_entity_id aboard, v3 posi
     return e;
 }
 
+static int32_t bits_of(float f) {
+    int32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    return bits;
+}
+static float float_of(int32_t bits) {
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+snapshot_entry snapshot_entry_craft(cw_entity_id id, v3 position, v3 velocity, quat orientation, v3 spin,
+                                    cw_entity_id pilot, bool resting, bool assist) {
+    snapshot_entry e = {};
+    e.id = id;
+    e.aboard = CW_INVALID_ENTITY;
+    e.pilot = pilot;
+    e.flags = (uint8_t)(SNAP_CRAFT | (resting ? SNAP_RESTING : 0) | (assist ? SNAP_ASSIST : 0));
+    const float p[3] = {position.x, position.y, position.z}, v[3] = {velocity.x, velocity.y, velocity.z};
+    const float q[4] = {orientation.x, orientation.y, orientation.z, orientation.w}, w[3] = {spin.x, spin.y, spin.z};
+    for (int k = 0; k < 3; ++k) {
+        e.position[k] = bits_of(p[k]);
+        e.velocity[k] = bits_of(v[k]);
+        e.spin[k] = bits_of(w[k]);
+    }
+    for (int k = 0; k < 4; ++k) e.orientation[k] = bits_of(q[k]);
+    return e;
+}
+
+void snapshot_craft_state(const snapshot_entry *e, v3 *position, v3 *velocity, quat *orientation, v3 *spin) {
+    *position = v3_make(float_of(e->position[0]), float_of(e->position[1]), float_of(e->position[2]));
+    *velocity = v3_make(float_of(e->velocity[0]), float_of(e->velocity[1]), float_of(e->velocity[2]));
+    *orientation = quat_make(float_of(e->orientation[0]), float_of(e->orientation[1]), float_of(e->orientation[2]),
+                             float_of(e->orientation[3]));
+    *spin = v3_make(float_of(e->spin[0]), float_of(e->spin[1]), float_of(e->spin[2]));
+}
+
 v3 snapshot_position(const snapshot_entry *e) {
     return v3_make((float)e->position[0] / SNAPSHOT_POSITION_SCALE, (float)e->position[1] / SNAPSHOT_POSITION_SCALE,
                    (float)e->position[2] / SNAPSHOT_POSITION_SCALE);
@@ -119,10 +159,11 @@ bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w) {
     for (uint16_t i = 0; i < s->count; ++i) {
         const snapshot_entry *e = &s->entries[i];
         const snapshot_entry *b = snapshot_find(base, e->id);
-        uint8_t change = 0;
+        uint32_t change = 0;
         if (!b) {
             b = &zero;
             change = CHANGE_NEW | CHANGE_ABOARD | CHANGE_POSITION | CHANGE_VELOCITY | CHANGE_ANGLES | CHANGE_FLAGS | CHANGE_STATS;
+            if (e->flags & SNAP_CRAFT) change |= CHANGE_ROTATION | CHANGE_PILOT;
         } else {
             if (e->aboard != b->aboard) change |= CHANGE_ABOARD;
             if (memcmp(e->position, b->position, sizeof(e->position)) != 0) change |= CHANGE_POSITION;
@@ -130,9 +171,12 @@ bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w) {
             if (e->yaw != b->yaw || e->pitch != b->pitch) change |= CHANGE_ANGLES;
             if (e->flags != b->flags) change |= CHANGE_FLAGS;
             if (e->hits_made != b->hits_made || e->hits_taken != b->hits_taken) change |= CHANGE_STATS;
+            if (memcmp(e->orientation, b->orientation, sizeof(e->orientation)) != 0 || memcmp(e->spin, b->spin, sizeof(e->spin)) != 0)
+                change |= CHANGE_ROTATION;
+            if (e->pilot != b->pilot) change |= CHANGE_PILOT;
         }
         write_id(w, e->id);
-        cw_writer_u8(w, change);
+        net_write_uvarint(w, change);
         if (change & CHANGE_ABOARD) write_id(w, e->aboard);
         if (change & CHANGE_POSITION)
             for (int k = 0; k < 3; ++k) net_write_svarint(w, (int64_t)e->position[k] - b->position[k]);
@@ -147,6 +191,11 @@ bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w) {
             net_write_uvarint(w, e->hits_made);
             net_write_uvarint(w, e->hits_taken);
         }
+        if (change & CHANGE_ROTATION) {
+            for (int k = 0; k < 4; ++k) net_write_svarint(w, (int64_t)e->orientation[k] - b->orientation[k]);
+            for (int k = 0; k < 3; ++k) net_write_svarint(w, (int64_t)e->spin[k] - b->spin[k]);
+        }
+        if (change & CHANGE_PILOT) write_id(w, e->pilot);
     }
     return cw_writer_ok(w);
 }
@@ -174,9 +223,8 @@ bool snapshot_decode(cw_reader *r, const snapshot *base, snapshot *out) {
     for (uint16_t i = 0; i < count; ++i) {
         snapshot_entry *e = &out->entries[i];
         cw_entity_id id = CW_INVALID_ENTITY;
-        uint8_t change = 0;
-        if (!read_id(r, &id)) return false;
-        cw_reader_u8(r, &change);
+        uint64_t change = 0;
+        if (!read_id(r, &id) || !net_read_uvarint(r, &change) || change > CHANGE_ALL) return false;
         const snapshot_entry *b = (change & CHANGE_NEW) ? NULL : snapshot_find(base, id);
         if (!b) {
             if (!(change & CHANGE_NEW)) return false;   // the base lacks an entry the sender coded against
@@ -210,6 +258,15 @@ bool snapshot_decode(cw_reader *r, const snapshot *base, snapshot *out) {
             e->hits_made = (uint16_t)made;
             e->hits_taken = (uint16_t)taken;
         }
+        if (change & CHANGE_ROTATION) {
+            for (int k = 0; k < 7; ++k) {
+                int64_t d = 0;
+                if (!net_read_svarint(r, &d)) return false;
+                if (k < 4) e->orientation[k] = (int32_t)(b->orientation[k] + d);
+                else e->spin[k - 4] = (int32_t)(b->spin[k - 4] + d);
+            }
+        }
+        if (change & CHANGE_PILOT && !read_id(r, &e->pilot)) return false;
         if (!cw_reader_ok(r)) return false;
         ++out->count;
     }

@@ -24,7 +24,9 @@ static void on_error(int code, const char *message) { fprintf(stderr, "glfw: %s 
 
 static void on_key(GLFWwindow *handle, int key, int, int action, int) {
     plat_window *window = (plat_window *)glfwGetWindowUserPointer(handle);
-    if (key >= 0 && key < PLAT_KEY_COUNT) window->input.keys[key] = action != GLFW_RELEASE;
+    if (key < 0 || key >= PLAT_KEY_COUNT) return;
+    window->input.keys[key] = action != GLFW_RELEASE;
+    if (action == GLFW_PRESS) window->input.pressed[key] = true;
 }
 
 static void on_mouse_button(GLFWwindow *handle, int button, int action, int) {
@@ -131,6 +133,7 @@ bool plat_vsync(void) { return vsync_on; }
 bool plat_window_poll(plat_window *window) {
     window->input.mouse_dx = window->input.mouse_dy = 0.0f;
     window->input.clicked = false;
+    memset(window->input.pressed, 0, sizeof(window->input.pressed));
     // Minimised: nothing presents, so nothing paces the loop.
     if (glfwGetWindowAttrib(window->handle, GLFW_ICONIFIED)) glfwWaitEventsTimeout(0.01);
     else glfwPollEvents();

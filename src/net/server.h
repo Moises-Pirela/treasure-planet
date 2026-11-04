@@ -59,6 +59,7 @@
 #define SERVER_LINGER_QUIT 10.0         // seconds a body stays after its player quit
 #define SERVER_LINGER_TIMEOUT 60.0      // ...after its player's connection was lost
 #define SERVER_SNAPSHOT_MIN 96       // bytes a snapshot may always use: the header and ourselves
+#define SERVER_CRAFT_LINGER 600.0    // seconds a craft waits for its owner after they left this server
 
 // What a client is told about, by class of entity: scenery (ships, planets, the
 // places) always; players and loot within a radius of the client's player, with a
@@ -100,6 +101,7 @@ struct server_config {
     double instance_linger;      // 0 takes SERVER_INSTANCE_LINGER
     const char *save_path;       // characters on disk, when this server runs its own backend (no directory)
     double linger_quit, linger_timeout;   // seconds a body stays after a quit / after a timeout (0: defaults)
+    double craft_linger;         // seconds a craft stays once its owner is on none of this server's worlds (0: default)
     uint32_t bandwidth;          // bytes per second sent to each client at most; 0 takes SERVER_BANDWIDTH.
                                  // Snapshots shrink to fit (farthest players first), the baseline is paced
     uint32_t total_bandwidth;    // bytes per second sent by this server at most, shared out among its
@@ -150,11 +152,17 @@ struct server_change {
 
 enum server_world_kind { WORLD_ZONE, WORLD_INSTANCE };
 struct server;
+// How long a craft has been without its owner on this server (server-only, on every craft).
+struct CraftKeep {
+    double owner_gone_since;     // net_seconds; 0 while the owner is here
+};
+
 struct server_world {
     server *owner;
     int kind;                    // server_world_kind
     game *g;                     // the zone's universe, or an instance's dungeon
     cw_component_id c_trail;     // server-only, on every player
+    cw_component_id c_keep;      // server-only, on every craft
     char dungeon[GAME_NAME_CAPACITY];
     uint64_t key;                // instance key; 0 for the zone
     int client_count;
@@ -231,6 +239,7 @@ struct server {
     uint64_t tick;               // every world ticks once per server tick
     double tick_base;            // universe time at server tick zero
     double last_trace;
+    double last_craft_sweep;     // crafts' owners are looked for once a second
     uint32_t ticks_skipped;      // simulation the clock made us skip (stalls longer than the catch-up)
     uint32_t rebases;            // times universe time had to move to follow a clock jump
     uint32_t instances_opened, instances_closed;

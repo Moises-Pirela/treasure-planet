@@ -1,16 +1,12 @@
-#include "game.h"
+#include "game_internal.h"
 #include <stdlib.h>
 #include <string.h>
 
-// World data reachable from a system. Systems get only the world, and the world's
-// user pointer is how they find the component ids and queries.
-static game *game_of(cw_world *w) { return (game *)w->user; }
-
-static const float GRAVITY = 20.0f;
+const float GAME_GRAVITY = 20.0f;
+const float GAME_STEP_HEIGHT = 0.35f;
 static const float WALK_SPEED = 6.0f;
 static const float AIR_ACCEL = 18.0f;
 static const float JUMP_SPEED = 7.0f;
-static const float STEP_HEIGHT = 0.35f;
 static const float INSIDE_SKIN = 0.02f;
 static const float KILL_HEIGHT = -600.0f;   // fell off the world: back to the hub
 
@@ -102,7 +98,7 @@ static void system_ships(cw_world *w, cw_phase, float) {
 }
 
 // Ship parts are derived state: hull transform plus a fixed offset, for both the
-// current and the previous position.
+// current and the previous position. A craft's offsets turn with it.
 static void system_attachments(cw_world *w, cw_phase, float) {
     game *g = game_of(w);
     cw_query parts = cw_query_begin(g->q_attachments);
@@ -111,7 +107,13 @@ static void system_attachments(cw_world *w, cw_phase, float) {
         const Attachment *a = CW_GET(w, id, g->c_attachment, Attachment);
         const Transform *ship_t = CW_GET(w, a->ship, g->c_transform, Transform);
         Transform *t = CW_GET(w, id, g->c_transform, Transform);
-        if (!ship_t) continue;
+        if (!ship_t || !cw_comp_has(w, a->ship, g->c_transform)) continue;
+        if (cw_comp_has(w, a->ship, g->c_craft)) {
+            const Craft *c = CW_GET(w, a->ship, g->c_craft, Craft);
+            t->position = v3_add(ship_t->position, quat_rotate(c->orientation, a->offset));
+            t->previous = v3_add(ship_t->previous, quat_rotate(c->previous_orientation, a->offset));
+            continue;
+        }
         t->position = v3_add(ship_t->position, a->offset);
         t->previous = v3_add(ship_t->previous, a->offset);
     }
@@ -151,12 +153,35 @@ static void grid_push(game *g, int32_t key, cw_entity_id id) {
     ++g->grid_count;
 }
 
+static int compare_craft_parts(const void *a, const void *b) {
+    const cw_entity_id *x = (const cw_entity_id *)a, *y = (const cw_entity_id *)b;
+    if (x[0] != y[0]) return x[0] < y[0] ? -1 : 1;
+    return x[1] < y[1] ? -1 : x[1] > y[1];
+}
+
+// Whether a part belongs to a craft, whose parts turn and are never in the grid.
+static bool craft_part(game *g, cw_entity_id id) {
+    cw_world *w = &g->world;
+    return cw_comp_has(w, id, g->c_attachment) && cw_comp_has(w, CW_GET(w, id, g->c_attachment, Attachment)->ship, g->c_craft);
+}
+
 static void system_solid_grid(cw_world *w, cw_phase, float) {
     game *g = game_of(w);
     g->grid_count = 0;
+    g->craft_part_count = 0;
     cw_query solids = cw_query_begin(g->q_solids);
     cw_entity_id id;
     while (cw_query_next(&solids, &id)) {
+        if (craft_part(g, id)) {
+            if (g->craft_part_count == g->craft_part_capacity) {
+                g->craft_part_capacity = g->craft_part_capacity ? g->craft_part_capacity * 2 : 64;
+                g->craft_parts = (decltype(g->craft_parts))realloc(g->craft_parts, (size_t)g->craft_part_capacity * sizeof(*g->craft_parts));
+            }
+            g->craft_parts[g->craft_part_count].craft = CW_GET(w, id, g->c_attachment, Attachment)->ship;
+            g->craft_parts[g->craft_part_count].part = id;
+            ++g->craft_part_count;
+            continue;
+        }
         const Solid *solid = CW_GET(w, id, g->c_solid, Solid);
         v3 c = CW_GET(w, id, g->c_transform, Transform)->position;
         int x0 = cell_of(c.x - solid->half.x - PLAYER_RADIUS), x1 = cell_of(c.x + solid->half.x + PLAYER_RADIUS);
@@ -165,12 +190,27 @@ static void system_solid_grid(cw_world *w, cw_phase, float) {
             for (int z = z0; z <= z1; ++z) grid_push(g, cell_key(x, z), id);
     }
     if (g->grid_count > 1) qsort(g->grid, (size_t)g->grid_count, sizeof(*g->grid), compare_grid);
+    if (g->craft_part_count > 1)
+        qsort(g->craft_parts, (size_t)g->craft_part_count, sizeof(*g->craft_parts), compare_craft_parts);
+}
+
+int game_craft_part_range(const game *g, cw_entity_id craft, int *first) {
+    int lo = 0, hi = g->craft_part_count;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (g->craft_parts[mid].craft < craft) lo = mid + 1;
+        else hi = mid;
+    }
+    *first = lo;
+    int n = 0;
+    while (lo + n < g->craft_part_count && g->craft_parts[lo + n].craft == craft) ++n;
+    return n;
 }
 
 // Visits every solid listed in the cell of `at` (each solid is listed in all the
 // cells its padded box touches, so one cell is enough).
-#define GAME_GRID_MAX_NEARBY 64
-static int solids_near(const game *g, v3 at, cw_entity_id *out) {
+#define GAME_GRID_MAX_NEARBY GAME_MAX_BOXES
+int game_solids_near(const game *g, v3 at, cw_entity_id *out) {
     int32_t key = cell_key(cell_of(at.x), cell_of(at.z));
     int lo = 0, hi = g->grid_count;
     while (lo < hi) {
@@ -183,46 +223,220 @@ static int solids_near(const game *g, v3 at, cw_entity_id *out) {
     return n;
 }
 
-// Moves along one axis and stops at the first solid crossed. A solid the player is
+// Moves along one axis and stops at the first box crossed. A box the player is
 // well inside (a ship landed on them) is ignored, so nobody can get stuck; "well"
 // because a carried player can sit a rounding error below the deck they stand on,
-// and that deck must still hold them up.
+// and that deck must still hold them up. The boxes are the world's solids around
+// the player, or a craft's parts in its frame for one aboard it.
 // Returns true when something blocked the move.
-static bool move_axis(game *g, Transform *t, int axis, float amount, bool can_step) {
-    cw_world *w = &g->world;
-    v3 from = t->position, to = from;
+static bool move_axis(v3 *position, int axis, float amount, bool can_step, const game_box *boxes, int count) {
+    v3 from = *position, to = from;
     *axis_of(&to, axis) += amount;
     bool blocked = false;
-    cw_entity_id nearby[GAME_GRID_MAX_NEARBY];
-    int count = solids_near(g, to, nearby);
     for (int k = 0; k < count; ++k) {
-        cw_entity_id id = nearby[k];
-        const Solid *solid = CW_GET(w, id, g->c_solid, Solid);
-        v3 center = CW_GET(w, id, g->c_transform, Transform)->position;
-        v3 core = v3_make(solid->half.x - INSIDE_SKIN, solid->half.y - INSIDE_SKIN, solid->half.z - INSIDE_SKIN);
-        if (!overlaps(to, center, solid->half) || overlaps(from, center, core)) continue;
-        float top = center.y + solid->half.y;
-        if (can_step && top - from.y <= STEP_HEIGHT) {
+        v3 center = boxes[k].center, half = boxes[k].half;
+        v3 core = v3_make(half.x - INSIDE_SKIN, half.y - INSIDE_SKIN, half.z - INSIDE_SKIN);
+        if (!overlaps(to, center, half) || overlaps(from, center, core)) continue;
+        float top = center.y + half.y;
+        if (can_step && top - from.y <= GAME_STEP_HEIGHT) {
             v3 stepped = to;
             stepped.y = top;
             bool clear = true;
-            for (int m = 0; clear && m < count; ++m) {
-                const Solid *s = CW_GET(w, nearby[m], g->c_solid, Solid);
-                clear = !overlaps(stepped, CW_GET(w, nearby[m], g->c_transform, Transform)->position, s->half);
-            }
+            for (int m = 0; clear && m < count; ++m) clear = !overlaps(stepped, boxes[m].center, boxes[m].half);
             if (clear) {
                 to.y = top;
                 continue;
             }
         }
         blocked = true;
-        v3 half = solid->half;
         float near_face = *axis_of(&center, axis) - (amount > 0.0f ? 1.0f : -1.0f) * *axis_of(&half, axis);
         float reach = axis == 1 ? (amount > 0.0f ? PLAYER_HEIGHT : 0.0f) : (amount > 0.0f ? PLAYER_RADIUS : -PLAYER_RADIUS);
         *axis_of(&to, axis) = near_face - reach;
     }
-    t->position = to;
+    *position = to;
     return blocked;
+}
+
+static bool move_axis_world(game *g, v3 *position, int axis, float amount, bool can_step) {
+    v3 to = *position;
+    *axis_of(&to, axis) += amount;
+    cw_entity_id nearby[GAME_GRID_MAX_NEARBY];
+    game_box boxes[GAME_GRID_MAX_NEARBY];
+    int count = game_solids_near(g, to, nearby);
+    for (int k = 0; k < count; ++k) {
+        boxes[k].center = CW_GET(&g->world, nearby[k], g->c_transform, Transform)->position;
+        boxes[k].half = CW_GET(&g->world, nearby[k], g->c_solid, Solid)->half;
+    }
+    return move_axis(position, axis, amount, can_step, boxes, count);
+}
+
+// The velocity a player's input asks for, in the frame they walk in: walking on
+// the ground, steering a little in the air, jumping, falling.
+static void steer(Player *p, const PlayerInput *in, float dt) {
+    float length = sqrtf(in->forward * in->forward + in->strafe * in->strafe);
+    float norm = length > 1.0f ? 1.0f / length : 1.0f;
+    float sin_yaw = sinf(in->yaw), cos_yaw = cosf(in->yaw);
+    float wish_x = (-sin_yaw * in->forward + cos_yaw * in->strafe) * norm * WALK_SPEED;
+    float wish_z = (-cos_yaw * in->forward - sin_yaw * in->strafe) * norm * WALK_SPEED;
+    if (p->grounded) {
+        p->velocity.x = wish_x;
+        p->velocity.z = wish_z;
+        if (in->jump) {
+            p->velocity.y = JUMP_SPEED;
+            p->grounded = false;
+        }
+    } else {
+        float step = AIR_ACCEL * dt;
+        float dx = wish_x - p->velocity.x, dz = wish_z - p->velocity.z;
+        float gap = sqrtf(dx * dx + dz * dz);
+        if (gap > step) { dx *= step / gap; dz *= step / gap; }
+        p->velocity.x += dx;
+        p->velocity.z += dz;
+    }
+    p->velocity.y -= GAME_GRAVITY * dt;
+    if (p->swing_cooldown > 0.0f) p->swing_cooldown -= dt;   // the swing itself is the server's call
+}
+
+static bool in_cabin(const Craft *c, v3 local) {
+    return inside_box(local, c->cabin_center, c->cabin_half);
+}
+
+// Whether a part of the craft is underfoot, or close enough under the feet to be
+// stepped down to: a player going down its stairs stays aboard.
+static bool supported(v3 local, const game_box *boxes, int count) {
+    v3 probe = local;
+    probe.y -= GAME_STEP_HEIGHT + 0.05f;
+    for (int k = 0; k < count; ++k) {
+        const game_box *b = &boxes[k];
+        float top = b->center.y + b->half.y;
+        if (top > local.y + 0.01f || top < probe.y) continue;
+        if (fabsf(local.x - b->center.x) < b->half.x + PLAYER_RADIUS && fabsf(local.z - b->center.z) < b->half.z + PLAYER_RADIUS)
+            return true;
+    }
+    return false;
+}
+
+static void board(game *g, cw_entity_id player, cw_entity_id craft, Transform *t, Player *p) {
+    const Craft *c = CW_GET(&g->world, craft, g->c_craft, Craft);
+    Aboard a = {};
+    a.craft = craft;
+    a.position = a.previous = game_craft_from_world(g, craft, t->position);
+    p->velocity = quat_unrotate(c->orientation, v3_sub(p->velocity, game_craft_point_velocity(g, craft, t->position)));
+    cw_comp_set(&g->world, player, g->c_aboard, &a, sizeof(a));
+}
+
+static void leave(game *g, cw_entity_id player, cw_entity_id craft, Transform *t, Player *p) {
+    const Craft *c = CW_GET(&g->world, craft, g->c_craft, Craft);
+    const Aboard *a = CW_GET(&g->world, player, g->c_aboard, Aboard);
+    t->position = game_craft_to_world(g, craft, a->position);
+    p->velocity = v3_add(quat_rotate(c->orientation, p->velocity), game_craft_point_velocity(g, craft, t->position));
+    cw_comp_remove(&g->world, player, g->c_aboard);
+}
+
+// A player in the world's frame against the crafts around them. Each craft's parts
+// are boxes in its own frame, so the player is taken into that frame (as an upright
+// box there: exact for a craft on the level, near enough for one that is not) and
+// stepped up onto, or pushed out of, whatever they overlap. Returns the craft they
+// ended up standing on, if any.
+static cw_entity_id collide_crafts(game *g, Transform *t, Player *p, bool can_step) {
+    cw_world *w = &g->world;
+    cw_entity_id standing = CW_INVALID_ENTITY;
+    cw_query crafts = cw_query_begin(g->q_crafts);
+    cw_entity_id craft;
+    while (cw_query_next(&crafts, &craft)) {
+        const Craft *c = CW_GET(w, craft, g->c_craft, Craft);
+        v3 local = game_craft_from_world(g, craft, t->position);
+        if (v3_length(local) > c->radius + PLAYER_HEIGHT + 1.0f) continue;
+        game_box boxes[GAME_MAX_BOXES];
+        int count = game_craft_boxes(g, craft, boxes, GAME_MAX_BOXES);
+        v3 velocity = quat_unrotate(c->orientation, p->velocity);
+        bool moved = false;
+        for (int k = 0; k < count; ++k) {
+            const game_box *b = &boxes[k];
+            if (!overlaps(local, b->center, b->half)) continue;
+            float top = b->center.y + b->half.y;
+            if (top - local.y <= GAME_STEP_HEIGHT && (can_step || velocity.y <= 0.0f)) {
+                v3 stepped = local;
+                stepped.y = top;
+                bool clear = true;
+                for (int m = 0; clear && m < count; ++m) clear = m == k || !overlaps(stepped, boxes[m].center, boxes[m].half);
+                if (clear) {
+                    local = stepped;
+                    if (velocity.y < 0.0f) velocity.y = 0.0f;
+                    standing = craft;
+                    moved = true;
+                    continue;
+                }
+            }
+            // Out along the shallowest way: each of the six faces, how far it is.
+            float out[6] = {
+                local.x + PLAYER_RADIUS - (b->center.x - b->half.x), (b->center.x + b->half.x) - (local.x - PLAYER_RADIUS),
+                local.y + PLAYER_HEIGHT - (b->center.y - b->half.y), top - local.y,
+                local.z + PLAYER_RADIUS - (b->center.z - b->half.z), (b->center.z + b->half.z) - (local.z - PLAYER_RADIUS)};
+            int best = 0;
+            for (int f = 1; f < 6; ++f)
+                if (out[f] < out[best]) best = f;
+            float sign = (best & 1) ? 1.0f : -1.0f;
+            *axis_of(&local, best / 2) += sign * out[best];
+            float *v = axis_of(&velocity, best / 2);
+            if (*v * sign < 0.0f) *v = 0.0f;
+            if (best == 3) standing = craft;
+            moved = true;
+        }
+        if (moved) {
+            t->position = game_craft_to_world(g, craft, local);
+            p->velocity = quat_rotate(c->orientation, velocity);
+        }
+    }
+    if (standing != CW_INVALID_ENTITY) p->grounded = true;
+    return standing;
+}
+
+// The helm is free when nobody is at it, or whoever was has gone.
+static bool helm_free(game *g, cw_entity_id craft, const Craft *c) {
+    return c->pilot == CW_INVALID_ENTITY || game_aboard(g, c->pilot) != craft;
+}
+
+// A player aboard a craft: in its frame, on its parts, under its gravity, which
+// pulls towards its deck whichever way the craft is turned. At the helm they stand
+// still and their input flies the craft instead (craft.cpp).
+static void walk_aboard(game *g, cw_entity_id id, cw_entity_id craft, Transform *t, Player *p, const PlayerInput *in,
+                        float dt) {
+    cw_world *w = &g->world;
+    Craft *c = CW_GET(w, craft, g->c_craft, Craft);
+    Aboard *a = CW_GET(w, id, g->c_aboard, Aboard);
+    if (in->use) {
+        if (c->pilot == id) {
+            c->pilot = CW_INVALID_ENTITY;
+        } else if (helm_free(g, craft, c) && v3_length(v3_sub(a->position, c->helm)) <= CRAFT_HELM_REACH
+                   && game_can_pilot(g, id, craft)) {
+            c->pilot = id;
+        }
+    }
+    if (c->pilot == id) {
+        a->position = c->helm;
+        p->velocity = v3_make(0, 0, 0);
+        p->grounded = true;
+        if (p->swing_cooldown > 0.0f) p->swing_cooldown -= dt;
+        t->position = game_craft_to_world(g, craft, a->position);
+        return;
+    }
+    game_box boxes[GAME_MAX_BOXES];
+    int count = game_craft_boxes(g, craft, boxes, GAME_MAX_BOXES);
+    steer(p, in, dt);
+    bool was_grounded = p->grounded;
+    if (move_axis(&a->position, 0, p->velocity.x * dt, was_grounded, boxes, count)) p->velocity.x = 0.0f;
+    if (move_axis(&a->position, 2, p->velocity.z * dt, was_grounded, boxes, count)) p->velocity.z = 0.0f;
+    float falling = p->velocity.y;
+    bool hit = move_axis(&a->position, 1, falling * dt, false, boxes, count);
+    p->grounded = hit && falling <= 0.0f;
+    if (hit) p->velocity.y = 0.0f;
+    // Off the deck and over nothing of the craft's: back in the world's frame.
+    if (!in_cabin(c, a->position) && !p->grounded && !supported(a->position, boxes, count)) {
+        leave(g, id, craft, t, p);
+        return;
+    }
+    t->position = game_craft_to_world(g, craft, a->position);
 }
 
 static void system_players(cw_world *w, cw_phase, float dt) {
@@ -236,34 +450,19 @@ static void system_players(cw_world *w, cw_phase, float dt) {
         p->yaw = in->yaw;
         p->pitch = in->pitch;
 
-        float length = sqrtf(in->forward * in->forward + in->strafe * in->strafe);
-        float norm = length > 1.0f ? 1.0f / length : 1.0f;
-        float sin_yaw = sinf(in->yaw), cos_yaw = cosf(in->yaw);
-        float wish_x = (-sin_yaw * in->forward + cos_yaw * in->strafe) * norm * WALK_SPEED;
-        float wish_z = (-cos_yaw * in->forward - sin_yaw * in->strafe) * norm * WALK_SPEED;
-        if (p->grounded) {
-            p->velocity.x = wish_x;
-            p->velocity.z = wish_z;
-            if (in->jump) {
-                p->velocity.y = JUMP_SPEED;
-                p->grounded = false;
-            }
-        } else {
-            float step = AIR_ACCEL * dt;
-            float dx = wish_x - p->velocity.x, dz = wish_z - p->velocity.z;
-            float gap = sqrtf(dx * dx + dz * dz);
-            if (gap > step) { dx *= step / gap; dz *= step / gap; }
-            p->velocity.x += dx;
-            p->velocity.z += dz;
+        cw_entity_id craft = game_aboard(g, id);
+        if (craft != CW_INVALID_ENTITY) {
+            walk_aboard(g, id, craft, t, p, in, dt);
+            continue;
         }
-        p->velocity.y -= GRAVITY * dt;
-        if (p->swing_cooldown > 0.0f) p->swing_cooldown -= dt;   // the swing itself is the server's call
+        if (cw_comp_has(w, id, g->c_aboard)) cw_comp_remove(w, id, g->c_aboard);   // its craft is gone
 
+        steer(p, in, dt);
         bool was_grounded = p->grounded;
-        if (move_axis(g, t, 0, p->velocity.x * dt, was_grounded)) p->velocity.x = 0.0f;
-        if (move_axis(g, t, 2, p->velocity.z * dt, was_grounded)) p->velocity.z = 0.0f;
+        if (move_axis_world(g, &t->position, 0, p->velocity.x * dt, was_grounded)) p->velocity.x = 0.0f;
+        if (move_axis_world(g, &t->position, 2, p->velocity.z * dt, was_grounded)) p->velocity.z = 0.0f;
         float falling = p->velocity.y;
-        bool hit = move_axis(g, t, 1, falling * dt, false);
+        bool hit = move_axis_world(g, &t->position, 1, falling * dt, false);
         p->grounded = hit && falling <= 0.0f;
         if (hit) p->velocity.y = 0.0f;
 
@@ -274,6 +473,20 @@ static void system_players(cw_world *w, cw_phase, float dt) {
             if (falling <= 0.0f) {
                 p->grounded = true;
                 p->velocity.y = 0.0f;
+            }
+        }
+
+        // Crafts, in their own frames; standing on one, or stepping into its cabin, is boarding it.
+        if (cw_query_count(g->q_crafts)) {
+            cw_entity_id standing = collide_crafts(g, t, p, was_grounded);
+            cw_query crafts = cw_query_begin(g->q_crafts);
+            cw_entity_id candidate;
+            while (standing == CW_INVALID_ENTITY && cw_query_next(&crafts, &candidate))
+                if (in_cabin(CW_GET(w, candidate, g->c_craft, Craft), game_craft_from_world(g, candidate, t->position)))
+                    standing = candidate;
+            if (standing != CW_INVALID_ENTITY) {
+                board(g, id, standing, t, p);
+                continue;
             }
         }
 
@@ -292,6 +505,16 @@ static void system_remember_positions(cw_world *w, cw_phase, float) {
         Transform *t = CW_GET(w, id, g->c_transform, Transform);
         t->previous = t->position;
     }
+    cw_query crafts = cw_query_begin(g->q_crafts);
+    while (cw_query_next(&crafts, &id)) {
+        Craft *c = CW_GET(w, id, g->c_craft, Craft);
+        c->previous_orientation = c->orientation;
+    }
+    cw_query aboard = cw_query_iter(w, cw_mask(&g->c_aboard, 1));
+    while (cw_query_next(&aboard, &id)) {
+        Aboard *a = CW_GET(w, id, g->c_aboard, Aboard);
+        a->previous = a->position;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +527,7 @@ void game_init(game *g, cw_sim_role role) {
     cw_world_init(w, g);
     cw_sim_init(&g->sim, role);
 
-    cw_component_id base = cw_comp_block(w, 11);
+    cw_component_id base = cw_comp_block(w, 14);
     g->c_transform = cw_cid(base, 0);
     g->c_solid = cw_cid(base, 1);
     g->c_attachment = cw_cid(base, 2);
@@ -316,6 +539,9 @@ void game_init(game *g, cw_sim_role role) {
     g->c_equipment = cw_cid(base, 8);
     g->c_loot = cw_cid(base, 9);
     g->c_owned = cw_cid(base, 10);
+    g->c_craft = cw_cid(base, 11);
+    g->c_part = cw_cid(base, 12);
+    g->c_aboard = cw_cid(base, 13);
     CW_REGISTER(w, g->c_transform, Transform);
     CW_REGISTER(w, g->c_solid, Solid);
     CW_REGISTER(w, g->c_attachment, Attachment);
@@ -327,6 +553,9 @@ void game_init(game *g, cw_sim_role role) {
     CW_REGISTER(w, g->c_equipment, Equipment);
     CW_REGISTER(w, g->c_loot, Loot);
     CW_REGISTER(w, g->c_owned, Owned);
+    CW_REGISTER(w, g->c_craft, Craft);
+    CW_REGISTER(w, g->c_part, Part);
+    CW_REGISTER(w, g->c_aboard, Aboard);
     cw_comp_set_transient(w, g->c_input, true);
 
     cw_component_id solids[] = {g->c_transform, g->c_solid};
@@ -343,6 +572,8 @@ void game_init(game *g, cw_sim_role role) {
     g->q_all_players = cw_query_create(w, cw_filter_all(cw_mask(all_players, 2)));
     cw_component_id loot[] = {g->c_transform, g->c_loot};
     g->q_loot = cw_query_create(w, cw_filter_all(cw_mask(loot, 2)));
+    cw_component_id crafts[] = {g->c_transform, g->c_craft};
+    g->q_crafts = cw_query_create(w, cw_filter_all(cw_mask(crafts, 2)));
 
     // Every movement system is shared: a client runs them on its own player and on
     // the ships, which is prediction. Only what a server adds is host-only.
@@ -366,14 +597,26 @@ void game_init(game *g, cw_sim_role role) {
     d.fn = system_solid_grid;
     d.order = 17;
     cw_sim_register(&g->sim, d);
+    d.name = "crafts";
+    d.fn = game_system_crafts;
+    d.order = 18;                // after the grid it collides with, before the players aboard
+    cw_sim_register(&g->sim, d);
     d.name = "players";
     d.fn = system_players;
     d.order = 20;
+    cw_sim_register(&g->sim, d);
+    // Only the host hands out crafts and tows them: a client would be making
+    // entities the server never heard of.
+    d.name = "yard";
+    d.fn = game_system_yard;
+    d.order = 25;
+    d.authority = CW_HOST_ONLY;
     cw_sim_register(&g->sim, d);
 }
 
 void game_destroy(game *g) {
     free(g->grid);
+    free(g->craft_parts);
     cw_sim_destroy(&g->sim);
     cw_world_destroy(&g->world);   // releases the cached queries with it
 }
@@ -508,9 +751,9 @@ float game_ground_y(game *g, v3 position) {
 
 int game_place_at(const game *g, v3 point) {
     // Doors and exits stand inside zone places, so they are looked for first; a
-    // landmark is a name for a spot, not a way anywhere.
+    // landmark or a yard terminal is a name for a spot, not a way anywhere.
     for (int i = 0; i < g->place_count; ++i)
-        if (g->places[i].kind != PLACE_ZONE && g->places[i].kind != PLACE_LANDMARK
+        if ((g->places[i].kind == PLACE_ENTRANCE || g->places[i].kind == PLACE_EXIT)
             && inside_box(point, g->places[i].center, g->places[i].half)) return i;
     for (int i = 0; i < g->place_count; ++i)
         if (g->places[i].kind == PLACE_ZONE && inside_box(point, g->places[i].center, g->places[i].half)) return i;

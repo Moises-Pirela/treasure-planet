@@ -14,10 +14,12 @@ struct plat_window;
 #define PLAT_KEY_F2 291
 #define PLAT_KEY_F3 292
 #define PLAT_KEY_F4 293
+#define PLAT_KEY_LEFT_CONTROL 341
 #define PLAT_KEY_COUNT 512
 
 struct plat_input {
-    bool keys[PLAT_KEY_COUNT];
+    bool keys[PLAT_KEY_COUNT];   // held now
+    bool pressed[PLAT_KEY_COUNT];    // went down since the last poll, however briefly
     float mouse_dx, mouse_dy;    // counts since the last poll, while captured
     bool mouse_captured;
     bool clicked;                // the left button went down since the last poll

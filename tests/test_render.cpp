@@ -253,6 +253,21 @@ int main(void) {
         CHECK(fabsf(p.frame.sun_dir[3] - cosf(0.02f)) < 1e-6f);
         CHECK(p.frame.counts[1] == 0 && p.frame.sky[0] == 0.0f && p.frame.sky[2] > 0.0f);
         CHECK(p.frame.camera_forward[3] == frame.camera.near_plane);
+        // Rolled a quarter turn, as aboard a banking craft: the picture's up is the one
+        // asked for, and what is off to that side lands at the top of the screen.
+        frame.camera.up = v3_make(1, 0, 0);
+        r_prepare(&frame, mesh_radius, NULL, 1280, 720, &scratch, &p);
+        CHECK(p.frame.camera_up[0] > 0.999f && fabsf(p.frame.camera_right[1] + 1.0f) < 1e-5f);
+        {
+            v3 off = v3_make(4.0f, 1.65f, -10.0f);
+            const float *m = p.frame.view_proj.m;
+            float x = m[0] * off.x + m[4] * off.y + m[8] * off.z + m[12], y = m[1] * off.x + m[5] * off.y + m[9] * off.z + m[13];
+            float w = m[3] * off.x + m[7] * off.y + m[11] * off.z + m[15];
+            CHECK(w > 0.0f && y / w > 0.3f && fabsf(x / w) < 1e-4f);
+        }
+        frame.camera.up = v3_make(0, 0, 0);   // unset: the world's up, as before
+        r_prepare(&frame, mesh_radius, NULL, 1280, 720, &scratch, &p);
+        CHECK(fabsf(p.frame.camera_up[1] - 1.0f) < 1e-5f);
         // No shading settings: plain Lambert, no tint (the shader multiplies by 1), no rim.
         CHECK(p.frame.ramp[0] == 0.0f && p.frame.ramp[1] == 0.0f && p.frame.ramp[2] == 0.0f);
         CHECK(p.frame.shadow_tint[0] == 1.0f && p.frame.shadow_tint[1] == 1.0f && p.frame.shadow_tint[2] == 1.0f);

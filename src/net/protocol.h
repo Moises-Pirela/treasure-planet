@@ -84,7 +84,7 @@ enum net_reject_reason { REJECT_VERSION = 1, REJECT_FULL, REJECT_TICKET, REJECT_
 // component ids (assigned at runtime) never leak into the protocol.
 enum net_component {
     NET_C_TRANSFORM, NET_C_SOLID, NET_C_ATTACHMENT, NET_C_VISUAL, NET_C_PLAYER, NET_C_SHIP, NET_C_PLANET,
-    NET_C_EQUIPMENT, NET_C_LOOT, NET_C_OWNED,
+    NET_C_EQUIPMENT, NET_C_LOOT, NET_C_OWNED, NET_C_CRAFT, NET_C_PART,
     NET_C_COUNT
 };
 
@@ -132,7 +132,9 @@ struct net_input_message {
     float view_ticks[NET_INPUT_REDUNDANCY];   // the server tick the client was rendering others at
 };
 // Inputs travel quantised (eighths of a percent, 16-bit angles); the client applies
-// this before predicting so that both sides simulate the same numbers.
+// this before predicting so that both sides simulate the same numbers. A helm's
+// controls (lift and the three turns) follow only when one of them is not zero, so
+// walking costs what it always did.
 void net_input_quantize(PlayerInput *in);
 
 struct net_redirect {

@@ -28,9 +28,14 @@ These are simplifications that will stop working, listed so that they are not mi
 
 ## 5. Ships players build and fly
 
-- **Ships only translate today:** they never rotate, which is what keeps every collision box axis-aligned. A pilotable ship has to turn, so players and hulls need collision in the ship's own frame, and carrying needs to become parenting.
-- Piloting, then ship construction, starting from the existing data: a ship is already a volume plus a list of parts.
-- Cargo: anything in a ship's volume should ride along, not only players (`system_ships` iterates over players for now).
+Begun: **crafts** (README, *Crafts*) are ships players own and fly, rigid bodies whose mass, inertia, thrust and torque come from their parts, with a flight computer, contacts with the land and the world's solids, and players aboard moving in the craft's own frame, so ships turn. Their pilot's client predicts them to the bit. What is left:
+
+- **Building ships.** A craft is already its parts and refits from them; what is missing is changing them: adding, removing and moving parts at the yard (and a way to show it), with the rules a design must keep (parts joined up, a helm, thrust enough to lift itself), and designs players own rather than the `DESIGNS` table.
+- **Keeping ships.** Crafts are not saved: one is handed out at the yard and put away a while after its owner leaves the server. They belong with the character, in the backend (social.h), like gear.
+- **Ships across zones.** A crew stays on its craft's server until it walks off; a craft flying into a place another zone owns should be handed over with everyone aboard, which is a ticket for a vessel, or crafts need a zone of their own.
+- **Physics still simplified:** thrusters push along the craft's axes only (any direction needs an allocation of thrust between them, a small optimisation), inertia is taken as principal along the craft's axes, crafts do not collide with each other, crew and cargo weigh nothing, a craft resting on a moving liner is not carried by it, and nobody sees anyone else's engines fire (the throttles are not replicated). Drag and radial gravity come with planets as places.
+- **Liners onto the same footing:** the timetable ships still carry by volume and only translate; they could be crafts flown by their timetable.
+- Cargo: anything in a ship's volume should ride along, not only players (`system_ships` iterates over players for now; a craft carries only players `Aboard`).
 
 ## 6. Economies
 

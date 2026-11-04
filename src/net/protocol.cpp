@@ -13,6 +13,20 @@ static v3 read_v3(cw_reader *r) {
     cw_reader_f32(r, &v.z);
     return v;
 }
+static void write_quat(cw_writer *w, quat q) {
+    cw_writer_f32(w, q.x);
+    cw_writer_f32(w, q.y);
+    cw_writer_f32(w, q.z);
+    cw_writer_f32(w, q.w);
+}
+static quat read_quat(cw_reader *r) {
+    quat q = {};
+    cw_reader_f32(r, &q.x);
+    cw_reader_f32(r, &q.y);
+    cw_reader_f32(r, &q.z);
+    cw_reader_f32(r, &q.w);
+    return quat_normalize(q);
+}
 static void write_name(cw_writer *w, const char *name) {
     uint8_t length = (uint8_t)strnlen(name, GAME_NAME_CAPACITY - 1);
     cw_writer_u8(w, length);
@@ -69,6 +83,8 @@ cw_component_id net_component_id(const game *g, int component) {
     case NET_C_EQUIPMENT: return g->c_equipment;
     case NET_C_LOOT: return g->c_loot;
     case NET_C_OWNED: return g->c_owned;
+    case NET_C_CRAFT: return g->c_craft;
+    case NET_C_PART: return g->c_part;
     default: return CW_INVALID_COMPONENT;
     }
 }
@@ -155,6 +171,43 @@ bool net_component_write(cw_writer *w, game *g, cw_entity_id id, int component) 
     }
     case NET_C_OWNED: {
         cw_writer_u64(w, CW_GET(world, id, g->c_owned, Owned)->account);
+        return true;
+    }
+    case NET_C_CRAFT: {
+        // Everything the pilot's client needs to fly it as the server does: its
+        // motion, and what its parts made of it. Snapshots keep the motion fresh.
+        const Craft *c = CW_GET(world, id, g->c_craft, Craft);
+        write_name(w, c->name);
+        cw_writer_u8(w, (uint8_t)c->design);
+        write_v3(w, c->cabin_center);
+        write_v3(w, c->cabin_half);
+        cw_writer_f32(w, c->radius);
+        cw_writer_f32(w, c->draft);
+        write_v3(w, c->helm);
+        cw_writer_i64(w, c->pilot);
+        cw_writer_i16(w, (int16_t)c->berth);
+        write_quat(w, c->orientation);
+        write_v3(w, c->velocity);
+        write_v3(w, c->spin);
+        cw_writer_u8(w, (uint8_t)((c->resting ? 1 : 0) | (c->assist ? 2 : 0)));
+        cw_writer_f32(w, c->mass);
+        write_v3(w, c->center);
+        write_v3(w, c->inertia);
+        for (int k = 0; k < CRAFT_GROUPS; ++k) {
+            cw_writer_f32(w, c->thrust[k]);
+            write_v3(w, c->thrust_torque[k]);
+            cw_writer_f32(w, c->top_speed[k]);
+        }
+        write_v3(w, c->gyro);
+        write_v3(w, c->top_rate);
+        return true;
+    }
+    case NET_C_PART: {
+        const Part *p = CW_GET(world, id, g->c_part, Part);
+        cw_writer_u8(w, (uint8_t)p->kind);
+        cw_writer_f32(w, p->mass);
+        write_v3(w, p->thrust);
+        cw_writer_f32(w, p->torque);
         return true;
     }
     default:
@@ -246,6 +299,53 @@ bool net_component_read(cw_reader *r, game *g, cw_entity_id id, int component) {
         Owned owned = {};
         cw_reader_u64(r, &owned.account);
         return cw_reader_ok(r) && cw_comp_set(world, id, g->c_owned, &owned, sizeof(owned));
+    }
+    case NET_C_CRAFT: {
+        Craft c = {};
+        uint8_t design = 0, flags = 0;
+        int16_t berth = 0;
+        if (!read_name(r, c.name)) return false;
+        cw_reader_u8(r, &design);
+        c.design = design;
+        c.cabin_center = read_v3(r);
+        c.cabin_half = read_v3(r);
+        cw_reader_f32(r, &c.radius);
+        cw_reader_f32(r, &c.draft);
+        c.helm = read_v3(r);
+        cw_reader_i64(r, &c.pilot);
+        cw_reader_i16(r, &berth);
+        c.berth = berth;
+        c.orientation = c.previous_orientation = read_quat(r);
+        c.velocity = read_v3(r);
+        c.spin = read_v3(r);
+        cw_reader_u8(r, &flags);
+        c.resting = (flags & 1) != 0;
+        c.assist = (flags & 2) != 0;
+        cw_reader_f32(r, &c.mass);
+        c.center = read_v3(r);
+        c.inertia = read_v3(r);
+        for (int k = 0; k < CRAFT_GROUPS; ++k) {
+            cw_reader_f32(r, &c.thrust[k]);
+            c.thrust_torque[k] = read_v3(r);
+            cw_reader_f32(r, &c.top_speed[k]);
+        }
+        c.gyro = read_v3(r);
+        c.top_rate = read_v3(r);
+        if (!cw_reader_ok(r)) return false;
+        // A mass or inertia that cannot be divided by would make the first tick of
+        // flight a nonsense: such a craft is left at rest, never flown.
+        if (!(c.mass > 0.0f) || !(c.inertia.x > 0.0f) || !(c.inertia.y > 0.0f) || !(c.inertia.z > 0.0f)) c.mass = 0.0f;
+        return cw_comp_set(world, id, g->c_craft, &c, sizeof(c));
+    }
+    case NET_C_PART: {
+        Part p = {};
+        uint8_t kind = 0;
+        cw_reader_u8(r, &kind);
+        p.kind = kind;
+        cw_reader_f32(r, &p.mass);
+        p.thrust = read_v3(r);
+        cw_reader_f32(r, &p.torque);
+        return cw_reader_ok(r) && cw_comp_set(world, id, g->c_part, &p, sizeof(p));
     }
     default:
         return false;
@@ -478,19 +578,50 @@ static int16_t pitch_q(float pitch) {
     float p = pitch * (32767.0f / TP_PI);
     return (int16_t)(int)(p > 32767.0f ? 32767.0f : p < -32767.0f ? -32767.0f : p < 0.0f ? p - 0.5f : p + 0.5f);
 }
-static PlayerInput input_dequantize(int8_t forward, int8_t strafe, uint16_t yaw, int16_t pitch, uint8_t flags) {
+// The wire's form of an input: axes in 127ths, angles in 16 bits, the buttons and
+// whether a helm's axes follow as flags.
+enum { INPUT_JUMP = 1, INPUT_ACT = 2, INPUT_USE = 4, INPUT_DECOUPLED = 8, INPUT_HELM = 16 };
+struct wire_input {
+    int8_t forward, strafe;
+    uint16_t yaw;
+    int16_t pitch;
+    uint8_t flags;
+    int8_t lift, turn_pitch, turn_yaw, turn_roll;
+};
+static wire_input input_to_wire(const PlayerInput *in) {
+    wire_input q = {};
+    q.forward = axis_q(in->forward);
+    q.strafe = axis_q(in->strafe);
+    q.yaw = yaw_q(in->yaw);
+    q.pitch = pitch_q(in->pitch);
+    q.lift = axis_q(in->lift);
+    q.turn_pitch = axis_q(in->turn_pitch);
+    q.turn_yaw = axis_q(in->turn_yaw);
+    q.turn_roll = axis_q(in->turn_roll);
+    bool helm = q.lift || q.turn_pitch || q.turn_yaw || q.turn_roll;
+    q.flags = (uint8_t)((in->jump ? INPUT_JUMP : 0) | (in->act ? INPUT_ACT : 0) | (in->use ? INPUT_USE : 0)
+                        | (in->decoupled ? INPUT_DECOUPLED : 0) | (helm ? INPUT_HELM : 0));
+    return q;
+}
+static PlayerInput input_from_wire(const wire_input *q) {
     PlayerInput in = {};
-    in.forward = (float)forward / 127.0f;
-    in.strafe = (float)strafe / 127.0f;
-    in.yaw = (float)yaw * (2.0f * TP_PI / 65536.0f);
-    in.pitch = (float)pitch * (TP_PI / 32767.0f);
-    in.jump = (flags & 1) != 0;
-    in.act = (flags & 2) != 0;
+    in.forward = (float)q->forward / 127.0f;
+    in.strafe = (float)q->strafe / 127.0f;
+    in.yaw = (float)q->yaw * (2.0f * TP_PI / 65536.0f);
+    in.pitch = (float)q->pitch * (TP_PI / 32767.0f);
+    in.jump = (q->flags & INPUT_JUMP) != 0;
+    in.act = (q->flags & INPUT_ACT) != 0;
+    in.use = (q->flags & INPUT_USE) != 0;
+    in.decoupled = (q->flags & INPUT_DECOUPLED) != 0;
+    in.lift = (float)q->lift / 127.0f;
+    in.turn_pitch = (float)q->turn_pitch / 127.0f;
+    in.turn_yaw = (float)q->turn_yaw / 127.0f;
+    in.turn_roll = (float)q->turn_roll / 127.0f;
     return in;
 }
 void net_input_quantize(PlayerInput *in) {
-    *in = input_dequantize(axis_q(in->forward), axis_q(in->strafe), yaw_q(in->yaw), pitch_q(in->pitch),
-                           (uint8_t)((in->jump ? 1 : 0) | (in->act ? 2 : 0)));
+    wire_input q = input_to_wire(in);
+    *in = input_from_wire(&q);
 }
 
 void net_input_write(cw_writer *w, const net_input_message *m) {
@@ -498,12 +629,18 @@ void net_input_write(cw_writer *w, const net_input_message *m) {
     cw_writer_u32(w, m->ack_tick);
     cw_writer_u8(w, (uint8_t)m->count);
     for (uint32_t i = 0; i < m->count && i < NET_INPUT_REDUNDANCY; ++i) {
-        const PlayerInput *in = &m->inputs[i];
-        cw_writer_i8(w, axis_q(in->forward));
-        cw_writer_i8(w, axis_q(in->strafe));
-        cw_writer_u16(w, yaw_q(in->yaw));
-        cw_writer_i16(w, pitch_q(in->pitch));
-        cw_writer_u8(w, (uint8_t)((in->jump ? 1 : 0) | (in->act ? 2 : 0)));
+        wire_input q = input_to_wire(&m->inputs[i]);
+        cw_writer_i8(w, q.forward);
+        cw_writer_i8(w, q.strafe);
+        cw_writer_u16(w, q.yaw);
+        cw_writer_i16(w, q.pitch);
+        cw_writer_u8(w, q.flags);
+        if (q.flags & INPUT_HELM) {
+            cw_writer_i8(w, q.lift);
+            cw_writer_i8(w, q.turn_pitch);
+            cw_writer_i8(w, q.turn_yaw);
+            cw_writer_i8(w, q.turn_roll);
+        }
         float view = m->view_ticks[i] < 0.0f ? 0.0f : m->view_ticks[i];
         cw_writer_u32(w, (uint32_t)view);
         cw_writer_u8(w, (uint8_t)((view - floorf(view)) * 255.0f));
@@ -518,19 +655,23 @@ bool net_input_read(cw_reader *r, net_input_message *m) {
     if (count == 0 || count > NET_INPUT_REDUNDANCY) return false;
     m->count = count;
     for (uint32_t i = 0; i < m->count; ++i) {
-        int8_t forward = 0, strafe = 0;
-        uint16_t yaw = 0;
-        int16_t pitch = 0;
-        uint8_t flags = 0, fraction = 0;
+        wire_input q = {};
+        uint8_t fraction = 0;
         uint32_t view = 0;
-        cw_reader_i8(r, &forward);
-        cw_reader_i8(r, &strafe);
-        cw_reader_u16(r, &yaw);
-        cw_reader_i16(r, &pitch);
-        cw_reader_u8(r, &flags);
+        cw_reader_i8(r, &q.forward);
+        cw_reader_i8(r, &q.strafe);
+        cw_reader_u16(r, &q.yaw);
+        cw_reader_i16(r, &q.pitch);
+        cw_reader_u8(r, &q.flags);
+        if (q.flags & INPUT_HELM) {
+            cw_reader_i8(r, &q.lift);
+            cw_reader_i8(r, &q.turn_pitch);
+            cw_reader_i8(r, &q.turn_yaw);
+            cw_reader_i8(r, &q.turn_roll);
+        }
         cw_reader_u32(r, &view);
         cw_reader_u8(r, &fraction);
-        m->inputs[i] = input_dequantize(forward, strafe, yaw, pitch, flags);
+        m->inputs[i] = input_from_wire(&q);
         m->view_ticks[i] = (float)view + (float)fraction / 255.0f;
     }
     return cw_reader_ok(r);

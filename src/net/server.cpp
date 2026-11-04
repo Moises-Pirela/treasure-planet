@@ -16,6 +16,7 @@ server_config server_config_default(void) {
     c.bandwidth = SERVER_BANDWIDTH;
     c.linger_quit = SERVER_LINGER_QUIT;
     c.linger_timeout = SERVER_LINGER_TIMEOUT;
+    c.craft_linger = SERVER_CRAFT_LINGER;
     c.inbound_packets = SERVER_INBOUND_PACKETS;
     c.inbound_bytes = SERVER_INBOUND_BYTES;
     c.unconnected_per_ip = SERVER_UNCONNECTED_PER_IP;
@@ -96,6 +97,9 @@ static server_world *world_add(server *s, int kind, game *g) {
     world->c_trail = cw_comp_block(&g->world, 1);
     cw_comp_register(&g->world, world->c_trail, sizeof(Trail), alignof(Trail), "Trail", NULL);
     cw_comp_set_transient(&g->world, world->c_trail, true);
+    world->c_keep = cw_comp_block(&g->world, 1);
+    cw_comp_register(&g->world, world->c_keep, sizeof(CraftKeep), alignof(CraftKeep), "CraftKeep", NULL);
+    cw_comp_set_transient(&g->world, world->c_keep, true);
     cw_system_desc d = {};
     d.name = "net_record_created";
     d.phases = CW_PHASE(CW_ENTITY_CREATED);
@@ -208,6 +212,7 @@ static PlayerInput input_queue_apply(input_queue *q) {
     PlayerInput repeat = q->last;
     repeat.jump = false;
     repeat.act = false;
+    repeat.use = false;   // an edge, like the others: taken once, never repeated
     return repeat;
 }
 
@@ -226,11 +231,9 @@ static void record_trails(server_world *world) {
             cw_comp_set(w, id, world->c_trail, &fresh, sizeof(fresh));
         }
         Trail *trail = CW_GET(w, id, world->c_trail, Trail);
-        const Transform *t = CW_GET(w, id, g->c_transform, Transform);
-        cw_entity_id aboard = game_ship_at(g, t->position);
+        cw_entity_id aboard = CW_INVALID_ENTITY;
         int slot = (int)(tick % SERVER_TRAIL_TICKS);
-        trail->positions[slot] = aboard != CW_INVALID_ENTITY
-            ? v3_sub(t->position, CW_GET(w, aboard, g->c_transform, Transform)->position) : t->position;
+        trail->positions[slot] = game_player_frame(g, id, &aboard);
         trail->aboard[slot] = aboard;
         trail->ticks[slot] = tick;
     }
@@ -249,11 +252,8 @@ static v3 trail_position(server_world *world, cw_entity_id id, double view_tick)
     const int a = (int)(before % SERVER_TRAIL_TICKS), b = (int)(after % SERVER_TRAIL_TICKS);
     if (trail->ticks[a] != before || trail->ticks[b] != after) return t->position;
     float f = (float)(view_tick - (double)before);
-    v3 pa = trail->positions[a], pb = trail->positions[b];
-    if (trail->aboard[a] != CW_INVALID_ENTITY && cw_comp_has(w, trail->aboard[a], g->c_transform))
-        pa = v3_add(pa, CW_GET(w, trail->aboard[a], g->c_transform, Transform)->position);
-    if (trail->aboard[b] != CW_INVALID_ENTITY && cw_comp_has(w, trail->aboard[b], g->c_transform))
-        pb = v3_add(pb, CW_GET(w, trail->aboard[b], g->c_transform, Transform)->position);
+    v3 pa = game_frame_to_world(g, trail->aboard[a], trail->positions[a]);
+    v3 pb = game_frame_to_world(g, trail->aboard[b], trail->positions[b]);
     return v3_lerp(pa, pb, f);
 }
 
@@ -271,8 +271,8 @@ static void resolve_swings(server *s) {
         if (attacker->swing_cooldown > 0.0f) continue;
         attacker->swing_cooldown = PLAYER_SWING_COOLDOWN;
         ++s->swings;
-        v3 eye = v3_add(CW_GET(w, c->player, g->c_transform, Transform)->position, v3_make(0, PLAYER_EYE, 0));
-        v3 direction = look_direction(attacker->yaw, attacker->pitch);
+        v3 eye, direction;
+        game_player_view(g, c->player, &eye, &direction);
         cw_entity_id best = CW_INVALID_ENTITY;
         float best_distance = 1e30f;
         cw_query players = cw_query_begin(g->q_all_players);
@@ -530,7 +530,7 @@ static void build_snapshot(server *s, server_client *c, int wanted) {
     bool reselect = c->selection_count == 0 || c->selection_count > wanted
         || snap->tick - c->selection_tick >= (uint32_t)(SERVER_RESELECT_EVERY * s->snapshot_every);
     if (reselect) {
-        size_t players = cw_query_count(g->q_all_players);
+        size_t players = cw_query_count(g->q_all_players) + cw_query_count(g->q_crafts);
         if (players > s->candidate_capacity) {
             s->candidate_capacity = players * 2;
             s->candidates = realloc(s->candidates, s->candidate_capacity * sizeof(candidate));
@@ -564,6 +564,19 @@ static void build_snapshot(server *s, server_client *c, int wanted) {
             float age = last ? (float)(snap->tick - last) / (float)SNAPSHOT_EVERY : 60.0f;   // in snapshots missed
             candidates[n].id = id;
             candidates[n].priority = id == c->player ? -1.0f : distance2 / ((1.0f + age) * (1.0f + age));   // the long unseen come round
+            ++n;
+        }
+        // Crafts are scenery (every client has their records) that moves: always
+        // candidates, ahead of a player as far away, and the one this client stands
+        // in or flies first of all, since its own position is reckoned against it.
+        cw_entity_id carrying = game_aboard(g, c->player);
+        cw_query crafts = cw_query_begin(g->q_crafts);
+        while (cw_query_next(&crafts, &id)) {
+            v3 d = v3_sub(CW_GET(w, id, g->c_transform, Transform)->position, own);
+            uint32_t last = last_relevant_of(c, id);
+            float age = last ? (float)(snap->tick - last) / (float)SNAPSHOT_EVERY : 60.0f;
+            candidates[n].id = id;
+            candidates[n].priority = id == carrying ? -1.0f : 0.25f * v3_dot(d, d) / ((1.0f + age) * (1.0f + age));
             ++n;
         }
         if (relevance[RELEVANCE_LOOT].radius > 0.0f) {
@@ -601,15 +614,27 @@ static void build_snapshot(server *s, server_client *c, int wanted) {
     }
     for (int i = 0; i < c->selection_count; ++i) {
         cw_entity_id id = c->selection[i];
-        if (!cw_world_is_valid(w, id) || !cw_comp_has(w, id, g->c_player)) continue;   // gone since chosen
-        const Transform *t = CW_GET(w, id, g->c_transform, Transform);
+        if (!cw_world_is_valid(w, id)) continue;   // gone since chosen
+        if (cw_comp_has(w, id, g->c_craft)) {
+            const Craft *craft = CW_GET(w, id, g->c_craft, Craft);
+            snapshot_entry e = snapshot_entry_craft(id, CW_GET(w, id, g->c_transform, Transform)->position, craft->velocity,
+                                                    craft->orientation, craft->spin, craft->pilot, craft->resting, craft->assist);
+            e.priority = game_aboard(g, c->player) == id ? -1.0f : (float)i;
+            snap->entries[snap->count++] = e;
+            continue;
+        }
+        if (!cw_comp_has(w, id, g->c_player)) continue;
         const Player *p = CW_GET(w, id, g->c_player, Player);
-        // The trail recorded this tick already knows the ship, and the relative position.
+        // The trail recorded this tick already knows the frame, and the position in it.
         const Trail *trail = cw_comp_has(w, id, world->c_trail) ? CW_GET(w, id, world->c_trail, Trail) : NULL;
-        cw_entity_id aboard = trail && trail->ticks[slot] == snap->tick ? trail->aboard[slot] : game_ship_at(g, t->position);
-        v3 position = t->position;
-        if (aboard != CW_INVALID_ENTITY)
-            position = v3_sub(position, CW_GET(w, aboard, g->c_transform, Transform)->position);
+        cw_entity_id aboard = CW_INVALID_ENTITY;
+        v3 position;
+        if (trail && trail->ticks[slot] == snap->tick) {
+            aboard = trail->aboard[slot];
+            position = trail->positions[slot];
+        } else {
+            position = game_player_frame(g, id, &aboard);
+        }
         snapshot_entry e = snapshot_entry_make(id, aboard, position, p->velocity, p->yaw, p->pitch, p->grounded,
                                                p->hits_made, p->hits_taken);
         e.priority = id == c->player ? -1.0f : (float)i;   // the order they were chosen in
@@ -1176,11 +1201,11 @@ static void accept_client(server *s, net_address from, const net_connect_message
     welcome.place_count = g->place_count;
     memcpy(welcome.places, g->places, sizeof(welcome.places));
     cw_writer w;
-    cw_writer_init_fixed(&w, s->scratch, NET_MAX_PAYLOAD);
+    cw_writer_init_fixed(&w, s->big, NET_MAX_MESSAGE);   // the places may take more than a packet
     net_welcome_write(&w, &welcome);
     // The first reliable message on the connection. The client has no session yet and
     // adopts the one stamped on the packet that delivers this.
-    net_connection_send(&c->connection, MSG_WELCOME, NET_RELIABLE_ORDERED, s->scratch, w.size);
+    net_connection_send(&c->connection, MSG_WELCOME, NET_RELIABLE_ORDERED, s->big, w.size);
     send_baseline(s, c);
     report_presence(s, c, PRESENCE_ARRIVED, now);
     if (c->gear_known) {
@@ -1387,6 +1412,9 @@ static void check_handoffs(server *s, double now) {
         server_client *c = &s->clients[i];
         if (c->state != CLIENT_ACTIVE || now - c->redirected_at < SERVER_HANDOFF_RETRY) continue;
         game *g = c->world->g;
+        // A craft's crew stays with the craft, and the craft with the server that
+        // simulates it: hand-offs are for those who walk (see README, Crafts).
+        if (game_aboard(g, c->player) != CW_INVALID_ENTITY) continue;
         const Transform *t = CW_GET(&g->world, c->player, g->c_transform, Transform);
         int place = game_place_at(g, t->position);
         if (place < 0) continue;
@@ -1419,6 +1447,7 @@ bool server_init(server *s, const server_config *config) {
     if (s->config.bandwidth == 0) s->config.bandwidth = SERVER_BANDWIDTH;
     if (s->config.linger_quit < 0.0) s->config.linger_quit = 0.0;
     if (s->config.linger_timeout < 0.0) s->config.linger_timeout = 0.0;
+    if (s->config.craft_linger <= 0.0) s->config.craft_linger = SERVER_CRAFT_LINGER;
     // The zone table to start from.
     net_zones_init(&s->zones);
     if (s->config.zones) {
@@ -1539,8 +1568,9 @@ static void apply_inputs(server *s) {
         if (c->state == CLIENT_HANDING_OFF) {
             // Frozen: the ticket described this player standing here, and the other
             // world will pick up from exactly that. Looking around still works.
-            in->forward = in->strafe = 0.0f;
-            in->jump = false;
+            in->forward = in->strafe = in->lift = 0.0f;
+            in->turn_pitch = in->turn_yaw = in->turn_roll = 0.0f;
+            in->jump = in->use = false;
         }
     }
 }
@@ -1574,6 +1604,34 @@ void server_update(server *s, double now) {
             if (s->config.verbose) fprintf(stderr, "server: player %lld never left; unfrozen\n", (long long)c->player);
         }
     }
+    // Crafts whose owners are on none of this server's worlds wait for them a while
+    // (a dungeon, a dropped connection, a walk to a planet another zone owns and
+    // back), then are put away; whoever is aboard is set down where they stand.
+    for (int i = 0; i < s->world_count && now - s->last_craft_sweep >= 1.0; ++i) {
+        server_world *world = s->worlds[i];
+        game *g = world->g;
+        cw_query crafts = cw_query_begin(g->q_crafts);
+        cw_entity_id id;
+        while (cw_query_next(&crafts, &id)) {
+            uint64_t owner = game_owner(g, id);
+            if (!owner) continue;   // nobody's: the world's own, kept
+            if (!cw_comp_has(&g->world, id, world->c_keep)) {
+                CraftKeep fresh = {};
+                cw_comp_set(&g->world, id, world->c_keep, &fresh, sizeof(fresh));
+            }
+            CraftKeep *keep = CW_GET(&g->world, id, world->c_keep, CraftKeep);
+            if (server_client_of_account(s, owner)) keep->owner_gone_since = 0.0;
+            else if (keep->owner_gone_since == 0.0) keep->owner_gone_since = now;
+            else if (now - keep->owner_gone_since > s->config.craft_linger) {
+                game_despawn_craft(g, id);
+                if (s->config.verbose)
+                    fprintf(stderr, "server: put away a craft of %llx, its owner long gone\n", (unsigned long long)owner);
+            }
+        }
+    }
+
+    if (now - s->last_craft_sweep >= 1.0) s->last_craft_sweep = now;
+
     // Instances nobody has come back to.
     for (int i = s->world_count - 1; i >= 0; --i) {
         server_world *world = s->worlds[i];
@@ -1714,9 +1772,11 @@ void server_update(server *s, double now) {
             game *g = c->world->g;
             v3 at = CW_GET(&g->world, c->player, g->c_transform, Transform)->position;
             int place = game_place_at(g, at);
+            cw_entity_id frame = CW_INVALID_ENTITY;
+            game_player_frame(g, c->player, &frame);
             fprintf(stderr, "trace: tick %llu player %lld in %s at %.2f %.2f %.2f, %s, aboard %lld, input %u applied %u starved %u skipped %u\n",
                     (unsigned long long)g->world.tick, (long long)c->player, world_name(c->world), at.x, at.y, at.z,
-                    place >= 0 ? g->places[place].name : "between places", (long long)game_ship_at(g, at),
+                    place >= 0 ? g->places[place].name : "between places", (long long)frame,
                     c->inputs.newest, c->inputs.last_applied, c->inputs.starved, c->inputs.skipped);
         }
     }

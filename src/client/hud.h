@@ -34,6 +34,8 @@ struct hud_frame {
     r_mesh quad;                 // a cube mesh does: it is scaled flat
 };
 hud_frame hud_begin(v3 eye, float yaw, float pitch, float aspect, r_mesh cube);
+// The same for a camera that may be rolled: `up` need only be roughly up.
+hud_frame hud_begin_view(v3 eye, v3 forward, v3 up, float aspect, r_mesh cube);
 
 // Draws `text` with its top-left (or top-right, when right_aligned) at (x, y) in
 // screen units, each pixel `pixel` screen units wide. Lowercase is drawn as capitals.
@@ -49,6 +51,19 @@ void hud_party(draw_list *list, const hud_frame *frame, const party_view *party,
 void hud_gear(draw_list *list, const hud_frame *frame, const character *gear, const item *last_pickup, float pickup_flash);
 // Loot in view, bottom centre: its name in its rarity's colour.
 void hud_loot(draw_list *list, const hud_frame *frame, const item *it);
+// At a helm, bottom left: the craft, how fast it goes and climbs, the flight
+// computer's state, what its thrusters are doing, and the keys; and in the middle
+// of the screen the stick: a ring where it rests and a mark where it is.
+struct hud_flight_view {
+    const char *craft;
+    float speed, climb;          // m/s, and m/s up the world's y
+    bool assist;
+    float stick_x, stick_y;      // -1..1, right and up
+    float throttle[CRAFT_GROUPS];    // 0..1 per thruster group (game.h)
+};
+void hud_flight(draw_list *list, const hud_frame *frame, const hud_flight_view *view);
+// A line of advice above the bottom centre: what a key would do here.
+void hud_prompt(draw_list *list, const hud_frame *frame, const char *text, v3 color);
 // What a player wears, drawn on their capsule: a box per slot, coloured by rarity.
 void hud_draw_gear(draw_list *list, r_mesh cube, v3 feet, float yaw, const Equipment *gear);
 

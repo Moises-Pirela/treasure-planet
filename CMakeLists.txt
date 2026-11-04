@@ -39,7 +39,7 @@ add_library(tp_ecs STATIC
     src/ecs/cw_snapshot.cpp src/ecs/cw_file.cpp src/ecs/cw_sim.cpp)
 tp_strict(tp_ecs)
 
-add_library(tp_game STATIC src/game/game.cpp src/game/universe.cpp src/game/planet.cpp src/game/dungeon.cpp src/game/items.cpp)
+add_library(tp_game STATIC src/game/game.cpp src/game/craft.cpp src/game/universe.cpp src/game/planet.cpp src/game/dungeon.cpp src/game/items.cpp)
 target_link_libraries(tp_game PUBLIC tp_ecs)
 tp_strict(tp_game)
 if(NOT WIN32)

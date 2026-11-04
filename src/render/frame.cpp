@@ -554,9 +554,10 @@ void r_prepare(const r_frame *frame, const float *mesh_radius, const r_shader_se
 
     // The camera.
     v3 forward = v3_normalize(camera->forward);
-    v3 right = v3_normalize(v3_cross(forward, v3_make(0, 1, 0)));
+    v3 up_hint = v3_dot(camera->up, camera->up) > 0.0f ? v3_normalize(camera->up) : v3_make(0, 1, 0);
+    v3 right = v3_normalize(v3_cross(forward, up_hint));
     v3 up = v3_cross(right, forward);
-    m4 view = m4_look_to(camera->position, forward);
+    m4 view = m4_look_to_up(camera->position, forward, up_hint);
     m4 projection = m4_perspective(camera->fov_y, aspect, camera->near_plane);
     gpu->view_proj = m4_mul(projection, view);
     float tan_y = tanf(camera->fov_y * 0.5f);

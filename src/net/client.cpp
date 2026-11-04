@@ -36,13 +36,19 @@ static void replica_push(Replica *r, const net_sample *s) {
     r->last_seen_tick = s->tick;
 }
 
-// A sample's position in world space, given where its ship is now (or was).
+// A sample's position in world space, given where its ship is now (or was): a
+// liner's offset, or a point in a craft's frame.
 static v3 sample_world(const net_client *c, const net_sample *s, bool previous) {
     if (s->aboard == CW_INVALID_ENTITY) return s->position;
     game *g = c->replica;
     if (!cw_comp_has(&g->world, s->aboard, g->c_transform)) return s->position;
     const Transform *ship = CW_GET(&g->world, s->aboard, g->c_transform, Transform);
-    return v3_add(previous ? ship->previous : ship->position, s->position);
+    v3 local = s->position;
+    if (cw_comp_has(&g->world, s->aboard, g->c_craft)) {
+        const Craft *craft = CW_GET(&g->world, s->aboard, g->c_craft, Craft);
+        local = quat_rotate(previous ? craft->previous_orientation : craft->orientation, local);
+    }
+    return v3_add(previous ? ship->previous : ship->position, local);
 }
 
 // Where the samples put the player at `tick`, placed against the ship's position
@@ -56,7 +62,9 @@ static v3 replica_position(const net_client *c, const Replica *r, double tick, b
         if (ahead > NET_EXTRAPOLATE) ahead = NET_EXTRAPOLATE;
         if (ahead < 0.0f) ahead = 0.0f;
         v3 velocity = newest->velocity;
-        velocity.y = 0.0f;   // gravity is the server's business
+        if (newest->aboard != CW_INVALID_ENTITY && cw_comp_has(&c->replica->world, newest->aboard, c->replica->c_craft))
+            velocity = v3_make(0, 0, 0);   // walking in a craft's frame: where it goes, they go
+        else if (!newest->craft) velocity.y = 0.0f;   // gravity is the server's business; a craft holds itself up
         return v3_add(sample_world(c, newest, previous), v3_scale(velocity, ahead));
     }
     const net_sample *oldest = sample_at(r, 0);
@@ -69,6 +77,26 @@ static v3 replica_position(const net_client *c, const Replica *r, double tick, b
         }
     }
     return sample_world(c, newest, previous);
+}
+
+// A craft's orientation at `tick`, the same way: between the samples around it, or
+// turned on at its last spin for a while past the newest.
+static quat replica_orientation(const Replica *r, double tick) {
+    const net_sample *newest = sample_at(r, r->count - 1);
+    if (r->count == 1 || tick >= (double)newest->tick) {
+        float ahead = (float)(tick - (double)newest->tick) / (float)GAME_TICK_HZ;
+        if (ahead > NET_EXTRAPOLATE) ahead = NET_EXTRAPOLATE;
+        if (ahead < 0.0f) ahead = 0.0f;
+        return quat_integrate(newest->orientation, newest->spin, ahead);
+    }
+    const net_sample *oldest = sample_at(r, 0);
+    if (tick <= (double)oldest->tick) return oldest->orientation;
+    for (int i = r->count - 2; i >= 0; --i) {
+        const net_sample *a = sample_at(r, i), *b = sample_at(r, i + 1);
+        if ((double)a->tick <= tick)
+            return quat_nlerp(a->orientation, b->orientation, (float)((tick - (double)a->tick) / (double)(b->tick - a->tick)));
+    }
+    return newest->orientation;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,8 +112,33 @@ static predicted_input *history_of(net_client *c, uint32_t seq) {
     return h->seq == seq ? h : NULL;
 }
 
-// The server's word on our player as of tick `tick`, with input `applied` in it.
-static void reconcile(net_client *c, const snapshot_entry *e, uint32_t tick, uint32_t applied) {
+// A craft's state as a snapshot has it, exactly, with nothing to sweep from.
+static void craft_from_entry(game *g, cw_entity_id id, const snapshot_entry *e) {
+    cw_world *w = &g->world;
+    Craft *craft = CW_GET(w, id, g->c_craft, Craft);
+    Transform *t = CW_GET(w, id, g->c_transform, Transform);
+    v3 position;
+    snapshot_craft_state(e, &position, &craft->velocity, &craft->orientation, &craft->spin);
+    craft->orientation = quat_normalize(craft->orientation);
+    craft->previous_orientation = craft->orientation;
+    t->position = t->previous = position;
+    craft->pilot = e->pilot;
+    craft->resting = (e->flags & SNAP_RESTING) != 0;
+    craft->assist = (e->flags & SNAP_ASSIST) != 0;
+    craft->quiet_ticks = 0;
+}
+
+// Where our player is in the frame that moves them: the craft's (aboard one) or the world's.
+static v3 own_frame_position(game *g, cw_entity_id player, cw_entity_id *craft) {
+    *craft = game_aboard(g, player);
+    if (*craft != CW_INVALID_ENTITY) return CW_GET(&g->world, player, g->c_aboard, Aboard)->position;
+    return CW_GET(&g->world, player, g->c_transform, Transform)->position;
+}
+
+// The server's word on our player as of tick `tick`, with input `applied` in it;
+// and on the crafts we fly (`crafts`, that snapshot's entries for them).
+static void reconcile(net_client *c, const snapshot_entry *e, uint32_t tick, uint32_t applied,
+                      const snapshot_entry *const *crafts, int craft_count) {
     game *g = c->replica;
     cw_world *w = &g->world;
     if (!cw_world_is_valid(w, c->player) || !c->clock_started) return;
@@ -94,23 +147,43 @@ static void reconcile(net_client *c, const snapshot_entry *e, uint32_t tick, uin
         w->tick = tick;
         return;
     }
+    // A frame we have not heard of yet (a craft's record still on its way behind
+    // this snapshot) would put us nowhere: the next snapshot will do.
+    if (e->aboard != CW_INVALID_ENTITY && !cw_world_is_valid(w, e->aboard)) return;
     Transform *t = CW_GET(w, c->player, g->c_transform, Transform);
     Player *p = CW_GET(w, c->player, g->c_player, Player);
 
-    // The server's position in world space: ships are where the timetable had them
-    // at that tick, which we can compute without having been there.
-    v3 server_position = snapshot_position(e);
-    if (e->aboard != CW_INVALID_ENTITY && cw_comp_has(w, e->aboard, g->c_ship)) {
-        Ship ship = *CW_GET(w, e->aboard, g->c_ship, Ship);
-        server_position = v3_add(game_ship_at_time(&ship, game_time_of_tick(g, tick)), server_position);
-    }
-
-    v3 before = t->position;
+    cw_entity_id frame_before;
+    v3 before = own_frame_position(g, c->player, &frame_before);
     uint64_t tick_before = w->tick;
     PlayerInput current = *CW_GET(w, c->player, g->c_input, PlayerInput);
 
-    t->position = t->previous = server_position;
+    // The crafts we fly, as they were at that tick: their flight is ours to replay.
+    v3 predicted[NET_FLOWN_CRAFTS];
+    for (int i = 0; i < craft_count; ++i) {
+        predicted[i] = CW_GET(w, crafts[i]->id, g->c_transform, Transform)->position;
+        craft_from_entry(g, crafts[i]->id, crafts[i]);
+    }
+
+    // Our player. In a craft, in its frame: that is the whole of where we are. Else
+    // the server's position in world space: ships are where the timetable had them
+    // at that tick, which we can compute without having been there.
+    v3 server_position = snapshot_position(e);
     p->velocity = snapshot_velocity(e);
+    if (e->aboard != CW_INVALID_ENTITY && cw_comp_has(w, e->aboard, g->c_craft)) {
+        Aboard a = {};
+        a.craft = e->aboard;
+        a.position = a.previous = server_position;
+        cw_comp_set(w, c->player, g->c_aboard, &a, sizeof(a));
+        server_position = game_craft_to_world(g, e->aboard, server_position);
+    } else {
+        if (cw_comp_has(w, c->player, g->c_aboard)) cw_comp_remove(w, c->player, g->c_aboard);
+        if (e->aboard != CW_INVALID_ENTITY && cw_comp_has(w, e->aboard, g->c_ship)) {
+            Ship ship = *CW_GET(w, e->aboard, g->c_ship, Ship);
+            server_position = v3_add(game_ship_at_time(&ship, game_time_of_tick(g, tick)), server_position);
+        }
+    }
+    t->position = t->previous = server_position;
     p->grounded = (e->flags & SNAP_GROUNDED) != 0;
     if (e->hits_taken != p->hits_taken) c->hit_flash = NET_HIT_FLASH;   // the server's word: we were tagged
     p->hits_taken = e->hits_taken;
@@ -134,14 +207,32 @@ static void reconcile(net_client *c, const snapshot_entry *e, uint32_t tick, uin
         game_place_ships(g);
     }
     *CW_GET(w, c->player, g->c_input, PlayerInput) = current;
+    c->craft_error = 0.0f;
+    for (int i = 0; i < craft_count; ++i) {
+        float off = v3_length(v3_sub(CW_GET(w, crafts[i]->id, g->c_transform, Transform)->position, predicted[i]));
+        if (off > c->craft_error) c->craft_error = off;
+    }
 
-    v3 delta = v3_sub(t->position, before);
-    float error = v3_length(delta);
+    // The misprediction, in the frame we stand in, if it is the one we stood in: a
+    // step across into or out of a craft is not smoothed, it is where we are.
+    cw_entity_id frame_after;
+    v3 after = own_frame_position(g, c->player, &frame_after);
+    v3 delta = v3_sub(after, before);
+    float error = frame_after == frame_before ? v3_length(delta) : 0.0f;
     c->last_error = error;
+    if (frame_after != frame_before || frame_after != c->correction_frame) {
+        c->correction = v3_make(0, 0, 0);
+        c->correction_frame = frame_after;
+    }
     if (error > 0.0f) {
         // The simulation is corrected now; the picture catches up gradually.
         c->correction = error < NET_CORRECTION_SNAP ? v3_sub(c->correction, delta) : v3_make(0, 0, 0);
-        t->previous = v3_add(t->previous, delta);
+        if (frame_after != CW_INVALID_ENTITY) {
+            Aboard *a = CW_GET(w, c->player, g->c_aboard, Aboard);
+            a->previous = v3_add(a->previous, delta);
+        } else {
+            t->previous = v3_add(t->previous, delta);
+        }
     }
     if (w->tick != tick_before) {
         // The tick counter moved: the ships' previous positions are from another
@@ -239,11 +330,41 @@ static void on_snapshot(net_client *c, cw_reader *r, double now) {
     }
     ++c->snapshots_received;
 
+    // Crafts first: the ones we fly are rewound with our player; the rest are
+    // sampled, and whoever stands in them is placed against them.
+    const snapshot_entry *flown[NET_FLOWN_CRAFTS];
+    int flown_count = 0;
     for (uint16_t i = 0; i < snap->count; ++i) {
         const snapshot_entry *e = &snap->entries[i];
+        if (!(e->flags & SNAP_CRAFT) || !cw_world_is_valid(w, e->id) || !cw_comp_has(w, e->id, g->c_craft)) continue;
+        Craft *craft = CW_GET(w, e->id, g->c_craft, Craft);
+        if ((e->pilot == c->player || craft->pilot == c->player) && c->player != CW_INVALID_ENTITY && !c->lightweight) {
+            if (flown_count < NET_FLOWN_CRAFTS) flown[flown_count++] = e;
+            // Its samples are from before we flew it: once we let go, it is drawn
+            // as predicted until fresh ones come, not back where we took it.
+            if (cw_comp_has(w, e->id, c->c_replica)) CW_GET(w, e->id, c->c_replica, Replica)->count = 0;
+            continue;
+        }
+        net_sample s = {};
+        s.tick = tick;
+        s.aboard = CW_INVALID_ENTITY;
+        s.craft = true;
+        snapshot_craft_state(e, &s.position, &s.velocity, &s.orientation, &s.spin);
+        s.orientation = quat_normalize(s.orientation);
+        replica_push(replica_of(c, e->id), &s);
+        craft->pilot = e->pilot;
+        craft->resting = (e->flags & SNAP_RESTING) != 0;
+        craft->assist = (e->flags & SNAP_ASSIST) != 0;
+        craft->velocity = s.velocity;
+        craft->spin = s.spin;
+    }
+    for (uint16_t i = 0; i < snap->count; ++i) {
+        const snapshot_entry *e = &snap->entries[i];
+        if (e->flags & SNAP_CRAFT) continue;
         if (!cw_world_is_valid(w, e->id)) continue;   // its spawn is still on the way
+        if (e->id != c->player && e->aboard != CW_INVALID_ENTITY && !cw_world_is_valid(w, e->aboard)) continue;   // ...or its craft's
         if (e->id == c->player) {
-            reconcile(c, e, tick, snap->last_input_seq);
+            reconcile(c, e, tick, snap->last_input_seq, flown, flown_count);
             continue;
         }
         net_sample s = {tick, e->aboard, snapshot_position(e), snapshot_velocity(e), snapshot_yaw(e), snapshot_pitch(e)};
@@ -460,9 +581,8 @@ bool net_client_loot_in_view(const net_client *c, float reach, item *out) {
     game *g = c->replica;
     cw_world *w = &g->world;
     if (!cw_world_is_valid(w, c->player)) return false;
-    v3 eye = v3_add(CW_GET(w, c->player, g->c_transform, Transform)->position, v3_make(0, PLAYER_EYE, 0));
-    const Player *self = CW_GET(w, c->player, g->c_player, Player);
-    v3 direction = look_direction(self->yaw, self->pitch);
+    v3 eye, direction;
+    game_player_view(g, c->player, &eye, &direction);
     float best = reach;
     bool found = false;
     cw_query loot = cw_query_begin(g->q_loot);
@@ -487,9 +607,8 @@ bool net_client_player_in_view(const net_client *c, float reach, char name[ACCOU
     cw_world *w = &g->world;
     if (!cw_world_is_valid(w, c->player)) return false;
     const Transform *me = CW_GET(w, c->player, g->c_transform, Transform);
-    const Player *self = CW_GET(w, c->player, g->c_player, Player);
-    v3 eye = v3_add(me->position, v3_make(0, PLAYER_EYE, 0));
-    v3 direction = look_direction(self->yaw, self->pitch);
+    v3 eye, direction;
+    game_player_view(g, c->player, &eye, &direction);
     cw_entity_id best = CW_INVALID_ENTITY;
     float best_distance = reach;
     cw_query players = cw_query_begin(g->q_all_players);
@@ -550,6 +669,7 @@ bool net_client_init_options(net_client *c, game *g, const net_client_options *o
     c->interp_delay = interp_delay > 0.0f ? interp_delay : NET_INTERP_DELAY;
     c->state = NC_CONNECTING;
     c->player = CW_INVALID_ENTITY;
+    c->correction_frame = CW_INVALID_ENTITY;
     c->started = net_seconds();
     c->last_connect_sent = -1.0;
     c->nonce = (uint32_t)(c->started * 1e6) ^ 0xa5a5a5a5u;
@@ -717,16 +837,20 @@ void net_client_frame(net_client *c, const PlayerInput *in, double now) {
         if (c->redirect_pending) {
             // Frozen for the hand-off, like the server has us: the other zone picks
             // up exactly where the ticket says, and nothing rubber-bands meanwhile.
-            applied.forward = applied.strafe = 0.0f;
+            applied.forward = applied.strafe = applied.lift = 0.0f;
+            applied.turn_pitch = applied.turn_yaw = applied.turn_roll = 0.0f;
             applied.jump = false;
             applied.act = false;
+            applied.use = false;
         }
         // A swing is an edge, seen in one frame; ticks are rarer than frames, so it
-        // is kept until the next tick and applied to that one alone.
+        // is kept until the next tick and applied to that one alone. So is a use.
         if (applied.act) c->act_latched = true;
+        if (applied.use) c->use_latched = true;
         for (int i = 0; i < steps; ++i) {
             applied.act = c->act_latched;
-            c->act_latched = false;
+            applied.use = c->use_latched;
+            c->act_latched = c->use_latched = false;
             predict_tick(c, &applied, now);
         }
 
@@ -737,21 +861,32 @@ void net_client_frame(net_client *c, const PlayerInput *in, double now) {
         if (c->hit_flash > 0.0f) c->hit_flash -= frame_dt;
         if (c->pickup_flash > 0.0f) c->pickup_flash -= frame_dt;
 
-        // The other players, between the two samples around the render time.
+        // The other players and the crafts we do not fly, between the two samples
+        // around the render time: the crafts first, since those aboard them are
+        // placed in their frames.
         if (c->has_offset && !c->lightweight) {
             game *g = c->replica;
             cw_world *w = &g->world;
             double render_tick = c->render_tick;
             cw_component_id needed[] = {g->c_transform, c->c_replica};
-            cw_query replicas = cw_query_iter(w, cw_mask(needed, 2));
-            cw_entity_id id;
-            while (cw_query_next(&replicas, &id)) {
-                Replica *r = CW_GET(w, id, c->c_replica, Replica);
-                if (r->flash > 0.0f) r->flash -= frame_dt;
-                if (!r->count || id == c->player) continue;
-                Transform *t = CW_GET(w, id, g->c_transform, Transform);
-                t->position = replica_position(c, r, render_tick, false);
-                t->previous = replica_position(c, r, render_tick, true);
+            for (int pass = 0; pass < 2; ++pass) {
+                cw_query replicas = cw_query_iter(w, cw_mask(needed, 2));
+                cw_entity_id id;
+                while (cw_query_next(&replicas, &id)) {
+                    bool craft = cw_comp_has(w, id, g->c_craft);
+                    if (craft != (pass == 0)) continue;
+                    Replica *r = CW_GET(w, id, c->c_replica, Replica);
+                    if (r->flash > 0.0f) r->flash -= frame_dt;
+                    if (!r->count || id == c->player) continue;
+                    Transform *t = CW_GET(w, id, g->c_transform, Transform);
+                    if (craft) {
+                        Craft *flying = CW_GET(w, id, g->c_craft, Craft);
+                        if (flying->pilot == c->player) continue;   // ours: predicted
+                        flying->orientation = flying->previous_orientation = replica_orientation(r, render_tick);
+                    }
+                    t->position = replica_position(c, r, render_tick, false);
+                    t->previous = replica_position(c, r, render_tick, true);
+                }
             }
         }
     }
@@ -759,18 +894,34 @@ void net_client_frame(net_client *c, const PlayerInput *in, double now) {
 }
 
 float net_client_alpha(const net_client *c) { return c->clock_started ? cw_clock_alpha(&c->clock) : 1.0f; }
-v3 net_client_view_offset(const net_client *c) { return c->correction; }
+v3 net_client_view_offset(const net_client *c) {
+    if (c->correction_frame == CW_INVALID_ENTITY) return c->correction;
+    game *g = c->replica;
+    if (!cw_comp_has(&g->world, c->correction_frame, g->c_craft)) return v3_make(0, 0, 0);
+    return quat_rotate(CW_GET(&g->world, c->correction_frame, g->c_craft, Craft)->orientation, c->correction);
+}
 
 bool net_client_entity_visible(const net_client *c, cw_entity_id id) {
     cw_world *w = &c->replica->world;
     if (!cw_world_is_valid(w, id)) return false;
-    if (id == c->player) return true;
+    if (id == c->player || cw_comp_has(w, id, c->replica->c_craft)) return true;   // crafts are scenery
     if (!cw_comp_has(w, id, c->c_replica)) {
         // Never in a snapshot: scenery and ships are visible, a player is still on the way.
         return !cw_comp_has(w, id, c->replica->c_player);
     }
     const Replica *r = CW_GET(w, id, c->c_replica, Replica);
     return r->count > 0 && c->latest_tick - r->last_seen_tick < NET_UNSEEN_HIDE;
+}
+
+cw_entity_id net_client_craft_of(const net_client *c, cw_entity_id player) {
+    game *g = c->replica;
+    cw_world *w = &g->world;
+    if (!cw_world_is_valid(w, player)) return CW_INVALID_ENTITY;
+    if (player == c->player || !cw_comp_has(w, player, c->c_replica)) return game_aboard(g, player);
+    const Replica *r = CW_GET(w, player, c->c_replica, Replica);
+    if (!r->count) return CW_INVALID_ENTITY;
+    cw_entity_id aboard = sample_at(r, r->count - 1)->aboard;
+    return cw_comp_has(w, aboard, g->c_craft) ? aboard : CW_INVALID_ENTITY;
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,11 +1178,12 @@ void net_session_frame(net_session *s, const PlayerInput *in, double now) {
             game *old_world = s->world, *new_world = s->next_world;
             v3 old_position = cw_world_is_valid(&old_world->world, s->link->player)
                 ? v3_add(CW_GET(&old_world->world, s->link->player, old_world->c_transform, Transform)->position,
-                         s->link->correction)
+                         net_client_view_offset(s->link))
                 : v3_make(0, 0, 0);
             v3 new_position = CW_GET(&new_world->world, s->next_link->player, new_world->c_transform, Transform)->position;
             v3 delta = v3_sub(old_position, new_position);
             s->next_link->correction = v3_length(delta) < NET_CORRECTION_SNAP ? delta : v3_make(0, 0, 0);
+            s->next_link->correction_frame = CW_INVALID_ENTITY;   // nobody changes zone aboard a craft
             if (!s->next_link->party_updates) s->next_link->party = s->link->party;   // until the new zone is told
             if (!s->next_link->gear_known) {
                 s->next_link->gear = s->link->gear;

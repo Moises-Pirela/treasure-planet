@@ -206,6 +206,36 @@ static void spawn_planet(game *g, const planet_row *row) {
     spawn_block(g, pier, v3_make(2.0f, 0.5f, PIER_LENGTH * 0.5f), v3_make(0.45f, 0.45f, 0.5f));
 }
 
+// The yard: a platform west of the hub, across a bridge, where crafts are kept on
+// berths in two rows, bows to the north. A terminal at its near end is where a
+// player calls their craft (game_call_craft). It is part of the hub as a place.
+static const float YARD_X = -73.0f, YARD_HALF_X = 27.0f, YARD_HALF_Z = 30.0f;
+
+static void spawn_yard(game *g) {
+    v3 stone = v3_make(0.42f, 0.42f, 0.47f);
+    float near_edge = YARD_X + YARD_HALF_X, far_edge = YARD_X - YARD_HALF_X;
+    // The bridge, from the hub's west edge to the yard's near one, flush with both.
+    float bridge_half = (-HUB_HALF - near_edge) * 0.5f;
+    spawn_block(g, v3_make(near_edge + bridge_half, -0.5f, 0), v3_make(bridge_half, 0.5f, 2.5f), v3_scale(stone, 0.8f));
+    spawn_block(g, v3_make(YARD_X, -1.0f, 0), v3_make(YARD_HALF_X, 1.0f, YARD_HALF_Z), stone);
+    for (int row = 0; row < 2; ++row)
+        for (int column = 0; column < 4; ++column) {
+            game_berth *b = &g->berths[g->berth_count++];
+            b->floor = v3_make(near_edge - 12.0f - 12.0f * (float)column, 0.0f, row ? 14.0f : -14.0f);
+            b->heading = 0.0f;
+            // A pad marks each berth, a centimetre proud of the yard.
+            spawn_block(g, v3_add(b->floor, v3_make(0, -0.49f, 0)), v3_make(2.8f, 0.5f, 7.2f), v3_make(0.36f, 0.34f, 0.3f));
+            b->floor.y += 0.01f;
+        }
+    v3 terminal = v3_make(near_edge - 4.0f, 0.0f, -6.0f);
+    spawn_block(g, v3_add(terminal, v3_make(0, 1.0f, 0)), v3_make(0.6f, 1.0f, 0.4f), v3_make(0.75f, 0.58f, 0.25f));
+    game_declare_place(g, "Shipyard", PLACE_YARD, v3_add(terminal, v3_make(0, 1.0f, 1.4f)), v3_make(1.5f, 1.2f, 1.0f),
+                       v3_add(terminal, v3_make(0, 0, 1.4f)), NULL);
+    // Standing on the bridge or in the yard is being at the hub, for whoever owns it.
+    float west = far_edge - 1.0f, east = -HUB_HALF - 5.0f;
+    declare_place(g, "hub", v3_make((west + east) * 0.5f, 20.0f, 0), v3_make((east - west) * 0.5f, 21.0f, YARD_HALF_Z + 1.0f), g->spawn);
+}
+
 void game_build_universe(game *g) {
     g->spawn = v3_make(0.0f, 0.0f, 12.0f);
     // The hub and its piers; the ships docked at their ends are not part of it.
@@ -216,5 +246,6 @@ void game_build_universe(game *g) {
     spawn_block(g, v3_make(0, 3.0f, 22.0f), v3_make(8, 3, 2), v3_scale(stone, 0.7f));      // a terminal
     spawn_block(g, v3_make(-22, 1.0f, 5.0f), v3_make(2, 1, 2), v3_make(0.4f, 0.3f, 0.25f));  // crates
     spawn_block(g, v3_make(22, 1.5f, -5.0f), v3_make(2, 1.5f, 3), v3_make(0.3f, 0.35f, 0.4f));
+    spawn_yard(g);
     for (int i = 0; i < COUNT_OF(PLANETS); ++i) spawn_planet(g, &PLANETS[i]);
 }

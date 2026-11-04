@@ -44,7 +44,8 @@ struct r_vertex { float position[3], normal[3]; };
 
 struct r_camera {
     v3 position;
-    v3 forward;                  // unit; the frame's up is world +y
+    v3 forward;                  // unit
+    v3 up;                       // the way up the picture is, rebuilt square to `forward`; zero: world +y
     v3 velocity;                 // metres per second, for what depends on motion (an atmosphere's entry)
     float fov_y;                 // radians
     float near_plane;            // metres; the far plane is at infinity

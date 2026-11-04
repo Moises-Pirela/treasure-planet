@@ -101,6 +101,60 @@ int main(void) {
         free(hint.items);
         free(invited.items);
     }
+    // Aboard a banking craft the camera rolls, and the overlay rolls with it: the
+    // party panel stays top right, the flight panel bottom left, the stick in the
+    // middle, resting at the centre.
+    {
+        v3 eye = v3_make(-60.0f, 8.0f, 14.0f);
+        quat roll = quat_mul(quat_from_yaw(0.7f), quat_from_axis_angle(v3_make(0, 0, 1), 0.5f));
+        v3 forward = quat_rotate(roll, v3_make(0, 0, -1)), up = quat_rotate(roll, v3_make(0, 1, 0));
+        float aspect = 16.0f / 9.0f;
+        m4 view_proj = m4_mul(m4_perspective(HUD_FOV, aspect, 0.1f), m4_look_to_up(eye, forward, up));
+        hud_frame frame = hud_begin_view(eye, forward, up, aspect, 1);
+        party_view none = {};
+        draw_list panel = {};
+        hud_party(&panel, &frame, &none, "Bob");
+        float min_x = 2.0f, max_y = -2.0f;
+        for (size_t i = 0; i < panel.count; ++i) {
+            float x, y, depth;
+            CHECK(project(&view_proj, &panel.items[i], &x, &y, &depth));
+            if (x < min_x) min_x = x;
+            if (y > max_y) max_y = y;
+        }
+        CHECK(min_x > 0.2f && max_y < 1.0f && max_y > 0.9f);
+        free(panel.items);
+
+        hud_flight_view flight = {};
+        flight.craft = "Sloop";
+        flight.speed = 42.0f;
+        flight.climb = -1.5f;
+        flight.assist = true;
+        flight.throttle[CRAFT_GROUP_UP] = 0.6f;
+        draw_list list = {};
+        hud_flight(&list, &frame, &flight);
+        CHECK(list.count > 400);
+        int centre = 0, left_bottom = 0;
+        for (size_t i = 0; i < list.count; ++i) {
+            float x, y, depth;
+            if (!project(&view_proj, &list.items[i], &x, &y, &depth)) continue;
+            CHECK(fabsf(x) < 1.0f && fabsf(y) < 1.0f);
+            if (fabsf(x) < 0.02f && fabsf(y) < 0.04f) ++centre;
+            if (x < -0.3f && y < 0.0f) ++left_bottom;
+        }
+        CHECK(centre >= 5);                 // the stick's cross, resting in the middle
+        CHECK(left_bottom > 300);           // the panel
+        free(list.items);
+        flight.stick_x = 1.0f;              // full right: the cross moves right
+        draw_list moved = {};
+        hud_flight(&moved, &frame, &flight);
+        int right_of_centre = 0;
+        for (size_t i = 0; i < moved.count; ++i) {
+            float x, y, depth;
+            if (project(&view_proj, &moved.items[i], &x, &y, &depth) && x > 0.05f && fabsf(y) < 0.04f) ++right_of_centre;
+        }
+        CHECK(right_of_centre >= 5);
+        free(moved.items);
+    }
     if (failures) {
         printf("test_hud: %d failed\n", failures);
         return 1;

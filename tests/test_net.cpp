@@ -668,6 +668,44 @@ static void test_snapshot_codec(void) {
     // Decoding against the wrong base (or none) is refused rather than garbled.
     r = cw_reader_make(packet, w.size);
     CHECK(!snapshot_decode(&r, NULL, &decoded));
+
+    // Crafts travel exactly: the bits of their floats, delta-coded. A craft sitting
+    // still costs what an idle player does; one that moved, a few bytes a number.
+    quat turned = quat_normalize(quat_make(0.01f, 0.7071f, -0.002f, 0.7071f));
+    v3 where = v3_make(-1234.56789f, 87.654321f, 0.000123f), going = v3_make(12.3456f, -0.5f, 70.0f), spin = v3_make(0.01f, -0.3f, 0.0f);
+    snapshot *craft_base = snapshot_ring_push(&ring, 4);
+    craft_base->tick = 200;
+    craft_base->entries[craft_base->count++] = snapshot_entry_craft(7, where, going, turned, spin, 12, false, true);
+    craft_base->entries[craft_base->count++] = snapshot_entry_craft(8, where, going, turned, spin, CW_INVALID_ENTITY, true, false);
+    snapshot *craft_now = snapshot_ring_push(&ring, 4);
+    craft_now->tick = 203;
+    craft_now->entries[craft_now->count++] = snapshot_entry_craft(7, v3_add(where, v3_scale(going, 0.05f)), going,
+                                                                 quat_integrate(turned, spin, 0.05f), spin, 12, false, true);
+    craft_now->entries[craft_now->count++] = craft_base->entries[1];
+    cw_writer_init_fixed(&w, packet, sizeof(packet));
+    CHECK(snapshot_encode(craft_now, NULL, &w));
+    size_t full = w.size;
+    cw_writer_init_fixed(&w, packet, sizeof(packet));
+    CHECK(snapshot_encode(craft_now, craft_base, &w));
+    CHECK(w.size < full / 2);
+    CHECK(w.size < 14 + 2 + 2 + 7 * 4);   // the still one two bytes; the moving one's position and rotation
+    r = cw_reader_make(packet, w.size);
+    CHECK(snapshot_decode(&r, craft_base, &decoded));
+    CHECK(decoded.count == 2);
+    for (uint16_t i = 0; i < decoded.count && i < 2; ++i) {
+        snapshot_entry a = decoded.entries[i], b = craft_now->entries[i];
+        a.priority = b.priority = 0.0f;
+        CHECK(memcmp(&a, &b, sizeof(a)) == 0);
+        v3 p, v, sp;
+        quat q;
+        snapshot_craft_state(&a, &p, &v, &q, &sp);
+        v3 p0, v0, sp0;
+        quat q0;
+        snapshot_craft_state(&b, &p0, &v0, &q0, &sp0);
+        CHECK(memcmp(&p, &p0, sizeof(p)) == 0 && memcmp(&q, &q0, sizeof(q)) == 0 && memcmp(&sp, &sp0, sizeof(sp)) == 0);
+    }
+    CHECK(decoded.entries[0].pilot == 12 && decoded.entries[1].pilot == CW_INVALID_ENTITY);
+    CHECK((decoded.entries[1].flags & (SNAP_CRAFT | SNAP_RESTING)) == (SNAP_CRAFT | SNAP_RESTING));
     snapshot_free(&decoded);
     snapshot_ring_destroy(&ring);
 }
@@ -750,6 +788,7 @@ static void rig_init(rig *r, float server_loss) {
     config.max_clients = RIG_MAX;
     config.linger_quit = 0.5;      // bodies linger briefly in tests
     config.linger_timeout = 12.0;  // the client notices a lost connection some seconds after the server
+    config.craft_linger = 0.5;     // and crafts wait for their owners briefly
     rig_add_server(r, &config, server_loss);
 }
 
@@ -2431,6 +2470,132 @@ static void test_connect_tokens(void) {
 }
 
 // TEST_ONLY=name in the environment runs just that test.
+// ---------------------------------------------------------------------------
+// Crafts: flown by their owner's client a tick ahead of the server and agreeing
+// with it exactly, seen by another client, refused to anyone else at the helm
+// ---------------------------------------------------------------------------
+// Puts a client's body somewhere on the server; its client hears of it in the next
+// snapshot and takes the server's word, as after any large misprediction.
+static void place_on_server(server *s, cw_entity_id player, v3 at) {
+    Transform *t = CW_GET(&s->zone.world, player, s->zone.c_transform, Transform);
+    t->position = t->previous = at;
+    CW_GET(&s->zone.world, player, s->zone.c_player, Player)->velocity = v3_make(0, 0, 0);
+    if (cw_comp_has(&s->zone.world, player, s->zone.c_aboard)) cw_comp_remove(&s->zone.world, player, s->zone.c_aboard);
+}
+static void press_use(rig *r, int i) {
+    r->inputs[i].use = true;
+    rig_step(r);
+    r->inputs[i].use = false;
+}
+
+static void test_crafts_online(void) {
+    rig r;
+    rig_init(&r, 0.0f);
+    server *s = r.servers[0];
+    int a = rig_add_client_named(&r, s, 0.0f, "Alice"), b = rig_add_client_named(&r, s, 0.0f, "Bob");
+    CHECK(rig_wait_connected(&r, 5.0));
+    if (failures) { rig_destroy(&r); return; }
+    rig_run(&r, 0.3);
+    net_client *ca = link_of(&r, a), *cb = link_of(&r, b);
+    game *ga = world_of(&r, a), *gb = world_of(&r, b), *gs = &s->zone;
+
+    // Alice's craft, parked on the hub; both clients are sent it, parts and all.
+    cw_entity_id craft = game_spawn_craft(gs, 0, v3_make(12.0f, 0.0f, -6.0f), 0.0f, ca->account, -1);
+    rig_run(&r, 0.3);
+    CHECK(cw_world_is_valid(&ga->world, craft) && cw_world_is_valid(&gb->world, craft));
+    CHECK(cw_world_entity_count(&ga->world) == cw_world_entity_count(&gs->world));
+    if (!cw_world_is_valid(&ga->world, craft) || !cw_world_is_valid(&gb->world, craft)) { rig_destroy(&r); return; }
+    CHECK(game_owner(ga, craft) == ca->account);
+    const Craft *on_server = CW_GET(&gs->world, craft, gs->c_craft, Craft);
+    const Craft *on_a = CW_GET(&ga->world, craft, ga->c_craft, Craft), *on_b = CW_GET(&gb->world, craft, gb->c_craft, Craft);
+    CHECK(on_a->mass == on_server->mass && on_a->thrust[CRAFT_GROUP_UP] == on_server->thrust[CRAFT_GROUP_UP]);
+    v3 helm = game_craft_to_world(gs, craft, on_server->helm);
+
+    // Bob at the helm first: it is not his to take, on the server or in his prediction.
+    place_on_server(s, cb->player, v3_add(helm, v3_make(0, 0.05f, 0)));
+    rig_run(&r, 0.3);
+    CHECK(game_aboard(gs, cb->player) == craft);
+    CHECK(game_aboard(gb, cb->player) == craft);
+    press_use(&r, b);
+    rig_run(&r, 0.3);
+    CHECK(on_server->pilot == CW_INVALID_ENTITY && on_b->pilot == CW_INVALID_ENTITY);
+    place_on_server(s, cb->player, game_craft_to_world(gs, craft, v3_make(1.2f, 0.05f, 2.0f)));
+    place_on_server(s, ca->player, v3_add(helm, v3_make(0, 0.05f, 0)));
+    rig_run(&r, 0.3);
+    CHECK(game_aboard(gs, ca->player) == craft && game_aboard(ga, ca->player) == craft);
+    press_use(&r, a);
+    rig_run(&r, 0.3);
+    CHECK(on_server->pilot == ca->player && on_a->pilot == ca->player && on_b->pilot == ca->player);
+
+    // Alice flies: up, round, forward, and stops. Her client flies the craft a round
+    // trip ahead of the server and, replaying from the server's exact state, agrees
+    // with it every time; Bob rides along, predicting himself in its frame.
+    struct { float lift, yaw, forward, seconds; } legs[] = {{1.0f, 0, 0, 1.0f}, {0.2f, 0.8f, 0, 1.0f}, {0, 0, 1.0f, 1.0f}, {0, 0, 0, 4.0f}};
+    float worst_craft = 0.0f, worst_bob = 0.0f;
+    uint32_t starved = 0;
+    for (size_t leg = 0; leg < sizeof(legs) / sizeof(legs[0]); ++leg) {
+        r.inputs[a].lift = legs[leg].lift;
+        r.inputs[a].turn_yaw = legs[leg].yaw;
+        r.inputs[a].forward = legs[leg].forward;
+        double start = net_seconds();
+        while (net_seconds() - start < legs[leg].seconds) {
+            rig_step(&r);
+            if (ca->craft_error > worst_craft) worst_craft = ca->craft_error;
+            if (cb->last_error > worst_bob) worst_bob = cb->last_error;
+        }
+    }
+    starved = server_client_of(s, ca->player)->inputs.starved;
+    v3 parked = v3_make(12.0f, 0.0f, -6.0f);
+    v3 there = position_in(gs, craft);
+    CHECK(there.y > parked.y + 3.0f);
+    CHECK(distance(there, parked) > 8.0f);
+    CHECK(worst_craft < 0.001f || starved > 0);
+    CHECK(worst_bob < 0.002f);
+    CHECK(game_aboard(gs, cb->player) == craft && game_aboard(gb, cb->player) == craft);
+    CHECK(game_aboard(gs, ca->player) == craft && on_server->pilot == ca->player);
+    // Hovering, every view agrees: Alice's (ahead, but nothing is moving), Bob's
+    // interpolated craft, and where each sees the other standing on it.
+    CHECK(v3_length(on_server->velocity) < 0.1f);
+    CHECK(distance(position_in(ga, craft), there) < 0.05f);
+    CHECK(distance(position_in(gb, craft), there) < 0.05f);
+    v3 bob_on_a = position_in(ga, cb->player), bob_on_server = position_in(gs, cb->player);
+    CHECK(distance(bob_on_a, bob_on_server) < 0.05f);
+    CHECK(distance(position_in(gb, ca->player), game_craft_to_world(gs, craft, on_server->helm)) < 0.05f);
+    CHECK(fabsf(quat_dot(on_b->orientation, on_server->orientation)) > 0.9999f);
+    CHECK(fabsf(quat_dot(on_server->orientation, quat_identity())) < 0.99f);   // it did turn
+
+    // Alice lets go of the helm: its engines stop, and it drops to the hub. Her
+    // client stops predicting it and draws it from snapshots again, from fresh ones:
+    // never back where it was when she took it.
+    press_use(&r, a);
+    float farthest = 0.0f;
+    double start = net_seconds();
+    while (net_seconds() - start < 2.5) {
+        rig_step(&r);
+        float off = distance(position_in(ga, craft), position_in(gs, craft));
+        if (off > farthest) farthest = off;
+    }
+    CHECK(on_server->pilot == CW_INVALID_ENTITY && on_a->pilot == CW_INVALID_ENTITY);
+    CHECK(farthest < 3.0f);                                   // a fall seen a moment late, no more
+    CHECK(on_server->resting);                                // landed on the hub, and still
+    CHECK(distance(position_in(ga, craft), position_in(gs, craft)) < 0.01f);
+    CHECK(game_aboard(gs, ca->player) == craft && game_aboard(gs, cb->player) == craft);
+
+    // Alice leaves: her craft waits for her a while (here half a second; her body
+    // lingers as long again) and is then put away, and Bob is set down where he
+    // stood, in the world's frame, on the server and in his own prediction.
+    rig_drop_client(&r, a);
+    rig_run(&r, 0.3);
+    CHECK(cw_world_is_valid(&gs->world, craft));
+    rig_run(&r, 2.5);
+    CHECK(!cw_world_is_valid(&gs->world, craft));
+    CHECK(!cw_world_is_valid(&gb->world, craft));
+    CHECK(game_aboard(gs, cb->player) == CW_INVALID_ENTITY);
+    CHECK(game_aboard(gb, cb->player) == CW_INVALID_ENTITY);
+    CHECK(cb->state == NC_CONNECTED);
+    rig_destroy(&r);
+}
+
 #define RUN(name) do { const char *only = getenv("TEST_ONLY"); if (!only || !strcmp(only, #name)) name(); } while (0)
 
 int main(void) {
@@ -2456,6 +2621,7 @@ int main(void) {
     RUN(test_solo_instances);
     RUN(test_bandwidth_limit);
     RUN(test_lag_compensation);
+    RUN(test_crafts_online);
     RUN(test_directory);
     RUN(test_social_service);
     RUN(test_party);

@@ -27,6 +27,56 @@ static const planet_lod PLANET_LODS[] = {{384, 0.0f}, {128, 2.5f}, {48, 6.0f}};
 #define PLANET_SHADOW_ALTITUDE 220.0f
 #define MAX_PLANET_MESHES (8 * PLANET_LOD_COUNT)
 #define MAX_PITCH 1.5f
+#define STICK_PER_COUNT 0.004f       // how far a count of mouse moves the flight stick, of its full throw
+#define STICK_DEADZONE 0.06f         // ...and how far from the middle it must be to turn anything
+
+// What the client keeps between frames about how its player looks and flies: the
+// look (in the frame the player stands in, which is a craft's aboard one), the
+// flight stick where the mouse has pushed it, and whether the flight computer is off.
+struct view_state {
+    float yaw, pitch;
+    cw_entity_id frame;          // the craft the look is in, or CW_INVALID_ENTITY: the world
+    quat frame_orientation;      // its orientation when last seen, should it go
+    bool piloting;
+    float stick_x, stick_y;      // -1..1
+    bool decoupled;
+};
+
+static view_state view_make(float yaw, float pitch) {
+    view_state v = {};
+    v.yaw = yaw;
+    v.pitch = pitch;
+    v.frame = CW_INVALID_ENTITY;
+    v.frame_orientation = quat_identity();
+    return v;
+}
+
+// The craft our player stands in: from the replica's prediction online, the world alone.
+static cw_entity_id craft_of(game *g, const net_client *net, cw_entity_id player) {
+    if (!cw_world_is_valid(&g->world, player)) return CW_INVALID_ENTITY;
+    return net ? net_client_craft_of(net, player) : game_aboard(g, player);
+}
+
+// Keeps the look steady as the frame changes under it: stepping into a craft the
+// yaw and pitch become that craft's angles for the same direction, and back again
+// stepping out. Taking the helm faces the bow; the stick starts in the middle.
+static void follow_frame(game *g, const net_client *net, cw_entity_id player, view_state *v) {
+    cw_entity_id craft = craft_of(g, net, player);
+    bool piloting = craft != CW_INVALID_ENTITY && CW_GET(&g->world, craft, g->c_craft, Craft)->pilot == player;
+    if (craft != v->frame) {
+        v3 direction = quat_rotate(v->frame == CW_INVALID_ENTITY ? quat_identity() : v->frame_orientation,
+                                   look_direction(v->yaw, v->pitch));
+        if (craft != CW_INVALID_ENTITY) direction = quat_unrotate(CW_GET(&g->world, craft, g->c_craft, Craft)->orientation, direction);
+        look_angles(direction, &v->yaw, &v->pitch);
+        v->frame = craft;
+    }
+    if (piloting != v->piloting) {
+        v->stick_x = v->stick_y = 0.0f;
+        if (piloting) v->yaw = v->pitch = 0.0f;
+        v->piloting = piloting;
+    }
+    if (craft != CW_INVALID_ENTITY) v->frame_orientation = CW_GET(&g->world, craft, g->c_craft, Craft)->orientation;
+}
 
 struct options {
     r_backend_kind backend;
@@ -38,6 +88,7 @@ struct options {
     const char *capture_path;    // render one scripted frame, write it and exit
     int capture_ticks;
     const char *dungeon;         // alone: walk this dungeon instead of the universe
+    bool craft;                  // alone: start at the helm of a craft in the yard
     bool stats;                  // print the frame's and the GPU's times every second
     float bench_seconds;         // hold still (--at, --look) this long without vsync, printing the stats, and exit
     bool has_position;
@@ -73,6 +124,8 @@ static bool parse_options(int argc, char **argv, options *o) {
             o->capture_ticks = atoi(argv[++i]);
         } else if (!strcmp(arg, "--dungeon") && more) {
             o->dungeon = argv[++i];
+        } else if (!strcmp(arg, "--craft")) {
+            o->craft = true;
         } else if (!strcmp(arg, "--stats")) {
             o->stats = true;
         } else if (!strcmp(arg, "--bench") && more) {
@@ -544,6 +597,34 @@ static void collect_lights(game *g, float alpha, const net_client *net, light_li
         if (place->kind == PLACE_ENTRANCE) light_push(lights, v3_add(place->center, v3_make(0, 1.6f, 0)), 12.0f, v3_make(4.0f, 3.0f, 1.8f));
         if (place->kind == PLACE_EXIT) light_push(lights, place->center, 12.0f, v3_make(5.0f, 4.5f, 2.5f));
         if (place->kind == PLACE_LANDMARK) light_push(lights, place->center, 60.0f, v3_make(14.0f, 9.0f, 4.0f));   // the monument's beacon
+        if (place->kind == PLACE_YARD) light_push(lights, v3_add(place->center, v3_make(0, 2.0f, -1.0f)), 10.0f, v3_make(3.0f, 2.6f, 1.6f));
+    }
+    // A craft carries a lantern over its deck, and its thrusters glow as they fire,
+    // on the side they blow from. (Only the craft we fly knows its throttles.)
+    cw_query crafts = cw_query_begin(g->q_crafts);
+    cw_entity_id craft;
+    while (cw_query_next(&crafts, &craft)) {
+        const Craft *c = CW_GET(w, craft, g->c_craft, Craft);
+        v3 at;
+        quat q;
+        game_craft_pose(g, craft, alpha, &at, &q);
+        light_push(lights, v3_add(at, quat_rotate(q, v3_add(c->cabin_center, v3_make(0, c->cabin_half.y, 0)))), 12.0f,
+                   v3_make(3.5f, 2.8f, 1.8f));
+    }
+    cw_query parts = cw_query_begin(g->q_attachments);
+    cw_entity_id part;
+    while (cw_query_next(&parts, &part)) {
+        const Attachment *a = CW_GET(w, part, g->c_attachment, Attachment);
+        if (!cw_comp_has(w, part, g->c_part) || !cw_comp_has(w, a->ship, g->c_craft)) continue;
+        const Part *p = CW_GET(w, part, g->c_part, Part);
+        int group = game_part_group(p);
+        float burn = group >= 0 ? CW_GET(w, a->ship, g->c_craft, Craft)->throttle[group] : 0.0f;
+        if (burn < 0.02f) continue;
+        v3 at;
+        quat q;
+        game_craft_pose(g, a->ship, alpha, &at, &q);
+        v3 exhaust = v3_add(a->offset, v3_scale(v3_normalize(p->thrust), -0.6f));
+        light_push(lights, v3_add(at, quat_rotate(q, exhaust)), 2.0f + 4.0f * burn, v3_scale(v3_make(4.0f, 1.8f, 0.6f), burn));
     }
     cw_query ships = cw_query_begin(g->q_ships);
     cw_entity_id id;
@@ -569,6 +650,15 @@ static void set_status(plat_window *window, game *g, cw_entity_id player, const 
         return;
     }
     v3 at = CW_GET(w, player, g->c_transform, Transform)->position;
+    cw_entity_id craft = game_aboard(g, player);
+    if (craft != CW_INVALID_ENTITY) {
+        const Craft *c = CW_GET(w, craft, g->c_craft, Craft);
+        char text[320];
+        snprintf(text, sizeof(text), "%s: %s the %s, %.0f m/s, %s", prefix, c->pilot == player ? "at the helm of" : "aboard",
+                 c->name, v3_length(c->velocity), c->pilot == CW_INVALID_ENTITY ? "nobody at the helm" : c->assist ? "assist on" : "decoupled");
+        plat_window_set_title(window, text);
+        return;
+    }
     cw_entity_id aboard = game_ship_at(g, at);
     cw_entity_id shown = aboard;
     if (shown == CW_INVALID_ENTITY) {
@@ -704,7 +794,7 @@ static v3 entry_shake(const frame_tables *tables, v3 eye, v3 velocity, double ti
 // yet). Other players are their capsule plus a small block at the eyes, pointing
 // where they look. `net`, when set, hides replicas the server stopped updating.
 // `velocity` is the camera's, for an atmosphere's entry.
-static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id player, float yaw, float pitch,
+static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id player, const view_state *view,
                        float alpha, double time, v3 velocity, const r_mesh *meshes, r_mesh cloud_mesh, draw_list *list,
                        light_list *lights, frame_tables *tables, const net_client *net, const party_view *party,
                        const char *my_name, uint8_t **capture) {
@@ -714,8 +804,21 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
     plat_window_size(window, &width, &height);
     if (width <= 0 || height <= 0) return;
 
-    v3 eye = eye_of(g->spawn);
-    if (cw_world_is_valid(w, player)) {
+    // The eye, where the player's frame has it: in a craft, the craft's pose as drawn
+    // with the player's place on it, so the deck and the eye never part.
+    v3 eye = eye_of(g->spawn), forward = look_direction(view->yaw, view->pitch), up = v3_make(0, 1, 0);
+    cw_entity_id craft = craft_of(g, net, player);
+    if (craft != CW_INVALID_ENTITY && cw_comp_has(w, player, g->c_aboard)) {
+        v3 at;
+        quat q;
+        game_craft_pose(g, craft, alpha, &at, &q);
+        const Aboard *a = CW_GET(w, player, g->c_aboard, Aboard);
+        eye = v3_add(at, quat_rotate(q, eye_of(v3_lerp(a->previous, a->position, alpha))));
+        forward = quat_rotate(q, forward);
+        up = quat_rotate(q, up);
+        if (net) eye = v3_add(eye, net_client_view_offset(net));
+        if (velocity.x == 0.0f && velocity.y == 0.0f && velocity.z == 0.0f) velocity = CW_GET(w, craft, g->c_craft, Craft)->velocity;
+    } else if (cw_world_is_valid(w, player)) {
         const Transform *pt = CW_GET(w, player, g->c_transform, Transform);
         eye = eye_of(v3_lerp(pt->previous, pt->position, alpha));
         if (net) eye = v3_add(eye, net_client_view_offset(net));   // a fading misprediction
@@ -727,7 +830,8 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
     r_frame frame = {};
     frame.time = (float)time;
     frame.camera.position = eye;
-    frame.camera.forward = look_direction(yaw, pitch);
+    frame.camera.forward = forward;
+    frame.camera.up = up;
     frame.camera.velocity = velocity;
     frame.camera.fov_y = HUD_FOV;
     frame.camera.near_plane = 0.1f;
@@ -755,6 +859,22 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
         r_draw *draw = draw_push(list);
         draw->mesh = meshes[visual->mesh];
         draw->model = m4_translate_scale(at, visual->half);
+        // A craft's parts, and whoever stands in a craft, turn with it: drawn from its
+        // pose as drawn this frame, so nothing on it lags it.
+        cw_entity_id carrier = CW_INVALID_ENTITY;
+        if (cw_comp_has(w, id, g->c_attachment) && cw_comp_has(w, CW_GET(w, id, g->c_attachment, Attachment)->ship, g->c_craft))
+            carrier = CW_GET(w, id, g->c_attachment, Attachment)->ship;
+        quat turned = quat_identity();
+        if (carrier != CW_INVALID_ENTITY) {
+            v3 origin;
+            game_craft_pose(g, carrier, alpha, &origin, &turned);
+            at = v3_add(origin, quat_rotate(turned, CW_GET(w, id, g->c_attachment, Attachment)->offset));
+            draw->model = m4_pose(at, turned, visual->half);
+        } else if (cw_comp_has(w, id, g->c_player) && (carrier = craft_of(g, net, id)) != CW_INVALID_ENTITY) {
+            v3 origin;
+            game_craft_pose(g, carrier, alpha, &origin, &turned);
+            draw->model = m4_pose(at, turned, visual->half);
+        }
         draw->color[0] = visual->color.x;
         draw->color[1] = visual->color.y;
         draw->color[2] = visual->color.z;
@@ -800,9 +920,13 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
         }
         if (cw_comp_has(w, id, g->c_player)) {
             const Player *p = CW_GET(w, id, g->c_player, Player);
+            // Their angles are in the frame they stand in: the craft's, aboard one.
+            v3 looking = quat_rotate(turned, look_direction(p->yaw, p->pitch));
+            float world_yaw, world_pitch;
+            look_angles(quat_rotate(turned, look_direction(p->yaw, 0.0f)), &world_yaw, &world_pitch);
             // Their gear, for everyone to see, always.
-            if (cw_comp_has(w, id, g->c_equipment)) hud_draw_gear(list, meshes[MESH_CUBE], at, p->yaw, CW_GET(w, id, g->c_equipment, Equipment));
-            v3 nose = v3_add(eye_of(at), v3_scale(look_direction(p->yaw, p->pitch), PLAYER_RADIUS));
+            if (cw_comp_has(w, id, g->c_equipment)) hud_draw_gear(list, meshes[MESH_CUBE], at, world_yaw, CW_GET(w, id, g->c_equipment, Equipment));
+            v3 nose = v3_add(v3_add(at, quat_rotate(turned, v3_make(0, PLAYER_EYE, 0))), v3_scale(looking, PLAYER_RADIUS));
             r_draw *face = draw_push(list);
             face->mesh = meshes[MESH_CUBE];
             face->model = m4_translate_scale(nose, v3_make(0.08f, 0.08f, 0.08f));
@@ -811,14 +935,46 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
             face->flags = 0;
         }
     }
+    // The overlay, in the camera's frame: the party panel top right, gear bottom
+    // right, and what loot we are looking at (online); at a helm, the flight panel
+    // and the stick; and what the use key would do here.
+    hud_frame hud = hud_begin_view(eye, forward, up, (float)width / (float)height, meshes[MESH_CUBE]);
     if (party) {
-        // The overlay, in the camera's frame: the party panel top right, gear bottom
-        // right, and what loot we are looking at.
-        hud_frame hud = hud_begin(eye, yaw, pitch, (float)width / (float)height, meshes[MESH_CUBE]);
         hud_party(list, &hud, party, my_name);
         if (net && net->gear_known) hud_gear(list, &hud, &net->gear, &net->last_pickup, net->pickup_flash);
         item looked_at;
         if (net && net_client_loot_in_view(net, 6.0f, &looked_at)) hud_loot(list, &hud, &looked_at);
+    }
+    if (cw_world_is_valid(w, player)) {
+        const v3 advice = v3_make(0.95f, 0.85f, 0.5f), refusal = v3_make(0.95f, 0.45f, 0.4f);
+        if (craft != CW_INVALID_ENTITY && cw_comp_has(w, player, g->c_aboard)) {
+            const Craft *c = CW_GET(w, craft, g->c_craft, Craft);
+            if (c->pilot == player) {
+                hud_flight_view flight = {};
+                flight.craft = c->name;
+                flight.speed = v3_length(c->velocity);
+                flight.climb = c->velocity.y;
+                flight.assist = !view->decoupled;
+                flight.stick_x = view->stick_x;
+                flight.stick_y = view->stick_y;
+                memcpy(flight.throttle, c->throttle, sizeof(flight.throttle));
+                hud_flight(list, &hud, &flight);
+            } else if (v3_length(v3_sub(CW_GET(w, player, g->c_aboard, Aboard)->position, c->helm)) <= CRAFT_HELM_REACH) {
+                bool free = c->pilot == CW_INVALID_ENTITY || !cw_world_is_valid(w, c->pilot);
+                if (!game_can_pilot(g, player, craft)) hud_prompt(list, &hud, "THIS HELM IS NOT YOURS", refusal);
+                else if (!free) hud_prompt(list, &hud, "SOMEONE IS AT THE HELM", refusal);
+                else hud_prompt(list, &hud, "F  TAKE THE HELM", advice);
+            }
+        } else {
+            v3 feet = CW_GET(w, player, g->c_transform, Transform)->position;
+            for (int i = 0; i < g->place_count; ++i) {
+                const game_place *place = &g->places[i];
+                if (place->kind == PLACE_YARD && fabsf(feet.x - place->center.x) <= place->half.x
+                    && fabsf(feet.y - place->center.y) <= place->half.y && fabsf(feet.z - place->center.z) <= place->half.z)
+                    hud_prompt(list, &hud, game_craft_of(g, game_owner(g, player)) != CW_INVALID_ENTITY
+                                               ? "F  TOW YOUR SHIP BACK TO ITS BERTH" : "F  CALL YOUR SHIP", advice);
+            }
+        }
     }
     frame.draws = list->items;
     frame.draw_count = (uint32_t)list->count;
@@ -834,25 +990,59 @@ static void draw_world(renderer *r, plat_window *window, game *g, cw_entity_id p
     renderer_submit(r, &frame, width, height);
 }
 
-// Mouse look and the keys, into one tick's worth of input. Yaw and pitch are the
-// camera's and persist between frames.
-static PlayerInput read_input(plat_window *window, float *yaw, float *pitch) {
+static float stick_axis(float v) {
+    float size = fabsf(v);
+    if (size <= STICK_DEADZONE) return 0.0f;
+    return (v < 0.0f ? -1.0f : 1.0f) * (size - STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
+}
+
+// The keyboard and mouse, into one tick's worth of input. On foot the mouse looks
+// and W A S D walk. At a helm the mouse pushes the flight stick (it stays where it
+// is pushed, and turns the craft as far as it is from the middle), W and S thrust
+// forward and back, A and D slide, Space and C (or Ctrl) lift and sink, Q and E
+// roll, and X switches the flight computer off and on. F uses what is at hand: a
+// helm, or a yard's terminal. The look persists between frames, in `v`.
+static PlayerInput read_input(plat_window *window, view_state *v) {
     const plat_input *input = plat_window_input(window);
     if (input->keys[PLAT_KEY_ESCAPE]) plat_window_capture_mouse(window, false);
     if (input->clicked) plat_window_capture_mouse(window, true);
-    if (input->mouse_captured) {
-        *yaw -= input->mouse_dx * MOUSE_RADIANS_PER_COUNT;
-        *pitch -= input->mouse_dy * MOUSE_RADIANS_PER_COUNT;
-        if (*pitch > MAX_PITCH) *pitch = MAX_PITCH;
-        if (*pitch < -MAX_PITCH) *pitch = -MAX_PITCH;
-    }
+    bool use = input->pressed['F'];
+    if (input->pressed['X']) v->decoupled = !v->decoupled;
     PlayerInput in = {};
-    in.forward = (input->keys['W'] ? 1.0f : 0.0f) - (input->keys['S'] ? 1.0f : 0.0f);
-    in.strafe = (input->keys['D'] ? 1.0f : 0.0f) - (input->keys['A'] ? 1.0f : 0.0f);
-    in.jump = input->keys[PLAT_KEY_SPACE];
-    in.act = input->clicked && input->mouse_captured;   // a click while playing is a swing
-    in.yaw = *yaw;
-    in.pitch = *pitch;
+    float w = input->keys['W'] ? 1.0f : 0.0f, s = input->keys['S'] ? 1.0f : 0.0f;
+    float a = input->keys['A'] ? 1.0f : 0.0f, d = input->keys['D'] ? 1.0f : 0.0f;
+    in.forward = w - s;
+    in.strafe = d - a;
+    if (v->piloting) {
+        if (input->mouse_captured) {
+            v->stick_x += input->mouse_dx * STICK_PER_COUNT;
+            v->stick_y -= input->mouse_dy * STICK_PER_COUNT;   // the mouse away from you: the nose up
+            float throw_ = sqrtf(v->stick_x * v->stick_x + v->stick_y * v->stick_y);
+            if (throw_ > 1.0f) {
+                v->stick_x /= throw_;
+                v->stick_y /= throw_;
+            }
+        }
+        in.lift = (input->keys[PLAT_KEY_SPACE] ? 1.0f : 0.0f)
+                - (input->keys['C'] || input->keys[PLAT_KEY_LEFT_CONTROL] ? 1.0f : 0.0f);
+        in.turn_roll = (input->keys['E'] ? 1.0f : 0.0f) - (input->keys['Q'] ? 1.0f : 0.0f);
+        in.turn_yaw = stick_axis(v->stick_x);
+        in.turn_pitch = stick_axis(v->stick_y);
+        v->yaw = v->pitch = 0.0f;   // looking out over the bow
+    } else {
+        if (input->mouse_captured) {
+            v->yaw -= input->mouse_dx * MOUSE_RADIANS_PER_COUNT;
+            v->pitch -= input->mouse_dy * MOUSE_RADIANS_PER_COUNT;
+            if (v->pitch > MAX_PITCH) v->pitch = MAX_PITCH;
+            if (v->pitch < -MAX_PITCH) v->pitch = -MAX_PITCH;
+        }
+        in.jump = input->keys[PLAT_KEY_SPACE];
+        in.act = input->clicked && input->mouse_captured;   // a click while playing is a swing
+    }
+    in.use = use;
+    in.decoupled = v->decoupled;
+    in.yaw = v->yaw;
+    in.pitch = v->pitch;
     return in;
 }
 
@@ -869,7 +1059,7 @@ static const char *net_state_name(net_client_state state) {
 // and interpolates everyone else; we hand it the input and draw what it holds.
 static int run_online(const options *o, plat_window *window, renderer *r, const char *backend,
                       const r_mesh *meshes, r_mesh cloud_mesh, draw_list *list, light_list *lights, frame_tables *tables,
-                      float *yaw, float *pitch) {
+                      view_state *view) {
     stats_log stats = {};
     stats.on = o->stats;
     if (!net_init()) {
@@ -890,19 +1080,15 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
 
     double last_status = 0.0;
     int status = 0;
-    bool keys_before[PLAT_KEY_COUNT] = {};
+    game *view_world = NULL;     // the world the view's frame belongs to
     plat_window_capture_mouse(window, true);
     while (plat_window_poll(window)) {
-        PlayerInput in = read_input(window, yaw, pitch);
+        PlayerInput in = read_input(window, view);
         double now = net_seconds();
         // Party keys, on the press: F1 create, I invite whoever is in view, F2 accept,
         // F3 leave, F4 decline.
         const plat_input *input = plat_window_input(window);
-        bool pressed[PLAT_KEY_COUNT];
-        for (int k = 0; k < PLAT_KEY_COUNT; ++k) {
-            pressed[k] = input->keys[k] && !keys_before[k];
-            keys_before[k] = input->keys[k];
-        }
+        const bool *pressed = input->pressed;
         if (pressed[PLAT_KEY_F1]) net_session_party_request(&session, PARTY_CREATE, NULL);
         if (pressed[PLAT_KEY_F2]) net_session_party_request(&session, PARTY_ACCEPT, NULL);
         if (pressed[PLAT_KEY_F3]) net_session_party_request(&session, PARTY_LEAVE, NULL);
@@ -952,7 +1138,13 @@ static int run_online(const options *o, plat_window *window, renderer *r, const 
             }
             last_status = now;
         }
-        draw_world(r, window, g, player, *yaw, *pitch, net_client_alpha(link), now, v3_make(0, 0, 0), meshes, cloud_mesh, list,
+        if (g != view_world) {   // a new world (a hand-off): its entities are not the old one's
+            view->frame = CW_INVALID_ENTITY;
+            view->piloting = false;
+            view_world = g;
+        }
+        follow_frame(g, link, player, view);
+        draw_world(r, window, g, player, view, net_client_alpha(link), now, v3_make(0, 0, 0), meshes, cloud_mesh, list,
                    lights, tables, link, net_session_party(&session), session.identity.name, NULL);
         stats_frame(&stats, r, now, tick_seconds);
     }
@@ -984,7 +1176,7 @@ static int run(const options *o) {
     meshes[MESH_CAPSULE] = renderer_mesh_capsule(r, PLAYER_RADIUS, PLAYER_HEIGHT, 24, 8);
     r_mesh cloud_mesh = renderer_mesh_sphere(r, CLOUD_SEGMENTS, CLOUD_SEGMENTS / 2);
 
-    float yaw = o->yaw, pitch = o->pitch;
+    view_state view = view_make(o->yaw, o->pitch);
     draw_list list = {};
     light_list *lights = (light_list *)calloc(1, sizeof(light_list));
     frame_tables *tables = (frame_tables *)calloc(1, sizeof(frame_tables));
@@ -996,7 +1188,7 @@ static int run(const options *o) {
     int status = 0;
 
     if (o->connect || o->directory) {
-        status = run_online(o, window, r, backend, meshes, cloud_mesh, &list, lights, tables, &yaw, &pitch);
+        status = run_online(o, window, r, backend, meshes, cloud_mesh, &list, lights, tables, &view);
         free(list.items);
         free(lights);
         free(tables);
@@ -1010,18 +1202,33 @@ static int run(const options *o) {
     if (o->dungeon) game_build_dungeon(g, o->dungeon, "hub", v3_make(0, 0, 12), 1);
     else game_build_universe(g);
     cw_entity_id player = game_spawn_player(g, o->has_position ? o->position : g->spawn, true);
+    if (o->craft && !o->dungeon) {
+        // Called to a berth, and we at its helm: stepping aboard boards it, a use takes it.
+        cw_entity_id craft = game_call_craft(g, player);
+        if (craft != CW_INVALID_ENTITY) {
+            game_tick(g);   // the part lists the players step against
+            Transform *t = CW_GET(&g->world, player, g->c_transform, Transform);
+            t->position = t->previous = game_craft_to_world(g, craft, v3_add(CW_GET(&g->world, craft, g->c_craft, Craft)->helm, v3_make(0, 0.05f, 0)));
+            game_tick(g);
+            CW_GET(&g->world, player, g->c_input, PlayerInput)->use = true;
+            game_tick(g);
+            CW_GET(&g->world, player, g->c_input, PlayerInput)->use = false;
+        }
+    }
+    follow_frame(g, NULL, player, &view);
     char prefix[64];
     snprintf(prefix, sizeof(prefix), "Treasure Planet [%s]", backend);
 
     if (o->capture_path) {
         // Scripted: no clock and no input, so every run produces the same picture.
         for (int i = 0; i < o->capture_ticks; ++i) game_tick(g);
+        follow_frame(g, NULL, player, &view);
         uint8_t *pixels = NULL;
         // A few frames first, so a fresh swapchain has settled on the window's size.
         for (int i = 0; i < 4 && plat_window_poll(window); ++i)
-            draw_world(r, window, g, player, yaw, pitch, 1.0f, 0.0, o->velocity, meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, NULL);
+            draw_world(r, window, g, player, &view, 1.0f, 0.0, o->velocity, meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, NULL);
         plat_window_poll(window);
-        draw_world(r, window, g, player, yaw, pitch, 1.0f, 0.0, o->velocity, meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, &pixels);
+        draw_world(r, window, g, player, &view, 1.0f, 0.0, o->velocity, meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, &pixels);
         int width, height;
         plat_window_size(window, &width, &height);
         if (!pixels || !write_bmp(o->capture_path, pixels, width, height)) {
@@ -1038,7 +1245,7 @@ static int run(const options *o) {
         double start = plat_seconds();
         while (plat_window_poll(window) && plat_seconds() - start < o->bench_seconds) {
             double now = plat_seconds();
-            draw_world(r, window, g, player, yaw, pitch, 1.0f, now, o->velocity, meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, NULL);
+            draw_world(r, window, g, player, &view, 1.0f, now, o->velocity, meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, NULL);
             stats_frame(&stats, r, now, 0.0);
         }
     } else {
@@ -1047,21 +1254,29 @@ static int run(const options *o) {
         stats_log stats = {};
         stats.on = o->stats;
         plat_window_capture_mouse(window, true);
+        bool use_latched = false;
         while (plat_window_poll(window)) {
             PlayerInput *in = CW_GET(&g->world, player, g->c_input, PlayerInput);
-            *in = read_input(window, &yaw, &pitch);
+            *in = read_input(window, &view);
+            // The use key is an edge: one tick takes it, however many run this frame.
+            if (in->use) use_latched = true;
 
             double now = plat_seconds();
             int steps = cw_clock_advance(&clock, (float)(now - last));
             last = now;
-            for (int i = 0; i < steps; ++i) game_tick(g);
+            for (int i = 0; i < steps; ++i) {
+                in->use = use_latched;
+                use_latched = false;
+                game_tick(g);
+            }
+            follow_frame(g, NULL, player, &view);
             double tick_seconds = plat_seconds() - now;
 
             if (now - last_status > 0.25) {
                 set_status(window, g, player, prefix);
                 last_status = now;
             }
-            draw_world(r, window, g, player, yaw, pitch, cw_clock_alpha(&clock), now, v3_make(0, 0, 0), meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, NULL);
+            draw_world(r, window, g, player, &view, cw_clock_alpha(&clock), now, v3_make(0, 0, 0), meshes, cloud_mesh, &list, lights, tables, NULL, NULL, NULL, NULL);
             stats_frame(&stats, r, now, tick_seconds);
         }
     }
@@ -1080,7 +1295,7 @@ int main(int argc, char **argv) {
     options o;
     if (!parse_options(argc, argv, &o)) {
         fputs("usage: treasure_planet [--renderer vulkan|gl] [--connect host[:port] | --directory host[:port] [--place NAME]] [--name NAME]\n"
-              "                       [--dungeon NAME] [--stats] [--bench SECONDS | --capture out.bmp [--ticks N]] [--at X Y Z] [--look YAW PITCH] [--moving X Y Z]\n", stderr);
+              "                       [--dungeon NAME | --craft] [--stats] [--bench SECONDS | --capture out.bmp [--ticks N]] [--at X Y Z] [--look YAW PITCH] [--moving X Y Z]\n", stderr);
         return 2;
     }
     return run(&o);

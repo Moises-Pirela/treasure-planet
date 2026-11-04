@@ -95,5 +95,77 @@ static inline m4 m4_look_to_up(v3 eye, v3 forward, v3 up_hint) {
     return r;
 }
 static inline m4 m4_look_to(v3 eye, v3 forward) { return m4_look_to_up(eye, forward, v3_make(0, 1, 0)); }
+// The inverse of look_direction: the yaw and pitch that look along `direction` (unit).
+static inline void look_angles(v3 direction, float *yaw, float *pitch) {
+    float y = direction.y > 1.0f ? 1.0f : direction.y < -1.0f ? -1.0f : direction.y;
+    *pitch = asinf(y);
+    *yaw = atan2f(-direction.x, -direction.z);
+}
+
+// Rotations, as unit quaternions. A rotation takes a body's own frame to the world:
+// quat_rotate(q, v) is the body vector v in world axes.
+struct quat { float x, y, z, w; };
+
+static inline quat quat_make(float x, float y, float z, float w) { quat q = {x, y, z, w}; return q; }
+static inline quat quat_identity(void) { return quat_make(0, 0, 0, 1); }
+static inline quat quat_mul(quat a, quat b) {
+    return quat_make(a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                     a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                     a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                     a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
+}
+static inline quat quat_conjugate(quat q) { return quat_make(-q.x, -q.y, -q.z, q.w); }
+static inline float quat_dot(quat a, quat b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+// A zero quaternion (a field never set) normalises to the identity.
+static inline quat quat_normalize(quat q) {
+    float length = sqrtf(quat_dot(q, q));
+    if (length <= 0.0f) return quat_identity();
+    float s = 1.0f / length;
+    return quat_make(q.x * s, q.y * s, q.z * s, q.w * s);
+}
+static inline quat quat_from_axis_angle(v3 axis, float angle) {
+    float s = sinf(angle * 0.5f);
+    return quat_make(axis.x * s, axis.y * s, axis.z * s, cosf(angle * 0.5f));
+}
+// Heading about +y, in look_direction's sense: 0 faces -z.
+static inline quat quat_from_yaw(float yaw) { return quat_from_axis_angle(v3_make(0, 1, 0), yaw); }
+static inline v3 quat_rotate(quat q, v3 v) {
+    v3 u = v3_make(q.x, q.y, q.z);
+    v3 t = v3_scale(v3_cross(u, v), 2.0f);
+    return v3_add(v3_add(v, v3_scale(t, q.w)), v3_cross(u, t));
+}
+static inline v3 quat_unrotate(quat q, v3 v) { return quat_rotate(quat_conjugate(q), v); }
+// The orientation after turning at `spin` (rad/s, in the body's own axes) for `dt`.
+static inline quat quat_integrate(quat q, v3 spin, float dt) {
+    float rate = v3_length(spin);
+    if (rate * dt < 1e-9f) return q;
+    return quat_normalize(quat_mul(q, quat_from_axis_angle(v3_scale(spin, 1.0f / rate), rate * dt)));
+}
+// Between two rotations the short way round; normalised linear interpolation, which
+// is what a tick's worth of turning needs.
+static inline quat quat_nlerp(quat a, quat b, float t) {
+    if (quat_dot(a, b) < 0.0f) b = quat_make(-b.x, -b.y, -b.z, -b.w);
+    return quat_normalize(quat_make(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t,
+                                    a.w + (b.w - a.w) * t));
+}
+// Position, rotation and then scale: a box of half extents `scale` in a body's frame.
+static inline m4 m4_pose(v3 position, quat q, v3 scale) {
+    float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+    float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z, wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+    m4 r = m4_identity();
+    r.m[0] = (1.0f - 2.0f * (yy + zz)) * scale.x;
+    r.m[1] = 2.0f * (xy + wz) * scale.x;
+    r.m[2] = 2.0f * (xz - wy) * scale.x;
+    r.m[4] = 2.0f * (xy - wz) * scale.y;
+    r.m[5] = (1.0f - 2.0f * (xx + zz)) * scale.y;
+    r.m[6] = 2.0f * (yz + wx) * scale.y;
+    r.m[8] = 2.0f * (xz + wy) * scale.z;
+    r.m[9] = 2.0f * (yz - wx) * scale.z;
+    r.m[10] = (1.0f - 2.0f * (xx + yy)) * scale.z;
+    r.m[12] = position.x;
+    r.m[13] = position.y;
+    r.m[14] = position.z;
+    return r;
+}
 
 #endif

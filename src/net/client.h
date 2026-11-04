@@ -18,6 +18,14 @@
 // kept as a short history of samples, rendered NET_INTERP_DELAY behind the server's
 // clock between the two samples around that time. Samples of a player aboard a ship
 // are relative to the ship, so they stand on the deck the client is predicting.
+//
+// Crafts are the same either way round. The one our player flies is predicted like
+// our player (its state is set from each snapshot, exactly, and the inputs since
+// are replayed); every other craft is interpolated like another player, and those
+// aboard it (ourselves included, as passengers) stand in its frame, so they go
+// where it is drawn. Our own position aboard a craft is predicted in its frame,
+// which needs nothing of where the craft is: a passenger's prediction holds
+// whoever flies.
 #ifndef TP_CLIENT_H
 #define TP_CLIENT_H
 
@@ -25,6 +33,7 @@
 #include "protocol.h"
 
 #define NET_SAMPLE_HISTORY 16
+#define NET_FLOWN_CRAFTS 4           // crafts one snapshot may rewind for our player: the one we fly
 #define NET_UNSEEN_HIDE (60 * GAME_TICK_HZ)   // ticks without a snapshot before a player is hidden: everyone is drawn, far ones come round slowly
 #define NET_INTERP_DELAY 0.1f        // seconds behind the server: two snapshots
 #define NET_PREDICTION_HISTORY 128   // inputs kept for replay: two seconds
@@ -42,9 +51,12 @@ enum net_client_state { NC_CONNECTING, NC_LOADING, NC_CONNECTED, NC_DISCONNECTED
 
 struct net_sample {
     uint32_t tick;
-    cw_entity_id aboard;         // the ship `position` is relative to, or CW_INVALID_ENTITY
+    cw_entity_id aboard;         // the ship or craft `position` is in, or CW_INVALID_ENTITY
     v3 position, velocity;       // velocity carries a player on between rare updates
     float yaw, pitch;
+    bool craft;                  // a craft's sample: it turns, too
+    quat orientation;
+    v3 spin;                     // in the craft's axes
 };
 #define NET_EXTRAPOLATE 1.0f         // seconds a player keeps walking past their last sample
 // Client-only component on every other player.
@@ -110,12 +122,15 @@ struct net_client {
     int8_t input_lead;           // as of the last snapshot
     float rate;                  // ticks per server tick, steered around 1
     bool act_latched;            // a swing seen this frame, kept until a tick takes it
+    bool use_latched;            // ...and the use key, likewise
     predicted_input history[NET_PREDICTION_HISTORY];   // by seq
     uint32_t input_seq;
     double input_sent_at[64];    // by seq, for the round trip
-    v3 correction;               // view offset hiding the last misprediction
+    v3 correction;               // view offset hiding the last misprediction, in the frame of...
+    cw_entity_id correction_frame;   // ...the craft we were aboard, or CW_INVALID_ENTITY: the world's
     uint32_t resyncs;            // times the tick counter had to move
     float last_error;            // metres, of the last reconciliation
+    float craft_error;           // ...and of the craft we fly, where it had been predicted to be
     float hit_flash;             // seconds left of the flash that shows we were hit
 
     // Snapshots.
@@ -192,11 +207,15 @@ bool net_client_loot_in_view(const net_client *c, float reach, item *out);
 void net_client_equip(net_client *c, int index);
 // For rendering predicted entities between ticks.
 float net_client_alpha(const net_client *c);
-// Added to the local player's rendered position while a misprediction fades.
+// Added to the local player's rendered position while a misprediction fades, in
+// the world's axes.
 v3 net_client_view_offset(const net_client *c);
 // False for a player whose snapshots stopped (out of interest, or its spawn is still
 // on the way); such an entity should not be drawn.
 bool net_client_entity_visible(const net_client *c, cw_entity_id id);
+// The craft a player stands in, as this client has it: ours from our prediction,
+// anyone else's from their newest sample. CW_INVALID_ENTITY when none.
+cw_entity_id net_client_craft_of(const net_client *c, cw_entity_id player);
 
 // ---------------------------------------------------------------------------
 // A session: the player's connection across zones. Holds the current link and,

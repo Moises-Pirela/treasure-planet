@@ -9,7 +9,14 @@
 // is encoded against nothing and costs the full fields. Entries are sorted by id.
 //
 // Positions of players aboard a ship are relative to the ship, so a client can
-// place them on the deck it is predicting rather than where the deck was.
+// place them on the deck it is predicting rather than where the deck was; aboard a
+// craft they are in the craft's own frame (and so are their velocity and angles).
+//
+// Crafts are entries too (SNAP_CRAFT), with their orientation, spin and pilot. A
+// craft's numbers are not quantised: its position, velocity, orientation and spin
+// travel as the bits of the server's floats, delta-coded like the rest, which costs
+// about what millimetres would. Its pilot replays its flight from exactly the
+// server's state, and a replay of a deterministic simulation then agrees exactly.
 #ifndef TP_SNAPSHOT_H
 #define TP_SNAPSHOT_H
 
@@ -22,16 +29,18 @@
 #define SNAPSHOT_YAW_SCALE (65536.0f / (2.0f * TP_PI))
 #define SNAPSHOT_PITCH_SCALE (32767.0f / TP_PI)
 
-enum snapshot_flags { SNAP_GROUNDED = 1 };
+enum snapshot_flags { SNAP_GROUNDED = 1, SNAP_CRAFT = 2, SNAP_RESTING = 4, SNAP_ASSIST = 8 };
 
 struct snapshot_entry {
     cw_entity_id id;
-    cw_entity_id aboard;         // the ship position is relative to, or CW_INVALID_ENTITY
-    int32_t position[3], velocity[3];
+    cw_entity_id aboard;         // the ship or craft position is relative to, or CW_INVALID_ENTITY
+    int32_t position[3], velocity[3];   // a craft's: the bits of its floats
     uint16_t yaw;
     int16_t pitch;
     uint8_t flags;
     uint16_t hits_made, hits_taken;
+    int32_t orientation[4], spin[3];    // crafts: the bits of the floats
+    cw_entity_id pilot;          // crafts: at the helm, or CW_INVALID_ENTITY
     float priority;              // sender only: distance to the receiving player
 };
 
@@ -64,6 +73,10 @@ snapshot *snapshot_ring_push(snapshot_ring *ring, uint16_t count);
 // Quantisation.
 snapshot_entry snapshot_entry_make(cw_entity_id id, cw_entity_id aboard, v3 position, v3 velocity, float yaw,
                                    float pitch, bool grounded, uint16_t hits_made, uint16_t hits_taken);
+// A craft's entry, exactly.
+snapshot_entry snapshot_entry_craft(cw_entity_id id, v3 position, v3 velocity, quat orientation, v3 spin,
+                                    cw_entity_id pilot, bool resting, bool assist);
+void snapshot_craft_state(const snapshot_entry *e, v3 *position, v3 *velocity, quat *orientation, v3 *spin);
 v3 snapshot_position(const snapshot_entry *e);   // relative to the ship when aboard
 v3 snapshot_velocity(const snapshot_entry *e);
 float snapshot_yaw(const snapshot_entry *e);
@@ -72,7 +85,8 @@ const snapshot_entry *snapshot_find(const snapshot *s, cw_entity_id id);
 void snapshot_sort(snapshot *s);
 
 // Header: u32 tick, u32 base tick (0: none), u32 last input seq, i8 input lead, u16 count. Then
-// `count` entries delta-coded against `base`, which may be NULL. The writer must
+// `count` entries delta-coded against `base`, which may be NULL: each an id, a mask of
+// what changed (a varint: one byte unless a craft's pilot changed) and the changes. The writer must
 // be fixed-size: on overflow the caller drops entries and tries again.
 bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w);
 // Reads the header only, so the caller can look the base up.
