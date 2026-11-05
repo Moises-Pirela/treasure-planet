@@ -12,7 +12,8 @@
 // place them on the deck it is predicting rather than where the deck was; aboard a
 // craft they are in the craft's own frame (and so are their velocity and angles).
 //
-// Crafts are entries too (SNAP_CRAFT), with their orientation, spin and pilot. A
+// Crafts are entries too (SNAP_CRAFT), with their orientation, spin, pilot, flight
+// mode, sails and what each thruster group is firing at, so everyone sees the same. A
 // craft's numbers are not quantised: its position, velocity, orientation and spin
 // travel as the bits of the server's floats, delta-coded like the rest, which costs
 // about what millimetres would. Its pilot replays its flight from exactly the
@@ -29,7 +30,7 @@
 #define SNAPSHOT_YAW_SCALE (65536.0f / (2.0f * TP_PI))
 #define SNAPSHOT_PITCH_SCALE (32767.0f / TP_PI)
 
-enum snapshot_flags { SNAP_GROUNDED = 1, SNAP_CRAFT = 2, SNAP_RESTING = 4, SNAP_ASSIST = 8 };
+enum snapshot_flags { SNAP_GROUNDED = 1, SNAP_CRAFT = 2, SNAP_RESTING = 4, SNAP_ASSIST = 8, SNAP_LANDING = 16 };
 
 struct snapshot_entry {
     cw_entity_id id;
@@ -41,6 +42,15 @@ struct snapshot_entry {
     uint16_t hits_made, hits_taken;
     int32_t orientation[4], spin[3];    // crafts: the bits of the floats
     cw_entity_id pilot;          // crafts: at the helm, or CW_INVALID_ENTITY
+    cw_entity_id dock;           // crafts: the dock it makes for or lies at, or CW_INVALID_ENTITY
+    uint8_t docking;             // crafts: dock_state
+    uint8_t throttle[CRAFT_GROUPS];     // crafts: what each thruster group fires at, in 255ths, for all to see
+    uint8_t quiet;               // crafts: ticks it has sat still, towards coming to rest
+    // Crafts, a mast each (those it has not stay zero, and cost a byte or so):
+    int32_t sail[CRAFT_MAX_MASTS];       // how far its sail is set, the bits of the float
+    int32_t brace[CRAFT_MAX_MASTS];      // how it is braced, likewise
+    cw_entity_id hand[CRAFT_MAX_MASTS];  // at its sails, or CW_INVALID_ENTITY
+    int8_t fill[CRAFT_MAX_MASTS];        // how the current fills it, in 127ths, for all to see
     float priority;              // sender only: distance to the receiving player
 };
 
@@ -73,10 +83,11 @@ snapshot *snapshot_ring_push(snapshot_ring *ring, uint16_t count);
 // Quantisation.
 snapshot_entry snapshot_entry_make(cw_entity_id id, cw_entity_id aboard, v3 position, v3 velocity, float yaw,
                                    float pitch, bool grounded, uint16_t hits_made, uint16_t hits_taken);
-// A craft's entry, exactly.
-snapshot_entry snapshot_entry_craft(cw_entity_id id, v3 position, v3 velocity, quat orientation, v3 spin,
-                                    cw_entity_id pilot, bool resting, bool assist);
+// A craft's entry: its motion exactly, its engines and its modes.
+snapshot_entry snapshot_entry_craft(cw_entity_id id, v3 position, const Craft *craft);
 void snapshot_craft_state(const snapshot_entry *e, v3 *position, v3 *velocity, quat *orientation, v3 *spin);
+// Everything of a craft's entry onto the craft: motion, pilot, modes, engines.
+void snapshot_craft_apply(const snapshot_entry *e, Craft *craft, v3 *position);
 v3 snapshot_position(const snapshot_entry *e);   // relative to the ship when aboard
 v3 snapshot_velocity(const snapshot_entry *e);
 float snapshot_yaw(const snapshot_entry *e);

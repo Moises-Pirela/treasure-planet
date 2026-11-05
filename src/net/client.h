@@ -57,6 +57,7 @@ struct net_sample {
     bool craft;                  // a craft's sample: it turns, too
     quat orientation;
     v3 spin;                     // in the craft's axes
+    uint8_t throttle[CRAFT_GROUPS];     // its engines then, shown with the pose they went with
 };
 #define NET_EXTRAPOLATE 1.0f         // seconds a player keeps walking past their last sample
 // Client-only component on every other player.
@@ -123,6 +124,7 @@ struct net_client {
     float rate;                  // ticks per server tick, steered around 1
     bool act_latched;            // a swing seen this frame, kept until a tick takes it
     bool use_latched;            // ...and the use key, likewise
+    bool dock_latched;           // ...and the dock key
     predicted_input history[NET_PREDICTION_HISTORY];   // by seq
     uint32_t input_seq;
     double input_sent_at[64];    // by seq, for the round trip
@@ -160,6 +162,10 @@ struct net_client {
     uint32_t gear_updates;
     item last_pickup;
     float pickup_flash;
+    // The shipwright's last answer to an order of ours (shipwright.h), for the screen.
+    int shipwright_result;
+    shipwright_order shipwright_answered;
+    uint32_t shipwright_answers;
 
     // Hand-off. Once redirected, our inputs are sent without movement (the server
     // froze us anyway) until the other zone is showing or the attempt has failed.
@@ -201,10 +207,18 @@ void net_client_party_request(net_client *c, int op, const char *target_name);
 // The other player our look direction rests on, within `reach` metres (the capsule
 // test the server uses for swings): their name into `name`, false when none.
 bool net_client_player_in_view(const net_client *c, float reach, char name[ACCOUNT_NAME_CAPACITY]);
+// ...and which player that is, or CW_INVALID_ENTITY.
+cw_entity_id net_client_player_looked_at(const net_client *c, float reach);
 // Loot our look direction rests on within `reach` metres, false when none.
 bool net_client_loot_in_view(const net_client *c, float reach, item *out);
 // Asks to wear the item in stash slot `index`.
 void net_client_equip(net_client *c, int index);
+// Asks the server to put a player off the craft we own (CW_INVALID_ENTITY: everyone
+// aboard it but us). The server decides; the snapshots tell.
+void net_client_kick(net_client *c, cw_entity_id player);
+// Sends an order to the shipwright (we must be at the counter); the answer comes
+// back in shipwright_result, and the character after it, if it was done.
+void net_client_shipwright(net_client *c, const shipwright_order *order);
 // For rendering predicted entities between ticks.
 float net_client_alpha(const net_client *c);
 // Added to the local player's rendered position while a misprediction fades, in
@@ -267,5 +281,7 @@ void net_session_party_request(net_session *s, int op, const char *target_name);
 // The party as last heard, through whichever link is current.
 const party_view *net_session_party(const net_session *s);
 void net_session_equip(net_session *s, int stash_index);
+void net_session_kick(net_session *s, cw_entity_id player);
+void net_session_shipwright(net_session *s, const shipwright_order *order);
 
 #endif

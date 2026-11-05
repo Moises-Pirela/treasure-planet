@@ -3,7 +3,7 @@
 //                   [--zones FILE --zone NAME]
 //                   [--directory HOST:PORT --zone NAME [--owns PLACE,...] [--instances] [--public HOST:PORT] [--secret WORD]
 //                    [--region NAME] [--target N]]
-//                   [--universe-epoch UNIX_SECONDS] [--save FILE]
+//                   [--universe-epoch UNIX_SECONDS] [--save FILE] [--currents] [--captains N]
 // Alone it owns the whole universe. With a zones file (zones.h) it owns the places
 // listed for its name and hands players over to the other zones; with a directory
 // (directory.h) it registers what it owns there and learns the others from it.
@@ -23,13 +23,14 @@ static int usage(void) {
           "                       [--zones FILE --zone NAME]\n"
           "                       [--directory HOST:PORT --zone NAME [--owns PLACE,...] [--instances] [--public HOST:PORT] [--secret WORD]\n"
           "                        [--region NAME] [--target N]]\n"
-          "                       [--universe-epoch UNIX_SECONDS] [--save FILE]\n", stderr);
+          "                       [--universe-epoch UNIX_SECONDS] [--save FILE] [--currents] [--captains N]\n", stderr);
     return 2;
 }
 
 int main(int argc, char **argv) {
     server_config config = server_config_default();
     config.verbose = true;
+    config.captains = 4;
     const char *zones_path = NULL, *zone_name = NULL, *directory = NULL, *owns = NULL, *public_address = NULL;
     for (int i = 1; i < argc; ++i) {
         bool more = i + 1 < argc;
@@ -60,6 +61,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--quiet")) config.verbose = false;
         else if (!strcmp(argv[i], "--trace")) config.trace = true;
         else if (!strcmp(argv[i], "--save") && more) config.save_path = argv[++i];
+        else if (!strcmp(argv[i], "--currents")) config.currents = true;   // the solar current flows (off for now)
+        else if (!strcmp(argv[i], "--captains") && more) config.captains = atoi(argv[++i]);   // ships of the world's own (default 4)
         else return usage();
     }
     if (zones_path && !zone_name) return usage();

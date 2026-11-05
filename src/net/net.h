@@ -69,7 +69,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define NET_PROTOCOL_VERSION 9
+#define NET_PROTOCOL_VERSION 18
 #define NET_MAX_PACKET 1200          // bytes, safely under every common MTU
 #define NET_PACKET_HEADER 8          // magic, session: what every packet starts with, in the clear
 #define NET_ACKS_SIZE (2 + 2 + 4 + 2 + 2 * (2 + 8))   // the packet acks, then one (latest, bitfield) per reliable channel

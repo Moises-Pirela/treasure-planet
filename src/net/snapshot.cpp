@@ -9,7 +9,8 @@ enum {
     CHANGE_STATS = 64,
     CHANGE_ROTATION = 128,       // a craft's orientation and spin
     CHANGE_PILOT = 256,
-    CHANGE_ALL = 511
+    CHANGE_ENGINES = 512,        // a craft's throttles and its count towards rest
+    CHANGE_ALL = 1023
 };
 
 void snapshot_reserve(snapshot *s, uint16_t count) {
@@ -87,13 +88,31 @@ static float float_of(int32_t bits) {
     return f;
 }
 
-snapshot_entry snapshot_entry_craft(cw_entity_id id, v3 position, v3 velocity, quat orientation, v3 spin,
-                                    cw_entity_id pilot, bool resting, bool assist) {
+snapshot_entry snapshot_entry_craft(cw_entity_id id, v3 position, const Craft *craft) {
     snapshot_entry e = {};
     e.id = id;
     e.aboard = CW_INVALID_ENTITY;
-    e.pilot = pilot;
-    e.flags = (uint8_t)(SNAP_CRAFT | (resting ? SNAP_RESTING : 0) | (assist ? SNAP_ASSIST : 0));
+    e.pilot = craft->pilot;
+    e.dock = craft->dock;
+    e.docking = (uint8_t)craft->docking;
+    e.flags = (uint8_t)(SNAP_CRAFT | (craft->resting ? SNAP_RESTING : 0) | (craft->assist ? SNAP_ASSIST : 0)
+                        | (craft->mode == CRAFT_LANDING ? SNAP_LANDING : 0));
+    for (int m = 0; m < CRAFT_MAX_MASTS; ++m) {
+        const craft_sail *sail = &craft->sails[m];
+        bool rigged = m < craft->masts;
+        e.sail[m] = rigged ? bits_of(sail->set) : 0;
+        e.brace[m] = rigged ? bits_of(sail->brace) : 0;
+        e.hand[m] = rigged ? sail->hand : CW_INVALID_ENTITY;
+        float fill = !rigged ? 0.0f : sail->fill < -1.0f ? -1.0f : sail->fill > 1.0f ? 1.0f : sail->fill;
+        e.fill[m] = (int8_t)(int)(fill * 127.0f + (fill < 0.0f ? -0.5f : 0.5f));
+    }
+    for (int k = 0; k < CRAFT_GROUPS; ++k) {
+        float level = craft->throttle[k] < 0.0f ? 0.0f : craft->throttle[k] > 1.0f ? 1.0f : craft->throttle[k];
+        e.throttle[k] = (uint8_t)(level * 255.0f + 0.5f);
+    }
+    e.quiet = (uint8_t)(craft->quiet_ticks < 0 ? 0 : craft->quiet_ticks > 255 ? 255 : craft->quiet_ticks);
+    v3 velocity = craft->velocity, spin = craft->spin;
+    quat orientation = craft->orientation;
     const float p[3] = {position.x, position.y, position.z}, v[3] = {velocity.x, velocity.y, velocity.z};
     const float q[4] = {orientation.x, orientation.y, orientation.z, orientation.w}, w[3] = {spin.x, spin.y, spin.z};
     for (int k = 0; k < 3; ++k) {
@@ -111,6 +130,26 @@ void snapshot_craft_state(const snapshot_entry *e, v3 *position, v3 *velocity, q
     *orientation = quat_make(float_of(e->orientation[0]), float_of(e->orientation[1]), float_of(e->orientation[2]),
                              float_of(e->orientation[3]));
     *spin = v3_make(float_of(e->spin[0]), float_of(e->spin[1]), float_of(e->spin[2]));
+}
+
+void snapshot_craft_apply(const snapshot_entry *e, Craft *craft, v3 *position) {
+    snapshot_craft_state(e, position, &craft->velocity, &craft->orientation, &craft->spin);
+    craft->orientation = quat_normalize(craft->orientation);
+    craft->pilot = e->pilot;
+    craft->dock = e->dock;
+    craft->docking = e->docking <= DOCK_DOCKED ? (int)e->docking : (int)DOCK_NONE;
+    craft->resting = (e->flags & SNAP_RESTING) != 0;
+    craft->assist = (e->flags & SNAP_ASSIST) != 0;
+    craft->mode = (e->flags & SNAP_LANDING) ? CRAFT_LANDING : CRAFT_FLIGHT;
+    craft->quiet_ticks = e->quiet;
+    for (int m = 0; m < CRAFT_MAX_MASTS; ++m) {
+        craft_sail *sail = &craft->sails[m];
+        sail->set = float_of(e->sail[m]);
+        sail->brace = float_of(e->brace[m]);
+        sail->hand = e->hand[m];
+        sail->fill = (float)e->fill[m] / 127.0f;
+    }
+    for (int k = 0; k < CRAFT_GROUPS; ++k) craft->throttle[k] = (float)e->throttle[k] / 255.0f;
 }
 
 v3 snapshot_position(const snapshot_entry *e) {
@@ -163,7 +202,7 @@ bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w) {
         if (!b) {
             b = &zero;
             change = CHANGE_NEW | CHANGE_ABOARD | CHANGE_POSITION | CHANGE_VELOCITY | CHANGE_ANGLES | CHANGE_FLAGS | CHANGE_STATS;
-            if (e->flags & SNAP_CRAFT) change |= CHANGE_ROTATION | CHANGE_PILOT;
+            if (e->flags & SNAP_CRAFT) change |= CHANGE_ROTATION | CHANGE_PILOT | CHANGE_ENGINES;
         } else {
             if (e->aboard != b->aboard) change |= CHANGE_ABOARD;
             if (memcmp(e->position, b->position, sizeof(e->position)) != 0) change |= CHANGE_POSITION;
@@ -173,7 +212,12 @@ bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w) {
             if (e->hits_made != b->hits_made || e->hits_taken != b->hits_taken) change |= CHANGE_STATS;
             if (memcmp(e->orientation, b->orientation, sizeof(e->orientation)) != 0 || memcmp(e->spin, b->spin, sizeof(e->spin)) != 0)
                 change |= CHANGE_ROTATION;
-            if (e->pilot != b->pilot) change |= CHANGE_PILOT;
+            if (e->pilot != b->pilot || memcmp(e->hand, b->hand, sizeof(e->hand)) != 0 || e->dock != b->dock || e->docking != b->docking)
+                change |= CHANGE_PILOT;
+            if (memcmp(e->throttle, b->throttle, sizeof(e->throttle)) != 0 || e->quiet != b->quiet
+                || memcmp(e->sail, b->sail, sizeof(e->sail)) != 0 || memcmp(e->fill, b->fill, sizeof(e->fill)) != 0
+                || memcmp(e->brace, b->brace, sizeof(e->brace)) != 0)
+                change |= CHANGE_ENGINES;
         }
         write_id(w, e->id);
         net_write_uvarint(w, change);
@@ -195,7 +239,21 @@ bool snapshot_encode(const snapshot *s, const snapshot *base, cw_writer *w) {
             for (int k = 0; k < 4; ++k) net_write_svarint(w, (int64_t)e->orientation[k] - b->orientation[k]);
             for (int k = 0; k < 3; ++k) net_write_svarint(w, (int64_t)e->spin[k] - b->spin[k]);
         }
-        if (change & CHANGE_PILOT) write_id(w, e->pilot);
+        if (change & CHANGE_PILOT) {
+            write_id(w, e->pilot);
+            for (int m = 0; m < CRAFT_MAX_MASTS; ++m) write_id(w, e->hand[m]);
+            write_id(w, e->dock);
+            cw_writer_u8(w, e->docking);
+        }
+        if (change & CHANGE_ENGINES) {
+            cw_writer_bytes(w, e->throttle, sizeof(e->throttle));
+            cw_writer_u8(w, e->quiet);
+            for (int m = 0; m < CRAFT_MAX_MASTS; ++m) {
+                net_write_svarint(w, (int64_t)e->sail[m] - b->sail[m]);
+                net_write_svarint(w, (int64_t)e->brace[m] - b->brace[m]);
+                cw_writer_i8(w, e->fill[m]);
+            }
+        }
     }
     return cw_writer_ok(w);
 }
@@ -266,7 +324,25 @@ bool snapshot_decode(cw_reader *r, const snapshot *base, snapshot *out) {
                 else e->spin[k - 4] = (int32_t)(b->spin[k - 4] + d);
             }
         }
-        if (change & CHANGE_PILOT && !read_id(r, &e->pilot)) return false;
+        if (change & CHANGE_PILOT) {
+            if (!read_id(r, &e->pilot)) return false;
+            for (int m = 0; m < CRAFT_MAX_MASTS; ++m)
+                if (!read_id(r, &e->hand[m])) return false;
+            if (!read_id(r, &e->dock)) return false;
+            cw_reader_u8(r, &e->docking);
+        }
+        if (change & CHANGE_ENGINES) {
+            cw_reader_bytes(r, e->throttle, sizeof(e->throttle));
+            cw_reader_u8(r, &e->quiet);
+            for (int m = 0; m < CRAFT_MAX_MASTS; ++m) {
+                int64_t d = 0;
+                if (!net_read_svarint(r, &d)) return false;
+                e->sail[m] = (int32_t)(b->sail[m] + d);
+                if (!net_read_svarint(r, &d)) return false;
+                e->brace[m] = (int32_t)(b->brace[m] + d);
+                cw_reader_i8(r, &e->fill[m]);
+            }
+        }
         if (!cw_reader_ok(r)) return false;
         ++out->count;
     }

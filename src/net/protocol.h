@@ -24,7 +24,11 @@
 //                                                               out of the client's interest; joins, leaves)
 //   client <--------------------------- MSG_UPDATE  server     (reliable, ordered: the components of a known
 //                                                               entity that changed, nothing else)
-//   client <------------------------ MSG_CHARACTER  server     (reliable, unordered: the gear, versioned)
+//   client <------------------------ MSG_CHARACTER  server     (reliable, unordered: the gear, purse and ships, versioned)
+//   client  MSG_SHIPWRIGHT ------------------------> server     (reliable: an order at the shipwright's;
+//   client <------------------ MSG_SHIPWRIGHT_RESULT server      answered, and MSG_CHARACTER if it was done)
+//   client  MSG_KICK ------------------------------> server     (reliable: an owner putting a player off
+//                                                               their craft; the change comes back as an UPDATE)
 // Channels (net.h): the handshake is unreliable, everything with state is sequenced,
 // everything that must arrive is reliable ordered unless it carries its own
 // version, in which case it need not wait behind a baseline.
@@ -39,6 +43,7 @@
 #define TP_PROTOCOL_H
 
 #include "../game/game.h"
+#include "../game/shipwright.h"
 #include "accounts.h"
 #include "net.h"
 #include "social.h"
@@ -72,7 +77,13 @@ enum net_message_type {
     MSG_EQUIP,               // client -> server: u8 stash index to wear
     MSG_UPDATE,              // server -> client: u16 count, then partial entity records (net_entity_write_masked)
     MSG_CHALLENGE,           // server -> client: u32 nonce (the connect's), u64 challenge to repeat
+    MSG_KICK,                // client -> server: u8 kick_op, i64 player; a craft owner putting someone off it
+    MSG_SHIPWRIGHT,          // client -> server: shipwright_order_write; a player at the shipwright's trading
+    MSG_SHIPWRIGHT_RESULT,   // server -> client: u8 shipwright_result, then the order it answers
 };
+
+// What MSG_KICK asks: one player off the sender's craft, or everyone aboard it but the sender.
+enum kick_op { KICK_ONE = 0, KICK_ALL = 1 };
 
 // Why a client leaves: a quit keeps its body in the world a short while (it may be
 // back), a hand-off means it is already somewhere else, so nothing stays.
@@ -84,7 +95,7 @@ enum net_reject_reason { REJECT_VERSION = 1, REJECT_FULL, REJECT_TICKET, REJECT_
 // component ids (assigned at runtime) never leak into the protocol.
 enum net_component {
     NET_C_TRANSFORM, NET_C_SOLID, NET_C_ATTACHMENT, NET_C_VISUAL, NET_C_PLAYER, NET_C_SHIP, NET_C_PLANET,
-    NET_C_EQUIPMENT, NET_C_LOOT, NET_C_OWNED, NET_C_CRAFT, NET_C_PART,
+    NET_C_EQUIPMENT, NET_C_LOOT, NET_C_OWNED, NET_C_CRAFT, NET_C_PART, NET_C_GRAVITY, NET_C_BARRED, NET_C_DOCK,
     NET_C_COUNT
 };
 
@@ -118,6 +129,7 @@ struct net_welcome {
     v3 spawn;                    // where players come back after falling off the world
     uint64_t account;
     uint8_t input_target;        // inputs the server likes to have queued: what the client steers for
+    bool currents;               // whether the solar current flows in this world (game.currents)
     char world[GAME_NAME_CAPACITY];   // the dungeon this world is, or "" for the universe
     char zone[NET_ZONE_NAME];    // the server's name, for a connect token to come back with
     game_place places[GAME_MAX_PLACES];
@@ -133,7 +145,7 @@ struct net_input_message {
 };
 // Inputs travel quantised (eighths of a percent, 16-bit angles); the client applies
 // this before predicting so that both sides simulate the same numbers. A helm's
-// controls (lift and the three turns) follow only when one of them is not zero, so
+// controls (lift, the three turns, the sail and its brace) follow only when one of them is not zero, so
 // walking costs what it always did.
 void net_input_quantize(PlayerInput *in);
 
@@ -175,6 +187,12 @@ void item_write(cw_writer *w, const item *it);
 bool item_read(cw_reader *r, item *it);
 void character_write(cw_writer *w, const character *c);
 bool character_read(cw_reader *r, character *c);
+// Only what a character was before it had a purse and ships: the gear (old saves).
+bool character_read_gear(cw_reader *r, character *c);
+// A character as written at an older format: 1 the gear alone, 2 with ships whose
+// loadouts had no look, 3 (CHARACTER_FORMAT) as now.
+#define CHARACTER_FORMAT 3
+bool character_read_format(cw_reader *r, character *c, int format);
 void net_welcome_write(cw_writer *w, const net_welcome *m);
 bool net_welcome_read(cw_reader *r, net_welcome *m);
 void net_input_write(cw_writer *w, const net_input_message *m);

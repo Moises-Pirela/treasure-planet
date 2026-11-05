@@ -56,18 +56,52 @@ bool item_read(cw_reader *r, item *it) {
     cw_reader_u32(r, &it->seed);
     return cw_reader_ok(r) && it->slot < SLOT_COUNT && it->rarity < RARITY_COUNT;
 }
+// The gear, then the purse, then the fleet: the owned hulls and the one sailed,
+// each owned hull's loadout, and the store (how many fittings it counts, then each).
 void character_write(cw_writer *w, const character *c) {
     cw_writer_u32(w, c->version);
     for (int i = 0; i < SLOT_COUNT; ++i) item_write(w, &c->equipment[i]);
     for (int i = 0; i < STASH_SIZE; ++i) item_write(w, &c->stash[i]);
+    cw_writer_i64(w, c->doubloons);
+    cw_writer_u8(w, c->bottomless ? 1 : 0);
+    cw_writer_i64(w, c->spent);
+    cw_writer_u8(w, c->ships.owned);
+    cw_writer_u8(w, c->ships.sailing);
+    for (int h = 0; h < HULL_COUNT; ++h)
+        if (c->ships.owned & (1u << h)) ship_loadout_write(w, &c->ships.loadouts[h]);
+    int kinds = ship_component_count();
+    cw_writer_u8(w, (uint8_t)kinds);
+    for (int i = 0; i < kinds; ++i) cw_writer_u16(w, c->ships.store[i]);
 }
-bool character_read(cw_reader *r, character *c) {
+bool character_read_gear(cw_reader *r, character *c) {
     memset(c, 0, sizeof(*c));
     cw_reader_u32(r, &c->version);
     for (int i = 0; i < SLOT_COUNT; ++i)
         if (!item_read(r, &c->equipment[i])) return false;
     for (int i = 0; i < STASH_SIZE; ++i)
         if (!item_read(r, &c->stash[i])) return false;
+    return cw_reader_ok(r);
+}
+bool character_read(cw_reader *r, character *c) { return character_read_format(r, c, CHARACTER_FORMAT); }
+bool character_read_format(cw_reader *r, character *c, int format) {
+    if (!character_read_gear(r, c)) return false;
+    if (format <= 1) return true;
+    uint8_t bottomless = 0, kinds = 0;
+    cw_reader_i64(r, &c->doubloons);
+    cw_reader_u8(r, &bottomless);
+    c->bottomless = bottomless != 0;
+    cw_reader_i64(r, &c->spent);
+    cw_reader_u8(r, &c->ships.owned);
+    cw_reader_u8(r, &c->ships.sailing);
+    if (!cw_reader_ok(r) || c->ships.owned >= (1u << HULL_COUNT) || c->ships.sailing >= HULL_COUNT) return false;
+    for (int h = 0; h < HULL_COUNT; ++h)
+        if (c->ships.owned & (1u << h)) {
+            bool read = format >= 3 ? ship_loadout_read(r, &c->ships.loadouts[h]) : ship_loadout_read_plain(r, &c->ships.loadouts[h]);
+            if (!read || c->ships.loadouts[h].hull != h) return false;
+        }
+    cw_reader_u8(r, &kinds);
+    if (!cw_reader_ok(r) || kinds > SHIP_CATALOGUE_MAX) return false;
+    for (int i = 0; i < kinds; ++i) cw_reader_u16(r, &c->ships.store[i]);
     return cw_reader_ok(r);
 }
 
@@ -85,6 +119,9 @@ cw_component_id net_component_id(const game *g, int component) {
     case NET_C_OWNED: return g->c_owned;
     case NET_C_CRAFT: return g->c_craft;
     case NET_C_PART: return g->c_part;
+    case NET_C_GRAVITY: return g->c_gravity;
+    case NET_C_BARRED: return g->c_barred;
+    case NET_C_DOCK: return g->c_dock;
     default: return CW_INVALID_COMPONENT;
     }
 }
@@ -178,7 +215,7 @@ bool net_component_write(cw_writer *w, game *g, cw_entity_id id, int component) 
         // motion, and what its parts made of it. Snapshots keep the motion fresh.
         const Craft *c = CW_GET(world, id, g->c_craft, Craft);
         write_name(w, c->name);
-        cw_writer_u8(w, (uint8_t)c->design);
+        ship_loadout_write(w, &c->loadout);
         write_v3(w, c->cabin_center);
         write_v3(w, c->cabin_half);
         cw_writer_f32(w, c->radius);
@@ -189,7 +226,22 @@ bool net_component_write(cw_writer *w, game *g, cw_entity_id id, int component) 
         write_quat(w, c->orientation);
         write_v3(w, c->velocity);
         write_v3(w, c->spin);
-        cw_writer_u8(w, (uint8_t)((c->resting ? 1 : 0) | (c->assist ? 2 : 0)));
+        cw_writer_u8(w, (uint8_t)((c->resting ? 1 : 0) | (c->assist ? 2 : 0) | (c->mode == CRAFT_LANDING ? 4 : 0)));
+        cw_writer_u8(w, (uint8_t)c->masts);
+        for (int m = 0; m < c->masts && m < CRAFT_MAX_MASTS; ++m) {
+            const craft_sail *sail = &c->sails[m];
+            cw_writer_f32(w, sail->set);
+            cw_writer_f32(w, sail->brace);
+            cw_writer_f32(w, sail->fill);
+            cw_writer_i64(w, sail->hand);
+            write_v3(w, sail->station);
+            cw_writer_f32(w, sail->area);
+            write_v3(w, sail->center);
+            cw_writer_f32(w, sail->drive);
+            cw_writer_f32(w, sail->sharpness);
+        }
+        cw_writer_u8(w, (uint8_t)(c->quiet_ticks < 0 ? 0 : c->quiet_ticks > 255 ? 255 : c->quiet_ticks));
+        for (int k = 0; k < CRAFT_GROUPS; ++k) cw_writer_f32(w, c->throttle[k]);
         cw_writer_f32(w, c->mass);
         write_v3(w, c->center);
         write_v3(w, c->inertia);
@@ -200,6 +252,34 @@ bool net_component_write(cw_writer *w, game *g, cw_entity_id id, int component) 
         }
         write_v3(w, c->gyro);
         write_v3(w, c->top_rate);
+        cw_writer_f32(w, c->response);
+        cw_writer_f32(w, c->turn_response);
+        cw_writer_f32(w, c->hull_drag);
+        cw_writer_i64(w, c->dock);
+        cw_writer_u8(w, (uint8_t)c->docking);
+        return true;
+    }
+    case NET_C_BARRED: {
+        const Barred *b = CW_GET(world, id, g->c_barred, Barred);
+        for (int i = 0; i < CRAFT_BARRED; ++i) {
+            cw_writer_u64(w, b->account[i]);
+            cw_writer_u64(w, b->until[i]);
+        }
+        return true;
+    }
+    case NET_C_DOCK: {
+        const Dock *d = CW_GET(world, id, g->c_dock, Dock);
+        write_name(w, d->name);
+        cw_writer_u8(w, (uint8_t)d->size);
+        write_v3(w, d->forward);
+        return true;
+    }
+    case NET_C_GRAVITY: {
+        const Gravity *gravity = CW_GET(world, id, g->c_gravity, Gravity);
+        cw_writer_u8(w, (uint8_t)gravity->kind);
+        cw_writer_f32(w, gravity->strength);
+        cw_writer_f32(w, gravity->radius);
+        cw_writer_f32(w, gravity->reach);
         return true;
     }
     case NET_C_PART: {
@@ -208,6 +288,10 @@ bool net_component_write(cw_writer *w, game *g, cw_entity_id id, int component) 
         cw_writer_f32(w, p->mass);
         write_v3(w, p->thrust);
         cw_writer_f32(w, p->torque);
+        cw_writer_i8(w, (int8_t)p->mast);
+        cw_writer_u8(w, (uint8_t)p->component);
+        cw_writer_u8(w, (uint8_t)p->paint);
+        write_v3(w, p->base);
         return true;
     }
     default:
@@ -302,11 +386,9 @@ bool net_component_read(cw_reader *r, game *g, cw_entity_id id, int component) {
     }
     case NET_C_CRAFT: {
         Craft c = {};
-        uint8_t design = 0, flags = 0;
+        uint8_t flags = 0, masts = 0;
         int16_t berth = 0;
-        if (!read_name(r, c.name)) return false;
-        cw_reader_u8(r, &design);
-        c.design = design;
+        if (!read_name(r, c.name) || !ship_loadout_read(r, &c.loadout)) return false;
         c.cabin_center = read_v3(r);
         c.cabin_half = read_v3(r);
         cw_reader_f32(r, &c.radius);
@@ -321,6 +403,27 @@ bool net_component_read(cw_reader *r, game *g, cw_entity_id id, int component) {
         cw_reader_u8(r, &flags);
         c.resting = (flags & 1) != 0;
         c.assist = (flags & 2) != 0;
+        c.mode = (flags & 4) ? CRAFT_LANDING : CRAFT_FLIGHT;
+        cw_reader_u8(r, &masts);
+        if (masts > CRAFT_MAX_MASTS) return false;
+        c.masts = masts;
+        for (int m = 0; m < CRAFT_MAX_MASTS; ++m) c.sails[m].hand = CW_INVALID_ENTITY;
+        for (int m = 0; m < c.masts; ++m) {
+            craft_sail *sail = &c.sails[m];
+            cw_reader_f32(r, &sail->set);
+            cw_reader_f32(r, &sail->brace);
+            cw_reader_f32(r, &sail->fill);
+            cw_reader_i64(r, &sail->hand);
+            sail->station = read_v3(r);
+            cw_reader_f32(r, &sail->area);
+            sail->center = read_v3(r);
+            cw_reader_f32(r, &sail->drive);
+            cw_reader_f32(r, &sail->sharpness);
+        }
+        uint8_t quiet = 0;
+        cw_reader_u8(r, &quiet);
+        c.quiet_ticks = quiet;
+        for (int k = 0; k < CRAFT_GROUPS; ++k) cw_reader_f32(r, &c.throttle[k]);
         cw_reader_f32(r, &c.mass);
         c.center = read_v3(r);
         c.inertia = read_v3(r);
@@ -331,11 +434,48 @@ bool net_component_read(cw_reader *r, game *g, cw_entity_id id, int component) {
         }
         c.gyro = read_v3(r);
         c.top_rate = read_v3(r);
+        cw_reader_f32(r, &c.response);
+        cw_reader_f32(r, &c.turn_response);
+        cw_reader_f32(r, &c.hull_drag);
+        uint8_t docking = 0;
+        cw_reader_i64(r, &c.dock);
+        cw_reader_u8(r, &docking);
+        c.docking = docking <= DOCK_DOCKED ? (int)docking : (int)DOCK_NONE;
         if (!cw_reader_ok(r)) return false;
         // A mass or inertia that cannot be divided by would make the first tick of
         // flight a nonsense: such a craft is left at rest, never flown.
         if (!(c.mass > 0.0f) || !(c.inertia.x > 0.0f) || !(c.inertia.y > 0.0f) || !(c.inertia.z > 0.0f)) c.mass = 0.0f;
+        if (!(c.response > 0.0f) || !(c.turn_response > 0.0f)) c.mass = 0.0f;
         return cw_comp_set(world, id, g->c_craft, &c, sizeof(c));
+    }
+    case NET_C_BARRED: {
+        Barred b = {};
+        for (int i = 0; i < CRAFT_BARRED; ++i) {
+            cw_reader_u64(r, &b.account[i]);
+            cw_reader_u64(r, &b.until[i]);
+        }
+        return cw_reader_ok(r) && cw_comp_set(world, id, g->c_barred, &b, sizeof(b));
+    }
+    case NET_C_DOCK: {
+        Dock d = {};
+        uint8_t size = 0;
+        if (!read_name(r, d.name)) return false;
+        cw_reader_u8(r, &size);
+        d.size = size;
+        d.forward = read_v3(r);
+        if (size > BERTH_LARGE) return false;
+        return cw_reader_ok(r) && cw_comp_set(world, id, g->c_dock, &d, sizeof(d));
+    }
+    case NET_C_GRAVITY: {
+        Gravity gravity = {};
+        uint8_t kind = 0;
+        cw_reader_u8(r, &kind);
+        gravity.kind = kind;
+        cw_reader_f32(r, &gravity.strength);
+        cw_reader_f32(r, &gravity.radius);
+        cw_reader_f32(r, &gravity.reach);
+        if (kind > GRAVITY_RADIAL) return false;
+        return cw_reader_ok(r) && cw_comp_set(world, id, g->c_gravity, &gravity, sizeof(gravity));
     }
     case NET_C_PART: {
         Part p = {};
@@ -345,6 +485,15 @@ bool net_component_read(cw_reader *r, game *g, cw_entity_id id, int component) {
         cw_reader_f32(r, &p.mass);
         p.thrust = read_v3(r);
         cw_reader_f32(r, &p.torque);
+        int8_t mast = -1;
+        uint8_t component = 0, paint = 0;
+        cw_reader_i8(r, &mast);
+        cw_reader_u8(r, &component);
+        cw_reader_u8(r, &paint);
+        p.base = read_v3(r);
+        p.mast = mast < CRAFT_MAX_MASTS ? mast : -1;
+        p.component = component;
+        p.paint = paint <= PAINT_SAIL ? (int)paint : (int)PAINT_FIXED;
         return cw_reader_ok(r) && cw_comp_set(world, id, g->c_part, &p, sizeof(p));
     }
     default:
@@ -525,6 +674,7 @@ void net_welcome_write(cw_writer *w, const net_welcome *m) {
     write_v3(w, m->spawn);
     cw_writer_u64(w, m->account);
     cw_writer_u8(w, m->input_target);
+    cw_writer_u8(w, m->currents ? 1 : 0);
     write_name(w, m->world);
     write_text(w, m->zone, NET_ZONE_NAME);
     cw_writer_u8(w, (uint8_t)m->place_count);
@@ -547,6 +697,9 @@ bool net_welcome_read(cw_reader *r, net_welcome *m) {
     m->spawn = read_v3(r);
     cw_reader_u64(r, &m->account);
     cw_reader_u8(r, &m->input_target);
+    uint8_t currents = 0;
+    cw_reader_u8(r, &currents);
+    m->currents = currents != 0;
     if (!read_name(r, m->world) || !read_text(r, m->zone, NET_ZONE_NAME)) return false;
     uint8_t count = 0;
     cw_reader_u8(r, &count);
@@ -580,13 +733,13 @@ static int16_t pitch_q(float pitch) {
 }
 // The wire's form of an input: axes in 127ths, angles in 16 bits, the buttons and
 // whether a helm's axes follow as flags.
-enum { INPUT_JUMP = 1, INPUT_ACT = 2, INPUT_USE = 4, INPUT_DECOUPLED = 8, INPUT_HELM = 16 };
+enum { INPUT_JUMP = 1, INPUT_ACT = 2, INPUT_USE = 4, INPUT_DECOUPLED = 8, INPUT_HELM = 16, INPUT_LANDING = 32, INPUT_DOCK = 64 };
 struct wire_input {
     int8_t forward, strafe;
     uint16_t yaw;
     int16_t pitch;
     uint8_t flags;
-    int8_t lift, turn_pitch, turn_yaw, turn_roll;
+    int8_t lift, turn_pitch, turn_yaw, turn_roll, sail, brace;
 };
 static wire_input input_to_wire(const PlayerInput *in) {
     wire_input q = {};
@@ -598,9 +751,12 @@ static wire_input input_to_wire(const PlayerInput *in) {
     q.turn_pitch = axis_q(in->turn_pitch);
     q.turn_yaw = axis_q(in->turn_yaw);
     q.turn_roll = axis_q(in->turn_roll);
-    bool helm = q.lift || q.turn_pitch || q.turn_yaw || q.turn_roll;
+    q.sail = axis_q(in->sail);
+    q.brace = axis_q(in->brace);
+    bool helm = q.lift || q.turn_pitch || q.turn_yaw || q.turn_roll || q.sail || q.brace;
     q.flags = (uint8_t)((in->jump ? INPUT_JUMP : 0) | (in->act ? INPUT_ACT : 0) | (in->use ? INPUT_USE : 0)
-                        | (in->decoupled ? INPUT_DECOUPLED : 0) | (helm ? INPUT_HELM : 0));
+                        | (in->decoupled ? INPUT_DECOUPLED : 0) | (helm ? INPUT_HELM : 0) | (in->landing ? INPUT_LANDING : 0)
+                        | (in->dock ? INPUT_DOCK : 0));
     return q;
 }
 static PlayerInput input_from_wire(const wire_input *q) {
@@ -613,10 +769,15 @@ static PlayerInput input_from_wire(const wire_input *q) {
     in.act = (q->flags & INPUT_ACT) != 0;
     in.use = (q->flags & INPUT_USE) != 0;
     in.decoupled = (q->flags & INPUT_DECOUPLED) != 0;
+    in.landing = (q->flags & INPUT_LANDING) != 0;
+    in.dock = (q->flags & INPUT_DOCK) != 0;
+
     in.lift = (float)q->lift / 127.0f;
     in.turn_pitch = (float)q->turn_pitch / 127.0f;
     in.turn_yaw = (float)q->turn_yaw / 127.0f;
     in.turn_roll = (float)q->turn_roll / 127.0f;
+    in.sail = (float)q->sail / 127.0f;
+    in.brace = (float)q->brace / 127.0f;
     return in;
 }
 void net_input_quantize(PlayerInput *in) {
@@ -640,6 +801,8 @@ void net_input_write(cw_writer *w, const net_input_message *m) {
             cw_writer_i8(w, q.turn_pitch);
             cw_writer_i8(w, q.turn_yaw);
             cw_writer_i8(w, q.turn_roll);
+            cw_writer_i8(w, q.sail);
+            cw_writer_i8(w, q.brace);
         }
         float view = m->view_ticks[i] < 0.0f ? 0.0f : m->view_ticks[i];
         cw_writer_u32(w, (uint32_t)view);
@@ -668,6 +831,8 @@ bool net_input_read(cw_reader *r, net_input_message *m) {
             cw_reader_i8(r, &q.turn_pitch);
             cw_reader_i8(r, &q.turn_yaw);
             cw_reader_i8(r, &q.turn_roll);
+            cw_reader_i8(r, &q.sail);
+            cw_reader_i8(r, &q.brace);
         }
         cw_reader_u32(r, &view);
         cw_reader_u8(r, &fraction);

@@ -71,6 +71,28 @@ static void pump_socket(net_socket *socket, net_connection *c, double now) {
         net_connection_receive(c, packet, (size_t)size, now);
     }
 }
+// Pumps a socket, as at the instant `now`, until `condition` holds or `seconds` of
+// real time have passed. A datagram sent on the loopback is not always there to be
+// read the moment the send returns (macOS's loopback hands it over a little later
+// than Linux's), so a test that counts what arrived waits for it to arrive; the
+// connection still sees every packet at `now`.
+// One datagram from a socket, waiting up to `seconds` for it; its size, or 0.
+static int recv_within(net_socket *socket, unsigned char *packet, size_t capacity, double seconds) {
+    double until = net_seconds() + seconds;
+    for (;;) {
+        int size = net_socket_recv(socket, NULL, packet, capacity);
+        if (size > 0 || net_seconds() >= until) return size > 0 ? size : 0;
+        net_sleep(0.001);
+    }
+}
+#define PUMP_UNTIL(socket, c, now, seconds, condition) do { \
+    double until_ = net_seconds() + (seconds); \
+    for (;;) { \
+        pump_socket(socket, c, now); \
+        if ((condition) || net_seconds() >= until_) break; \
+        net_sleep(0.001); \
+    } \
+} while (0)
 
 static void test_channels_under_loss(void) {
     net_socket *a = net_socket_open(0), *b = net_socket_open(0);
@@ -130,9 +152,8 @@ static void test_channels_under_loss(void) {
     net_connection_init(&stranger, a, loopback_b, 7, NULL, NULL);
     net_connection_send(&stranger, 1, NET_UNRELIABLE, "x", 1);
     net_connection_flush(&stranger, net_seconds(), false);
-    net_sleep(0.01);
     int before = rb.reliable_received + rb.unreliable_received;
-    pump_socket(b, &cb, net_seconds());
+    PUMP_UNTIL(b, &cb, net_seconds(), 2.0, cb.packets_rejected >= 1);
     CHECK(rb.reliable_received + rb.unreliable_received == before);
     CHECK(cb.packets_rejected == 1);
     net_connection_destroy(&stranger);
@@ -166,9 +187,8 @@ static void test_packet_validation(void) {
         const int channel_of_type[5] = {0, NET_RELIABLE_ORDERED, NET_UNRELIABLE, NET_SEQUENCED, NET_RELIABLE};
         for (int t = 1; t <= 4; ++t) CHECK(net_connection_send(&ca, (uint8_t)t, channel_of_type[t], payload, 4));
         net_connection_flush(&ca, net_seconds(), false);
-        net_sleep(0.01);
         unsigned char packet[NET_MAX_PACKET + 64];
-        int size = net_socket_recv(b, NULL, packet, sizeof(packet));
+        int size = recv_within(b, packet, sizeof(packet), 2.0);
         CHECK(size > 0);
         // Delivered once. Again: the reliable and sequenced messages are refused as
         // duplicates and stale, the unreliable one is delivered again; encrypted,
@@ -251,12 +271,15 @@ static void test_inbound_limit(void) {
         net_connection_flush(&ca, now, false);
         pump_socket(b, &cb, now);   // the same instant: only the burst gets through
     }
+    // Every one of the two hundred read, still at that instant, however late the
+    // loopback hands the last of them over.
+    PUMP_UNTIL(b, &cb, now, 2.0, rb.unreliable_received + (int)cb.packets_throttled >= 200);
     CHECK(rb.unreliable_received == 50);
     CHECK(cb.packets_throttled == 150);
     unsigned char payload[4] = {0, 0, 0, 0};
     net_connection_send(&ca, 2, NET_UNRELIABLE, payload, 4);
     net_connection_flush(&ca, now, false);
-    pump_socket(b, &cb, now + 0.1);   // a tenth of a second later: five more are allowed
+    PUMP_UNTIL(b, &cb, now + 0.1, 2.0, rb.unreliable_received >= 51);   // a tenth of a second later: five more are allowed
     CHECK(rb.unreliable_received == 51);
     net_connection_destroy(&ca);
     net_connection_destroy(&cb);
@@ -566,9 +589,8 @@ static void test_crypto(void) {
     unsigned char probe[4] = {0x5a, 0x5a, 0x5a, 0x5a};
     net_connection_send(&ca, 2, NET_UNRELIABLE, probe, 4);
     net_connection_flush(&ca, net_seconds(), false);
-    net_sleep(0.01);
     unsigned char packet[NET_MAX_PACKET];
-    int size = net_socket_recv(b, NULL, packet, sizeof(packet));
+    int size = recv_within(b, packet, sizeof(packet), 2.0);
     CHECK(size > NET_PACKET_HEADER + 8 + CRYPTO_TAG_SIZE);
     bool leaked = false;
     for (int i = NET_PACKET_HEADER; i + 4 <= size; ++i) leaked = leaked || memcmp(packet + i, probe, 4) == 0;
@@ -673,14 +695,36 @@ static void test_snapshot_codec(void) {
     // still costs what an idle player does; one that moved, a few bytes a number.
     quat turned = quat_normalize(quat_make(0.01f, 0.7071f, -0.002f, 0.7071f));
     v3 where = v3_make(-1234.56789f, 87.654321f, 0.000123f), going = v3_make(12.3456f, -0.5f, 70.0f), spin = v3_make(0.01f, -0.3f, 0.0f);
+    Craft flying = {}, parked = {};
+    flying.velocity = parked.velocity = going;
+    flying.orientation = parked.orientation = turned;
+    flying.spin = parked.spin = spin;
+    flying.pilot = 12;
+    flying.assist = true;
+    flying.throttle[CRAFT_GROUP_UP] = 0.6f;
+    flying.masts = 2;
+    flying.sails[0].set = 0.7318f;
+    flying.sails[0].fill = 0.5f;
+    flying.sails[0].brace = -0.61f;
+    flying.sails[0].hand = 31;
+    flying.sails[1].set = 0.25f;
+    flying.sails[1].brace = 0.3f;
+    flying.sails[1].hand = CW_INVALID_ENTITY;
+    parked.masts = 1;
+    parked.sails[0].hand = CW_INVALID_ENTITY;
+    parked.pilot = CW_INVALID_ENTITY;
+    parked.resting = true;
+    parked.mode = CRAFT_LANDING;
+    parked.quiet_ticks = 30;
     snapshot *craft_base = snapshot_ring_push(&ring, 4);
     craft_base->tick = 200;
-    craft_base->entries[craft_base->count++] = snapshot_entry_craft(7, where, going, turned, spin, 12, false, true);
-    craft_base->entries[craft_base->count++] = snapshot_entry_craft(8, where, going, turned, spin, CW_INVALID_ENTITY, true, false);
+    craft_base->entries[craft_base->count++] = snapshot_entry_craft(7, where, &flying);
+    craft_base->entries[craft_base->count++] = snapshot_entry_craft(8, where, &parked);
     snapshot *craft_now = snapshot_ring_push(&ring, 4);
     craft_now->tick = 203;
-    craft_now->entries[craft_now->count++] = snapshot_entry_craft(7, v3_add(where, v3_scale(going, 0.05f)), going,
-                                                                 quat_integrate(turned, spin, 0.05f), spin, 12, false, true);
+    flying.orientation = quat_integrate(turned, spin, 0.05f);
+    flying.throttle[CRAFT_GROUP_FORWARD] = 1.0f;   // the main engines light
+    craft_now->entries[craft_now->count++] = snapshot_entry_craft(7, v3_add(where, v3_scale(going, 0.05f)), &flying);
     craft_now->entries[craft_now->count++] = craft_base->entries[1];
     cw_writer_init_fixed(&w, packet, sizeof(packet));
     CHECK(snapshot_encode(craft_now, NULL, &w));
@@ -688,7 +732,7 @@ static void test_snapshot_codec(void) {
     cw_writer_init_fixed(&w, packet, sizeof(packet));
     CHECK(snapshot_encode(craft_now, craft_base, &w));
     CHECK(w.size < full / 2);
-    CHECK(w.size < 14 + 2 + 2 + 7 * 4);   // the still one two bytes; the moving one's position and rotation
+    CHECK(w.size < 14 + 2 + 2 + 7 * 4 + 17);   // the still one two bytes; the moving one's position, rotation, engines and sails
     r = cw_reader_make(packet, w.size);
     CHECK(snapshot_decode(&r, craft_base, &decoded));
     CHECK(decoded.count == 2);
@@ -706,6 +750,16 @@ static void test_snapshot_codec(void) {
     }
     CHECK(decoded.entries[0].pilot == 12 && decoded.entries[1].pilot == CW_INVALID_ENTITY);
     CHECK((decoded.entries[1].flags & (SNAP_CRAFT | SNAP_RESTING)) == (SNAP_CRAFT | SNAP_RESTING));
+    Craft seen = {};
+    v3 at;
+    snapshot_craft_apply(&decoded.entries[0], &seen, &at);
+    CHECK(seen.pilot == 12 && seen.assist && !seen.resting && seen.mode == CRAFT_FLIGHT);
+    CHECK(seen.throttle[CRAFT_GROUP_FORWARD] == 1.0f && fabsf(seen.throttle[CRAFT_GROUP_UP] - 0.6f) < 0.003f);
+    CHECK(seen.sails[0].set == 0.7318f && fabsf(seen.sails[0].fill - 0.5f) < 0.01f && seen.sails[0].brace == -0.61f && seen.sails[0].hand == 31);
+    CHECK(seen.sails[1].set == 0.25f && seen.sails[1].brace == 0.3f && seen.sails[1].hand == CW_INVALID_ENTITY);
+    CHECK(seen.sails[2].set == 0.0f && seen.sails[2].hand == CW_INVALID_ENTITY);   // no third mast
+    snapshot_craft_apply(&decoded.entries[1], &seen, &at);
+    CHECK(seen.resting && seen.mode == CRAFT_LANDING && seen.quiet_ticks == 30 && seen.throttle[CRAFT_GROUP_UP] == 0.0f);
     snapshot_free(&decoded);
     snapshot_ring_destroy(&ring);
 }
@@ -842,13 +896,20 @@ static void rig_run(rig *r, double seconds) {
     double start = net_seconds();
     while (net_seconds() - start < seconds) rig_step(r);
 }
+// Steps the rig until `condition` holds or `seconds` have passed: for what comes
+// back over the network, which a slow or loaded machine takes longer over than a
+// fast one, so that no test hangs on a fixed wait being long enough.
+#define RIG_UNTIL(r, seconds, condition) do { \
+    double until_ = net_seconds() + (seconds); \
+    while (!(condition) && net_seconds() < until_) rig_step(r); \
+} while (0)
 static bool rig_wait_connected(rig *r, double seconds) {
     double start = net_seconds();
     for (;;) {
         bool all = true;
         for (int i = 0; i < r->client_count; ++i)
             if (r->used[i] && net_session_state(&r->sessions[i]) != NC_CONNECTED) all = false;
-        if (all) return true;
+        if (all) { if (getenv("TEST_TIMING")) fprintf(stderr, "TIMING connect %.2f s of %.1f\n", net_seconds() - start, seconds); return true; }
         if (net_seconds() - start > seconds) return false;
         rig_step(r);
     }
@@ -997,7 +1058,7 @@ static void test_join_and_play_under_loss(void) {
     rig_init(&r, 0.25f);
     int a = rig_add_client(&r, 0.25f);
     int b = rig_add_client(&r, 0.0f);
-    CHECK(rig_wait_connected(&r, 8.0));
+    CHECK(rig_wait_connected(&r, 20.0));   // the world through a quarter of it lost each way, at the rate loss allows
     if (failures) { rig_destroy(&r); return; }
     rig_run(&r, 1.0);   // the other's record, reliable, may take a few tries through the loss
     server *s = r.servers[0];
@@ -1380,7 +1441,7 @@ static void test_bandwidth_limit(void) {
     config.bandwidth = 3000;   // bytes per second per client
     server *s = rig_add_server(&r, &config, 0.0f);
     for (int i = 0; i < 4; ++i) rig_add_client(&r, 0.0f);
-    CHECK(rig_wait_connected(&r, 10.0));
+    CHECK(rig_wait_connected(&r, 30.0));   // the world at 3 KB/s: some seconds
     if (failures) { rig_destroy(&r); return; }
     for (int i = 0; i < 4; ++i) r.inputs[i].forward = 1.0f;
     r.inputs[1].yaw = 1.0f;
@@ -1635,6 +1696,91 @@ static void test_social_service(void) {
     CHECK(social_view(soc, 2, &view) && view.invite == 0);
     CHECK(!social_find(soc, 2)->online);
     CHECK(pushes_seen > 10);
+    // Characters saved before ships (version 1: gear alone) load, each with a sloop
+    // and the purse; saved again, they keep their fleet.
+    {
+        const char *path = "treasure_test_v1.bin";
+        cw_writer w;
+        cw_writer_init(&w);
+        cw_writer_bytes(&w, "TPSV", 4);
+        cw_writer_u32(&w, 1);
+        cw_writer_u32(&w, 1);
+        cw_writer_u64(&w, 42);
+        cw_writer_u8(&w, 4);
+        cw_writer_bytes(&w, "Dora", 4);
+        cw_writer_u8(&w, 0);
+        character old = {};
+        old.version = 9;
+        old.equipment[SLOT_HEAD] = item_roll(5, 3);
+        old.equipment[SLOT_HEAD].slot = SLOT_HEAD;
+        cw_writer_u32(&w, old.version);
+        for (int i = 0; i < SLOT_COUNT; ++i) item_write(&w, &old.equipment[i]);
+        for (int i = 0; i < STASH_SIZE; ++i) item_write(&w, &old.stash[i]);
+        cw_file_error error;
+        CHECK(cw_file_write(path, w.data, w.size, &error));
+        cw_writer_destroy(&w);
+        social *loaded = (social *)malloc(sizeof(social));
+        social_init(loaded, &secret, count_push, NULL);
+        CHECK(social_load(loaded, path));
+        character *dora = social_character(loaded, 42, NULL);
+        CHECK(dora && dora->version == 9 && dora->equipment[SLOT_HEAD].id == old.equipment[SLOT_HEAD].id);
+        CHECK(dora && fleet_owns(dora, HULL_SLOOP) && dora->ships.sailing == HULL_SLOOP && dora->bottomless);
+        shipwright_order buy = {SHIPWRIGHT_BUY_HULL, HULL_BRIGANTINE, 0, 0};
+        CHECK(dora && shipwright_apply(dora, &buy) == SHIPWRIGHT_DONE);
+        social_set_save_path(loaded, path);
+        CHECK(social_save(loaded));
+        social *again = (social *)malloc(sizeof(social));
+        social_init(again, &secret, count_push, NULL);
+        CHECK(social_load(again, path));
+        character *kept = social_character(again, 42, NULL);
+        CHECK(kept && fleet_owns(kept, HULL_BRIGANTINE) && kept->spent == ship_hull_price(HULL_BRIGANTINE));
+        free(loaded);
+        free(again);
+        remove(path);
+    }
+    // ...and so do those saved before ships had looks (version 2): as built.
+    {
+        const char *path = "treasure_test_v2.bin";
+        cw_writer w;
+        cw_writer_init(&w);
+        cw_writer_bytes(&w, "TPSV", 4);
+        cw_writer_u32(&w, 2);
+        cw_writer_u32(&w, 1);
+        cw_writer_u64(&w, 43);
+        cw_writer_u8(&w, 3);
+        cw_writer_bytes(&w, "Eve", 3);
+        cw_writer_u8(&w, 0);
+        character old = {};
+        cw_writer_u32(&w, 4);
+        for (int i = 0; i < SLOT_COUNT; ++i) item_write(&w, &old.equipment[i]);
+        for (int i = 0; i < STASH_SIZE; ++i) item_write(&w, &old.stash[i]);
+        cw_writer_i64(&w, 0);
+        cw_writer_u8(&w, 1);
+        cw_writer_i64(&w, 20000);
+        cw_writer_u8(&w, (1u << HULL_SLOOP) | (1u << HULL_CUTTER));
+        cw_writer_u8(&w, HULL_CUTTER);
+        for (int h = HULL_SLOOP; h <= HULL_CUTTER; ++h) {   // the loadouts as they were: slots, and no look
+            ship_loadout l = ship_default_loadout(h);
+            int n = ship_slot_count(h);
+            cw_writer_u8(&w, (uint8_t)h);
+            cw_writer_u8(&w, (uint8_t)n);
+            for (int i = 0; i < n; ++i) cw_writer_u8(&w, l.fit[i]);
+        }
+        cw_writer_u8(&w, (uint8_t)ship_component_count());
+        for (int i = 0; i < ship_component_count(); ++i) cw_writer_u16(&w, i == ship_component_find("Iron Furnace") ? 2 : 0);
+        cw_file_error error;
+        CHECK(cw_file_write(path, w.data, w.size, &error));
+        cw_writer_destroy(&w);
+        social *loaded = (social *)malloc(sizeof(social));
+        social_init(loaded, &secret, count_push, NULL);
+        CHECK(social_load(loaded, path));
+        character *eve = social_character(loaded, 43, NULL);
+        CHECK(eve && eve->ships.sailing == HULL_CUTTER && fleet_owns(eve, HULL_SLOOP) && eve->spent == 20000);
+        CHECK(eve && eve->ships.store[ship_component_find("Iron Furnace")] == 2);
+        CHECK(eve && fleet_sailing(eve)->look.field[LOOK_HULL_SHAPE] == SHAPE_CLASSIC && fleet_sailing(eve)->look.field[LOOK_HULL_PAINT] == 0);
+        free(loaded);
+        remove(path);
+    }
     free(soc);
 }
 
@@ -1861,6 +2007,7 @@ static void test_loot(void) {
             CHECK(ca->gear.equipment[0].id == worn_id || ca->gear.equipment[1].id == worn_id || ca->gear.equipment[2].id == worn_id
                   || ca->gear.equipment[3].id == worn_id || ca->gear.equipment[4].id == worn_id);
             CHECK(ca->gear.version >= 2);
+            CHECK(fleet_owns(&ca->gear, HULL_CUTTER) && ca->gear.ships.sailing == HULL_CUTTER && ca->gear.spent == ship_hull_price(HULL_CUTTER));
             rig_destroy(&r);
             break;
         }
@@ -1899,6 +2046,18 @@ static void test_loot(void) {
         start = net_seconds();
         while (ca->gear_updates < 5 && net_seconds() - start < 3.0) rig_step(&r);
         CHECK(ca->gear.equipment[treasure.slot].id == treasure.id);
+        // Ships are kept with the rest: a cutter bought at the shipwright's counter, and sailed.
+        int counter = -1;
+        for (int i = 0; i < s->zone.place_count; ++i)
+            if (s->zone.places[i].kind == PLACE_SHIPWRIGHT) counter = i;
+        Transform *there = CW_GET(&s->zone.world, ca->player, s->zone.c_transform, Transform);
+        there->position = there->previous = s->zone.places[counter].spawn;
+        rig_run(&r, 0.3);
+        shipwright_order buy = {SHIPWRIGHT_BUY_HULL, HULL_CUTTER, 0, 0}, sail = {SHIPWRIGHT_SAIL, HULL_CUTTER, 0, 0};
+        net_client_shipwright(ca, &buy);
+        net_client_shipwright(ca, &sail);
+        RIG_UNTIL(&r, 10.0, ca->gear.ships.sailing == HULL_CUTTER);
+        CHECK(ca->gear.ships.sailing == HULL_CUTTER);
         // Chests in the dungeons are part of the world, and say what they hold.
         char dungeon[GAME_NAME_CAPACITY];
         game_dungeon_name("Verdant", dungeon, sizeof(dungeon));
@@ -2099,7 +2258,7 @@ static void test_orchestrator(void) {
     int a = r.client_count++;
     r.used[a] = true;
     CHECK(net_session_init_directory(&r.sessions[a], dir_text, "hub", 0.0f, &alice));
-    CHECK(rig_wait_connected(&r, 8.0));
+    CHECK(rig_wait_connected(&r, 15.0));
     start = net_seconds();
     for (;;) {
         rig_step(&r);
@@ -2110,7 +2269,7 @@ static void test_orchestrator(void) {
     int b = r.client_count++;
     r.used[b] = true;
     CHECK(net_session_init_directory(&r.sessions[b], dir_text, "hub", 0.0f, &bob));
-    CHECK(rig_wait_connected(&r, 8.0));
+    CHECK(rig_wait_connected(&r, 15.0));
     CHECK(link_of(&r, a)->server.port != link_of(&r, b)->server.port);
     // Both leave; the extra shard empties, drains, and is stopped; the first stays.
     rig_drop_client(&r, a);
@@ -2264,6 +2423,17 @@ static void raw_receive(net_socket *socket, raw_answer *a) {
     }
 }
 
+// Steps the rig and reads a raw socket's answers until `condition` holds, or up to
+// `seconds` of real time.
+#define RAW_UNTIL(r, socket, answer, seconds, condition) do { \
+    double until_ = net_seconds() + (seconds); \
+    for (;;) { \
+        rig_step(r); \
+        raw_receive(socket, answer); \
+        if ((condition) || net_seconds() >= until_) break; \
+    } \
+} while (0)
+
 static void test_handshake_defences(void) {
     rig r;
     rig_init(&r, 0.0f);
@@ -2285,30 +2455,26 @@ static void test_handshake_defences(void) {
     // nothing is allocated or computed for the sender.
     raw_answer answer = {};
     size_t sent = raw_connect(raw, to, &m);
-    rig_run(&r, 0.05);
-    raw_receive(raw, &answer);
+    RAW_UNTIL(&r, raw, &answer, 2.0, answer.challenges >= 1);
     CHECK(answer.challenges == 1 && answer.keys == 0 && answer.rejects == 0);
     CHECK(answer.bytes < sent && sent >= NET_CONNECT_PADDING);
     CHECK(s->challenges_sent == 2 && s->client_count == 1);
     // A wrong challenge: the same, counted.
     m.challenge = answer.challenge ^ 1;
     raw_connect(raw, to, &m);
-    rig_run(&r, 0.05);
-    raw_receive(raw, &answer);
+    RAW_UNTIL(&r, raw, &answer, 2.0, answer.challenges >= 2);
     CHECK(answer.challenges == 2 && answer.keys == 0 && s->challenges_failed == 1 && s->client_count == 1);
     // A challenge for one address is no good from another.
     net_socket *other = net_socket_open(0);
     m.challenge = answer.challenge;
     raw_connect(other, to, &m);
-    rig_run(&r, 0.05);
     raw_answer other_answer = {};
-    raw_receive(other, &other_answer);
+    RAW_UNTIL(&r, other, &other_answer, 2.0, other_answer.challenges >= 1);
     CHECK(other_answer.challenges == 1 && other_answer.keys == 0 && s->challenges_failed == 2 && s->client_count == 1);
     net_socket_close(other);
     // The right one is admitted: the keys come back, and a slot is taken.
     raw_connect(raw, to, &m);
-    rig_run(&r, 0.05);
-    raw_receive(raw, &answer);
+    RAW_UNTIL(&r, raw, &answer, 2.0, answer.keys >= 1);
     CHECK(answer.keys == 1 && s->challenges_passed == 2 && s->client_count == 2);
 
     // A flood of connects from one address: most are dropped unread, the challenges
@@ -2469,7 +2635,8 @@ static void test_connect_tokens(void) {
     rig_destroy(&r);
 }
 
-// TEST_ONLY=name in the environment runs just that test.
+// TEST_ONLY=name in the environment runs just that test; TEST_TIMING=1 prints how
+// long each rig's clients took to load the world (rig_wait_connected).
 // ---------------------------------------------------------------------------
 // Crafts: flown by their owner's client a tick ahead of the server and agreeing
 // with it exactly, seen by another client, refused to anyone else at the helm
@@ -2488,6 +2655,15 @@ static void press_use(rig *r, int i) {
     r->inputs[i].use = false;
 }
 
+// What may part a client's prediction from the server's flight: inputs of the
+// player's the server did not apply as sent (ticks it had none, those that came too
+// late), and ticks the server skipped, stalled past its catch-up (a machine too
+// slow or too loaded to keep the clock). Without any of these it must be exact.
+static uint32_t missed_inputs(server *s, cw_entity_id player) {
+    const server_client *c = server_client_of(s, player);
+    return c ? c->inputs.starved + c->inputs.skipped + s->ticks_skipped : 0;
+}
+
 static void test_crafts_online(void) {
     rig r;
     rig_init(&r, 0.0f);
@@ -2500,7 +2676,7 @@ static void test_crafts_online(void) {
     game *ga = world_of(&r, a), *gb = world_of(&r, b), *gs = &s->zone;
 
     // Alice's craft, parked on the hub; both clients are sent it, parts and all.
-    cw_entity_id craft = game_spawn_craft(gs, 0, v3_make(12.0f, 0.0f, -6.0f), 0.0f, ca->account, -1);
+    cw_entity_id craft = game_spawn_craft(gs, NULL, v3_make(12.0f, 0.0f, -6.0f), 0.0f, ca->account, -1);
     rig_run(&r, 0.3);
     CHECK(cw_world_is_valid(&ga->world, craft) && cw_world_is_valid(&gb->world, craft));
     CHECK(cw_world_entity_count(&ga->world) == cw_world_entity_count(&gs->world));
@@ -2532,19 +2708,27 @@ static void test_crafts_online(void) {
     // with it every time; Bob rides along, predicting himself in its frame.
     struct { float lift, yaw, forward, seconds; } legs[] = {{1.0f, 0, 0, 1.0f}, {0.2f, 0.8f, 0, 1.0f}, {0, 0, 1.0f, 1.0f}, {0, 0, 0, 4.0f}};
     float worst_craft = 0.0f, worst_bob = 0.0f;
+    double start = 0.0;
+    float engines_on_b[CRAFT_GROUPS] = {};   // the most Bob saw each thruster group fire at
     uint32_t starved = 0;
     for (size_t leg = 0; leg < sizeof(legs) / sizeof(legs[0]); ++leg) {
         r.inputs[a].lift = legs[leg].lift;
         r.inputs[a].turn_yaw = legs[leg].yaw;
         r.inputs[a].forward = legs[leg].forward;
-        double start = net_seconds();
+        start = net_seconds();
         while (net_seconds() - start < legs[leg].seconds) {
             rig_step(&r);
             if (ca->craft_error > worst_craft) worst_craft = ca->craft_error;
             if (cb->last_error > worst_bob) worst_bob = cb->last_error;
+            for (int k = 0; k < CRAFT_GROUPS; ++k)
+                if (on_b->throttle[k] > engines_on_b[k]) engines_on_b[k] = on_b->throttle[k];
         }
     }
-    starved = server_client_of(s, ca->player)->inputs.starved;
+    // Bob saw her engines fire: the lift on the way up, the mains on the way forward.
+    CHECK(engines_on_b[CRAFT_GROUP_UP] > 0.5f);
+    CHECK(engines_on_b[CRAFT_GROUP_FORWARD] > 0.9f);
+    CHECK(on_b->mode == CRAFT_FLIGHT && on_b->assist);
+    starved = missed_inputs(s, ca->player);
     v3 parked = v3_make(12.0f, 0.0f, -6.0f);
     v3 there = position_in(gs, craft);
     CHECK(there.y > parked.y + 3.0f);
@@ -2564,12 +2748,35 @@ static void test_crafts_online(void) {
     CHECK(fabsf(quat_dot(on_b->orientation, on_server->orientation)) > 0.9999f);
     CHECK(fabsf(quat_dot(on_server->orientation, quat_identity())) < 0.99f);   // it did turn
 
+    // Alice puts it in landing mode and brings it down onto the hub: it settles and
+    // powers down with her still at the helm. Her prediction holds to the bit all the
+    // way, and Bob sees the mode, the engines dying away and the craft at rest.
+    r.inputs[a].landing = true;
+    r.inputs[a].lift = -1.0f;
+    start = net_seconds();
+    float worst_landing = 0.0f;
+    while (net_seconds() - start < 8.0 && !(on_server->resting && on_b->resting)) {
+        rig_step(&r);
+        if (ca->craft_error > worst_landing) worst_landing = ca->craft_error;
+    }
+    rig_run(&r, 0.3);
+    CHECK(worst_landing < 0.001f || missed_inputs(s, ca->player) > starved);
+    CHECK(on_server->resting && on_server->mode == CRAFT_LANDING && on_server->pilot == ca->player);
+    CHECK(on_a->resting && on_a->mode == CRAFT_LANDING);
+    CHECK(on_b->resting && on_b->mode == CRAFT_LANDING && on_b->pilot == ca->player);
+    for (int k = 0; k < CRAFT_GROUPS; ++k) CHECK(on_b->throttle[k] == 0.0f && on_server->throttle[k] == 0.0f);
+    CHECK(distance(position_in(gb, craft), position_in(gs, craft)) < 0.01f);
+    CHECK(position_in(gs, craft).y < 2.0f);   // on the hub's floor: its draft is a metre and a half
+    r.inputs[a].lift = 0.0f;
+    r.inputs[a].landing = false;
+    rig_run(&r, 0.3);   // in flight mode on the ground, the computer holds it up: awake
+
     // Alice lets go of the helm: its engines stop, and it drops to the hub. Her
     // client stops predicting it and draws it from snapshots again, from fresh ones:
     // never back where it was when she took it.
     press_use(&r, a);
     float farthest = 0.0f;
-    double start = net_seconds();
+    start = net_seconds();
     while (net_seconds() - start < 2.5) {
         rig_step(&r);
         float off = distance(position_in(ga, craft), position_in(gs, craft));
@@ -2581,9 +2788,43 @@ static void test_crafts_online(void) {
     CHECK(distance(position_in(ga, craft), position_in(gs, craft)) < 0.01f);
     CHECK(game_aboard(gs, ca->player) == craft && game_aboard(gs, cb->player) == craft);
 
+    // Bob cannot put the owner off her own craft; the owner can put him off. He is
+    // set down behind the stern on the server and in his own prediction, hears that
+    // he is barred, and walking back up the stairs he is stopped at the gangway,
+    // his prediction agreeing with the server as he is.
+    net_session_kick(&r.sessions[b], ca->player);
+    rig_run(&r, 0.3);
+    CHECK(s->kicks_refused == 1 && game_aboard(gs, ca->player) == craft);
+    net_session_kick(&r.sessions[a], cb->player);
+    rig_run(&r, 0.5);
+    CHECK(s->kicks == 1);
+    CHECK(game_aboard(gs, cb->player) == CW_INVALID_ENTITY && game_aboard(gb, cb->player) == CW_INVALID_ENTITY);
+    CHECK(!game_may_board(gs, cb->player, craft) && !game_may_board(gb, cb->player, craft) && !game_may_board(ga, cb->player, craft));
+    CHECK(distance(position_in(gb, cb->player), position_in(gs, cb->player)) < 0.6f);   // a round trip ahead of the server
+    v3 gangway = game_craft_to_world(gs, craft, v3_make(0, 0, 1.0f));
+    float worst_outside = 0.0f;
+    start = net_seconds();
+    while (net_seconds() - start < 3.0) {
+        v3 way = v3_sub(gangway, position_in(gb, cb->player));
+        r.inputs[b].yaw = atan2f(-way.x, -way.z);
+        r.inputs[b].forward = 1.0f;
+        rig_step(&r);
+        CHECK(game_aboard(gs, cb->player) == CW_INVALID_ENTITY && game_aboard(gb, cb->player) == CW_INVALID_ENTITY);
+        if (net_seconds() - start > 0.5 && cb->last_error > worst_outside) worst_outside = cb->last_error;
+    }
+    r.inputs[b].forward = 0.0f;
+    rig_run(&r, 0.3);
+    CHECK(worst_outside < 0.01f);
+    // Wherever he was set down (behind the stern, or beside the craft where the hub
+    // ends behind it), he is on his feet by it, and outside the space over its deck.
+    v3 reached = game_craft_from_world(gs, craft, position_in(gs, cb->player));
+    const Craft *shape = CW_GET(&gs->world, craft, gs->c_craft, Craft);
+    CHECK(v3_length(reached) < shape->radius + 3.0f);
+    CHECK(CW_GET(&gs->world, cb->player, gs->c_player, Player)->grounded);
+    CHECK(fabsf(reached.x) >= shape->cabin_half.x || fabsf(reached.z) >= shape->cabin_half.z || reached.y < -0.1f);
+
     // Alice leaves: her craft waits for her a while (here half a second; her body
-    // lingers as long again) and is then put away, and Bob is set down where he
-    // stood, in the world's frame, on the server and in his own prediction.
+    // lingers as long again) and is then put away.
     rig_drop_client(&r, a);
     rig_run(&r, 0.3);
     CHECK(cw_world_is_valid(&gs->world, craft));
@@ -2593,6 +2834,322 @@ static void test_crafts_online(void) {
     CHECK(game_aboard(gs, cb->player) == CW_INVALID_ENTITY);
     CHECK(game_aboard(gb, cb->player) == CW_INVALID_ENTITY);
     CHECK(cb->state == NC_CONNECTED);
+    rig_destroy(&r);
+}
+
+// Sailing online: Alice at the helm, Bob at the sails. Bob hoists and braces the
+// sail and everyone sees it set and turned; Alice's prediction of her craft, which
+// cannot know Bob's hands, is exact again as soon as they rest; and left with nobody
+// at helm or sails, the craft sails on.
+static void test_sails_online(void) {
+    rig r;
+    rig_init(&r, 0.0f);
+    server *s = r.servers[0];
+    s->zone.currents = true;   // as --currents does: the clients hear of it in the welcome
+    int a = rig_add_client_named(&r, s, 0.0f, "Alice"), b = rig_add_client_named(&r, s, 0.0f, "Bob");
+    CHECK(rig_wait_connected(&r, 5.0));
+    if (failures) { rig_destroy(&r); return; }
+    rig_run(&r, 0.3);
+    net_client *ca = link_of(&r, a), *cb = link_of(&r, b);
+    game *ga = world_of(&r, a), *gb = world_of(&r, b), *gs = &s->zone;
+    CHECK(ga->currents && gb->currents);
+    // High over the hub, its bow where the current flows.
+    v3 at = v3_make(0.0f, 60.0f, 0.0f);
+    v3 flow = game_solar_current_at_tick(gs, at, gs->world.tick);
+    cw_entity_id craft = game_spawn_craft(gs, NULL, at, atan2f(-flow.x, -flow.z), ca->account, -1);
+    CW_GET(&gs->world, craft, gs->c_craft, Craft)->resting = false;
+    rig_run(&r, 0.3);
+    const Craft *on_server = CW_GET(&gs->world, craft, gs->c_craft, Craft);
+    place_on_server(s, ca->player, game_craft_to_world(gs, craft, v3_make(0, 0.05f, -3.0f)));
+    place_on_server(s, cb->player, game_craft_to_world(gs, craft, v3_add(on_server->sails[0].station, v3_make(0, 0.05f, 0))));
+    rig_run(&r, 0.3);
+    press_use(&r, a);
+    press_use(&r, b);
+    rig_run(&r, 0.5);
+    CHECK(on_server->pilot == ca->player && on_server->sails[0].hand == cb->player);
+    if (!cw_world_is_valid(&gb->world, craft) || !cw_world_is_valid(&ga->world, craft)) { rig_destroy(&r); return; }
+    const Craft *on_a = CW_GET(&ga->world, craft, ga->c_craft, Craft), *on_b = CW_GET(&gb->world, craft, gb->c_craft, Craft);
+    CHECK(on_a->sails[0].hand == cb->player && on_b->sails[0].hand == cb->player);
+
+    // Bob hoists, and braces a little to starboard.
+    r.inputs[b].sail = 1.0f;
+    r.inputs[b].brace = 1.0f;
+    rig_run(&r, 0.5);
+    r.inputs[b].brace = 0.0f;
+    rig_run(&r, 2.0);
+    r.inputs[b].sail = 0.0f;
+    rig_run(&r, 0.5);
+    CHECK(on_server->sails[0].set == 1.0f && on_a->sails[0].set == 1.0f && on_b->sails[0].set == 1.0f);
+    CHECK(on_server->sails[0].brace > 0.2f && on_a->sails[0].brace == on_server->sails[0].brace && on_b->sails[0].brace == on_server->sails[0].brace);
+    CHECK(on_server->sails[0].fill > 0.5f);
+    uint32_t starved = missed_inputs(s, ca->player);
+    float worst = 0.0f;
+    double start = net_seconds();
+    while (net_seconds() - start < 1.5) {
+        rig_step(&r);
+        if (ca->craft_error > worst) worst = ca->craft_error;
+    }
+    CHECK(worst < 0.001f || missed_inputs(s, ca->player) > starved);
+    // Both step away: it sails on, straight and level.
+    press_use(&r, a);
+    press_use(&r, b);
+    rig_run(&r, 0.5);
+    CHECK(on_server->pilot == CW_INVALID_ENTITY && on_server->sails[0].hand == CW_INVALID_ENTITY && on_server->sails[0].set == 1.0f);
+    CHECK(on_b->sails[0].hand == CW_INVALID_ENTITY);
+    v3 sailing = position_in(gs, craft);
+    float height = sailing.y;
+    rig_run(&r, 2.0);
+    v3 bow = quat_rotate(on_server->orientation, v3_make(0, 0, -1));
+    CHECK(v3_dot(v3_sub(position_in(gs, craft), sailing), bow) > 10.0f);
+    CHECK(fabsf(position_in(gs, craft).y - height) < 0.5f);
+    CHECK(distance(position_in(gb, craft), position_in(gs, craft)) < 5.0f);
+    CHECK(game_aboard(gs, cb->player) == craft && game_aboard(gb, cb->player) == craft);
+    rig_destroy(&r);
+}
+
+// The parts of a craft a world holds: all of them, once its records have arrived.
+static int craft_parts_in(game *g, cw_entity_id craft) {
+    int n = 0;
+    cw_query query = cw_query_begin(g->q_attachments);
+    cw_entity_id id;
+    while (cw_query_next(&query, &id)) n += CW_GET(&g->world, id, g->c_attachment, Attachment)->ship == craft;
+    return n;
+}
+// Whether a client holds a craft whole: its record and every part the server has.
+static bool holds_craft(game *client, game *server, cw_entity_id craft) {
+    return cw_world_is_valid(&client->world, craft) && cw_comp_has(&client->world, craft, client->c_craft)
+        && craft_parts_in(client, craft) == craft_parts_in(server, craft);
+}
+
+// A galleon online: bought at the shipwright's counter (and not from anywhere
+// else), kept by the backend, refitted with great wheels and rebuilt; the clients
+// are sent it whole (its loadout, its three masts, each part's mast), a hand works
+// the mizzen alone, and its owner flies it from the helm, her prediction agreeing
+// with the server as a sloop's does.
+static void test_ships_online(void) {
+    rig r;
+    rig_init(&r, 0.0f);
+    server *s = r.servers[0];
+    int a = rig_add_client_named(&r, s, 0.0f, "Alice"), b = rig_add_client_named(&r, s, 0.0f, "Bob");
+    CHECK(rig_wait_connected(&r, 5.0));
+    if (failures) { rig_destroy(&r); return; }
+    rig_run(&r, 0.3);
+    net_client *ca = link_of(&r, a), *cb = link_of(&r, b);
+    game *ga = world_of(&r, a), *gb = world_of(&r, b), *gs = &s->zone;
+    // Alice's character arrives: a sloop, and the purse everyone has for now.
+    RIG_UNTIL(&r, 10.0, ca->gear_known);
+    CHECK(ca->gear_known && ca->gear.bottomless && fleet_owns(&ca->gear, HULL_SLOOP) && !fleet_owns(&ca->gear, HULL_GALLEON));
+    int counter = -1;
+    for (int i = 0; i < gs->place_count; ++i)
+        if (gs->places[i].kind == PLACE_SHIPWRIGHT) counter = i;
+    CHECK(counter >= 0);
+    if (counter < 0) { rig_destroy(&r); return; }
+    // An order from the middle of the hub is refused: the shipwright is in the yard.
+    shipwright_order buy = {SHIPWRIGHT_BUY_HULL, HULL_GALLEON, 0, 0}, sail = {SHIPWRIGHT_SAIL, HULL_GALLEON, 0, 0};
+    net_client_shipwright(ca, &buy);
+    RIG_UNTIL(&r, 10.0, ca->shipwright_answers >= 1);
+    CHECK(ca->shipwright_answers == 1 && ca->shipwright_result == SHIPWRIGHT_INVALID && s->shipwright_refused == 1);
+    CHECK(!fleet_owns(&ca->gear, HULL_GALLEON));
+    // At the counter she buys a galleon and sails her: the yard builds her, on a large berth.
+    place_on_server(s, ca->player, gs->places[counter].spawn);
+    rig_run(&r, 0.3);
+    net_client_shipwright(ca, &buy);
+    net_client_shipwright(ca, &sail);
+    RIG_UNTIL(&r, 10.0, ca->shipwright_answers >= 3 && ca->gear.ships.sailing == HULL_GALLEON);
+    CHECK(ca->shipwright_answers == 3 && ca->shipwright_result == SHIPWRIGHT_DONE && s->shipwright_orders == 2);
+    CHECK(fleet_owns(&ca->gear, HULL_GALLEON) && ca->gear.ships.sailing == HULL_GALLEON && ca->gear.spent == ship_hull_price(HULL_GALLEON));
+    const character *kept = social_character(s->local_social, ca->account, NULL);   // and the backend keeps it
+    CHECK(kept && fleet_owns(kept, HULL_GALLEON) && kept->ships.sailing == HULL_GALLEON);
+    // A fitting bought: her gyros, every one; she is rebuilt with them.
+    cw_entity_id first = game_craft_of(gs, ca->account);
+    shipwright_order wheels = {SHIPWRIGHT_FIT_ALL, 0, SLOT_GYRO, (uint8_t)ship_component_find("Great Wheel")};
+    net_client_shipwright(ca, &wheels);
+    RIG_UNTIL(&r, 10.0, ca->shipwright_answers >= 4 && ca->gear.ships.store[ship_component_find("Spinning Brass")] == 3);
+    CHECK(ca->shipwright_result == SHIPWRIGHT_DONE && ca->gear.ships.store[ship_component_find("Spinning Brass")] == 3);
+    CHECK(game_craft_of(gs, ca->account) != first);
+    // Her look: navy paint and solar sails, bought a field at a time; she is rebuilt
+    // so, and every client sees her so (the loadout's look, and the paint on her parts).
+    shipwright_order navy = {SHIPWRIGHT_STYLE, 0, LOOK_HULL_PAINT, 5}, solar = {SHIPWRIGHT_STYLE, 0, LOOK_SAIL_CUT, CUT_SOLAR};
+    net_client_shipwright(ca, &navy);
+    net_client_shipwright(ca, &solar);
+    RIG_UNTIL(&r, 10.0, ca->shipwright_answers >= 6 && fleet_sailing(&ca->gear)->look.field[LOOK_SAIL_CUT] == CUT_SOLAR);
+    CHECK(ca->shipwright_result == SHIPWRIGHT_DONE && fleet_sailing(&ca->gear)->look.field[LOOK_HULL_PAINT] == 5);
+    cw_entity_id craft = game_craft_of(gs, ca->account);
+    CHECK(craft != CW_INVALID_ENTITY);
+    // Both clients are sent her whole: her record and every one of her parts.
+    RIG_UNTIL(&r, 15.0, craft != CW_INVALID_ENTITY && holds_craft(ga, gs, craft) && holds_craft(gb, gs, craft));
+    if (craft == CW_INVALID_ENTITY || !cw_world_is_valid(&ga->world, craft) || !cw_world_is_valid(&gb->world, craft)) {
+        CHECK(false);
+        rig_destroy(&r);
+        return;
+    }
+    const Craft *on_server = CW_GET(&gs->world, craft, gs->c_craft, Craft);
+    const Craft *on_a = CW_GET(&ga->world, craft, ga->c_craft, Craft), *on_b = CW_GET(&gb->world, craft, gb->c_craft, Craft);
+    CHECK(on_server->loadout.hull == HULL_GALLEON && gs->berths[on_server->berth].size == BERTH_LARGE);
+    CHECK(ship_loadout_equal(&on_a->loadout, &on_server->loadout) && ship_loadout_equal(&on_b->loadout, &on_server->loadout));
+    CHECK(on_a->masts == 3 && on_a->mass == on_server->mass && on_a->inertia.y == on_server->inertia.y);
+    CHECK(on_a->response == on_server->response && on_a->turn_response == on_server->turn_response && on_a->hull_drag == on_server->hull_drag);
+    for (int m = 0; m < 3; ++m)
+        CHECK(on_a->sails[m].area == on_server->sails[m].area && v3_length(v3_sub(on_a->sails[m].station, on_server->sails[m].station)) == 0.0f);
+    // Every part arrived, with the mast it belongs to.
+    int sails[3] = {}, parts = 0;
+    cw_query query = cw_query_begin(ga->q_attachments);
+    cw_entity_id id;
+    while (cw_query_next(&query, &id)) {
+        if (CW_GET(&ga->world, id, ga->c_attachment, Attachment)->ship != craft) continue;
+        const Part *part = CW_GET(&ga->world, id, ga->c_part, Part);
+        ++parts;
+        if (part->kind == PART_SAIL && part->mast >= 0 && part->mast < 3) ++sails[part->mast];
+    }
+    CHECK(parts > 60 && sails[0] == 1 && sails[1] == 1 && sails[2] == 1);
+    CHECK(on_a->loadout.look.field[LOOK_HULL_PAINT] == 5 && on_b->loadout.look.field[LOOK_SAIL_CUT] == CUT_SOLAR);
+    v3 navy_color;
+    ship_paint_color(5, &navy_color);
+    int navy_parts = 0;
+    query = cw_query_begin(gb->q_attachments);
+    while (cw_query_next(&query, &id)) {
+        if (CW_GET(&gb->world, id, gb->c_attachment, Attachment)->ship != craft || !cw_comp_has(&gb->world, id, gb->c_part)) continue;
+        const Part *part = CW_GET(&gb->world, id, gb->c_part, Part);
+        if (part->paint != PAINT_HULL) continue;
+        ++navy_parts;
+        CHECK(memcmp(&CW_GET(&gb->world, id, gb->c_visual, Visual)->color, &navy_color, sizeof(v3)) == 0);
+    }
+    CHECK(navy_parts >= 1);
+
+    // Alice to the helm, Bob to the mizzen.
+    place_on_server(s, ca->player, game_craft_to_world(gs, craft, v3_add(on_server->helm, v3_make(0, 0.05f, 0))));
+    place_on_server(s, cb->player, game_craft_to_world(gs, craft, v3_add(on_server->sails[2].station, v3_make(0, 0.05f, 0))));
+    rig_run(&r, 0.3);
+    press_use(&r, a);
+    press_use(&r, b);
+    RIG_UNTIL(&r, 10.0, on_server->pilot == ca->player && on_a->sails[2].hand == cb->player && on_b->sails[2].hand == cb->player);
+    CHECK(on_server->pilot == ca->player && on_server->sails[2].hand == cb->player && on_server->sails[0].hand == CW_INVALID_ENTITY);
+    CHECK(on_a->sails[2].hand == cb->player && on_b->sails[2].hand == cb->player);
+    r.inputs[b].sail = 1.0f;
+    r.inputs[a].lift = 1.0f;
+    RIG_UNTIL(&r, 15.0, on_server->sails[2].set == 1.0f && game_craft_altitude(gs, craft) > 5.0f);
+    r.inputs[b].sail = 0.0f;
+    r.inputs[a].lift = 0.0f;
+    RIG_UNTIL(&r, 10.0, on_a->sails[2].set == 1.0f && on_b->sails[2].set == 1.0f);
+    CHECK(on_server->sails[2].set == 1.0f && on_server->sails[0].set == 0.0f && on_server->sails[1].set == 0.0f);
+    CHECK(on_a->sails[2].set == 1.0f && on_b->sails[2].set == 1.0f && on_b->sails[0].set == 0.0f);
+    CHECK(game_craft_altitude(gs, craft) > 5.0f);
+    // Alice brings her round: her prediction agrees with the server's flight.
+    uint32_t starved = missed_inputs(s, ca->player);
+    r.inputs[a].turn_yaw = 1.0f;
+    float worst = 0.0f;
+    double start = net_seconds();
+    while (net_seconds() - start < 1.5) {
+        rig_step(&r);
+        if (ca->craft_error > worst) worst = ca->craft_error;
+    }
+    r.inputs[a].turn_yaw = 0.0f;
+    CHECK(worst < 0.001f || missed_inputs(s, ca->player) > starved);
+    CHECK(v3_length(on_server->spin) > 0.05f);
+    rig_destroy(&r);
+}
+
+// Docking online: the docks reach every client with their names; Alice asks at the
+// helm and her craft's autopilot brings it in, her prediction agreeing with the
+// server as it flies, and Bob sees it docking and docked.
+static void test_docking_online(void) {
+    rig r;
+    rig_init(&r, 0.0f);
+    server *s = r.servers[0];
+    int a = rig_add_client_named(&r, s, 0.0f, "Alice"), b = rig_add_client_named(&r, s, 0.0f, "Bob");
+    CHECK(rig_wait_connected(&r, 5.0));
+    if (failures) { rig_destroy(&r); return; }
+    rig_run(&r, 0.3);
+    net_client *ca = link_of(&r, a);
+    game *ga = world_of(&r, a), *gb = world_of(&r, b), *gs = &s->zone;
+    CHECK(cw_query_count(ga->q_docks) == 12 && cw_query_count(gb->q_docks) == 12);
+    bool named = false;
+    cw_query docks = cw_query_begin(gb->q_docks);
+    cw_entity_id id;
+    while (cw_query_next(&docks, &id)) named = named || !strcmp(CW_GET(&gb->world, id, gb->c_dock, Dock)->name, "Hub Dock 2");
+    CHECK(named);
+    // Her sail set, she holds where she is with nobody at the helm, however long
+    // Alice takes to get there.
+    cw_entity_id craft = game_spawn_craft(gs, NULL, v3_make(80.0f, 30.0f, -40.0f), 1.0f, ca->account, -1);
+    Craft *spawned = CW_GET(&gs->world, craft, gs->c_craft, Craft);
+    spawned->resting = false;
+    spawned->sails[0].set = 1.0f;
+    RIG_UNTIL(&r, 10.0, holds_craft(ga, gs, craft));
+    const Craft *on_server = CW_GET(&gs->world, craft, gs->c_craft, Craft);
+    place_on_server(s, ca->player, game_craft_to_world(gs, craft, v3_add(on_server->helm, v3_make(0, 0.05f, 0))));
+    RIG_UNTIL(&r, 10.0, game_aboard(gs, ca->player) == craft && game_aboard(ga, ca->player) == craft);
+    press_use(&r, a);
+    RIG_UNTIL(&r, 10.0, on_server->pilot == ca->player && CW_GET(&ga->world, craft, ga->c_craft, Craft)->pilot == ca->player);
+    CHECK(on_server->pilot == ca->player);
+    uint32_t missed = missed_inputs(s, ca->player);
+    r.inputs[a].dock = true;
+    rig_step(&r);
+    r.inputs[a].dock = false;
+    float worst = 0.0f;
+    bool seen_docking = false;
+    double start = net_seconds();
+    while (net_seconds() - start < 90.0 && on_server->docking != DOCK_DOCKED) {
+        rig_step(&r);
+        if (ca->craft_error > worst) worst = ca->craft_error;
+        if (cw_world_is_valid(&gb->world, craft) && CW_GET(&gb->world, craft, gb->c_craft, Craft)->docking == DOCK_APPROACH) seen_docking = true;
+    }
+    RIG_UNTIL(&r, 10.0, CW_GET(&gb->world, craft, gb->c_craft, Craft)->docking == DOCK_DOCKED
+                       && CW_GET(&ga->world, craft, ga->c_craft, Craft)->docking == DOCK_DOCKED);
+    CHECK(on_server->docking == DOCK_DOCKED && on_server->resting);
+    CHECK(worst < 0.001f || missed_inputs(s, ca->player) > missed);
+    CHECK(seen_docking && CW_GET(&gb->world, craft, gb->c_craft, Craft)->docking == DOCK_DOCKED);
+    CHECK(CW_GET(&ga->world, craft, ga->c_craft, Craft)->docking == DOCK_DOCKED);
+    rig_destroy(&r);
+}
+
+// Players a client sees named as captains are.
+static int captains_seen(game *g) {
+    int named = 0;
+    cw_query players = cw_query_begin(g->q_all_players);
+    cw_entity_id id;
+    while (cw_query_next(&players, &id)) named += strncmp(CW_GET(&g->world, id, g->c_player, Player)->name, "Captain ", 8) == 0;
+    return named;
+}
+
+// Captains on a server: clients see them (players named so, at the helms of ships
+// of their own) and their ships leave their docks; the server keeps their ships,
+// whose owners are none of its clients.
+static void test_captains_online(void) {
+    rig r;
+    memset(&r, 0, sizeof(r));
+    server_config config = server_config_default();
+    config.port = 0;
+    config.max_clients = RIG_MAX;
+    config.craft_linger = 0.5;
+    config.captains = 3;
+    server *s = rig_add_server(&r, &config, 0.0f);
+    int a = rig_add_client_named(&r, s, 0.0f, "Alice");
+    CHECK(rig_wait_connected(&r, 5.0));
+    if (failures) { rig_destroy(&r); return; }
+    game *ga = world_of(&r, a), *gs = &s->zone;
+    CHECK(cw_query_count(gs->q_captains) == 3 && cw_query_count(gs->q_crafts) == 3);
+    RIG_UNTIL(&r, 15.0, captains_seen(ga) == 3 && cw_query_count(ga->q_crafts) == 3);
+    CHECK(captains_seen(ga) == 3);
+    CHECK(cw_query_count(ga->q_crafts) == 3);
+    // Their time in port cut short (it is ten to forty seconds, by their dice): the
+    // first to leave is seen leaving, and the sweep, long past, has left their ships be.
+    bool left = false;
+    cw_entity_id id;
+    double start = net_seconds();
+    while (net_seconds() - start < 60.0 && !left) {
+        rig_step(&r);
+        cw_query captains = cw_query_begin(gs->q_captains);
+        while (cw_query_next(&captains, &id)) {
+            Captain *cap = CW_GET(&gs->world, id, gs->c_captain, Captain);
+            if (cap->state == CAPTAIN_IN_PORT && cap->timer < -1.0f) cap->timer = -1.0f;
+        }
+        cw_query crafts = cw_query_begin(ga->q_crafts);
+        while (cw_query_next(&crafts, &id))
+            if (!CW_GET(&ga->world, id, ga->c_craft, Craft)->resting && CW_GET(&ga->world, id, ga->c_craft, Craft)->docking == DOCK_NONE) left = true;
+    }
+    CHECK(left);
+    rig_run(&r, 1.5);   // a sweep or two more
+    CHECK(cw_query_count(gs->q_crafts) == 3);
     rig_destroy(&r);
 }
 
@@ -2622,6 +3179,10 @@ int main(void) {
     RUN(test_bandwidth_limit);
     RUN(test_lag_compensation);
     RUN(test_crafts_online);
+    RUN(test_sails_online);
+    RUN(test_ships_online);
+    RUN(test_docking_online);
+    RUN(test_captains_online);
     RUN(test_directory);
     RUN(test_social_service);
     RUN(test_party);

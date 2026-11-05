@@ -117,7 +117,7 @@ struct social {
     double last_saved;
 };
 #define SOCIAL_SAVE_EVERY 5.0        // seconds between writes while something changed
-#define SOCIAL_SAVE_VERSION 1
+#define SOCIAL_SAVE_VERSION 3          // 3: ships have looks; 2: characters have a purse and ships; 1: gear alone. All load
 
 void social_init(social *s, const net_zone_table *secret, social_deliver_fn deliver, void *user);
 // A message from a server (already peeled out of its packet). `from` is where

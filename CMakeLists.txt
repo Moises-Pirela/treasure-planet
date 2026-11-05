@@ -39,7 +39,7 @@ add_library(tp_ecs STATIC
     src/ecs/cw_snapshot.cpp src/ecs/cw_file.cpp src/ecs/cw_sim.cpp)
 tp_strict(tp_ecs)
 
-add_library(tp_game STATIC src/game/game.cpp src/game/craft.cpp src/game/universe.cpp src/game/planet.cpp src/game/dungeon.cpp src/game/items.cpp)
+add_library(tp_game STATIC src/game/game.cpp src/game/craft.cpp src/game/ships.cpp src/game/shipwright.cpp src/game/captains.cpp src/game/universe.cpp src/game/planet.cpp src/game/dungeon.cpp src/game/items.cpp)
 target_link_libraries(tp_game PUBLIC tp_ecs)
 tp_strict(tp_game)
 if(NOT WIN32)
@@ -86,7 +86,7 @@ if(TP_BUILD_TESTS)
     target_link_libraries(test_ecs PRIVATE tp_game)
     target_link_libraries(test_game PRIVATE tp_game)
     target_link_libraries(test_net PRIVATE tp_net)
-    target_sources(test_hud PRIVATE src/client/hud.cpp)
+    target_sources(test_hud PRIVATE src/client/hud.cpp src/client/shipwright_ui.cpp)
     target_link_libraries(test_hud PRIVATE tp_net)
     # Preparing a frame is pure arithmetic: the test links it without a backend.
     target_sources(test_render PRIVATE src/render/frame.cpp src/render/obj.cpp)
@@ -213,6 +213,7 @@ if(TP_BUILD_CLIENT)
     add_executable(treasure_planet
         src/client/main.cpp
         src/client/hud.cpp
+        src/client/shipwright_ui.cpp
         src/platform/platform_glfw.cpp
         src/render/renderer.cpp
         src/render/frame.cpp

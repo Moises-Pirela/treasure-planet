@@ -16,7 +16,7 @@ extern const float GAME_STEP_HEIGHT; // metres a walker steps up without jumping
 struct game_box {
     v3 center, half;
 };
-#define GAME_MAX_BOXES 64
+#define GAME_MAX_BOXES 128     // at least a craft's parts (SHIP_MAX_PARTS)
 
 // The solids listed in the grid cell of `at` (game.cpp); returns the count.
 int game_solids_near(const game *g, v3 at, cw_entity_id *out);
@@ -29,5 +29,6 @@ void game_place_craft_parts(game *g, cw_entity_id craft);
 
 void game_system_crafts(cw_world *w, cw_phase phase, float dt);   // shared: flight, contacts
 void game_system_yard(cw_world *w, cw_phase phase, float dt);     // host: terminals, towing
+void game_system_captains(cw_world *w, cw_phase phase, float dt); // host: the captains at their helms
 
 #endif

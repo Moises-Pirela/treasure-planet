@@ -230,6 +230,9 @@ int game_solids_near(const game *g, v3 at, cw_entity_id *out) {
 // the player, or a craft's parts in its frame for one aboard it.
 // Returns true when something blocked the move.
 static bool move_axis(v3 *position, int axis, float amount, bool can_step, const game_box *boxes, int count) {
+    // Not moving along this axis, nothing can be crossed: without this, a player set
+    // down a hair inside a floor would be "stopped" at the floor's far side.
+    if (amount == 0.0f) return false;
     v3 from = *position, to = from;
     *axis_of(&to, axis) += amount;
     bool blocked = false;
@@ -338,7 +341,7 @@ static void leave(game *g, cw_entity_id player, cw_entity_id craft, Transform *t
 // box there: exact for a craft on the level, near enough for one that is not) and
 // stepped up onto, or pushed out of, whatever they overlap. Returns the craft they
 // ended up standing on, if any.
-static cw_entity_id collide_crafts(game *g, Transform *t, Player *p, bool can_step) {
+static cw_entity_id collide_crafts(game *g, cw_entity_id player, Transform *t, Player *p, bool can_step) {
     cw_world *w = &g->world;
     cw_entity_id standing = CW_INVALID_ENTITY;
     cw_query crafts = cw_query_begin(g->q_crafts);
@@ -348,7 +351,13 @@ static cw_entity_id collide_crafts(game *g, Transform *t, Player *p, bool can_st
         v3 local = game_craft_from_world(g, craft, t->position);
         if (v3_length(local) > c->radius + PLAYER_HEIGHT + 1.0f) continue;
         game_box boxes[GAME_MAX_BOXES];
-        int count = game_craft_boxes(g, craft, boxes, GAME_MAX_BOXES);
+        int count = game_craft_boxes(g, craft, boxes, GAME_MAX_BOXES - 1);
+        bool barred = !game_may_board(g, player, craft);
+        if (barred) {   // put off it: the space over its deck is closed to them
+            boxes[count].center = c->cabin_center;
+            boxes[count].half = c->cabin_half;
+            ++count;
+        }
         v3 velocity = quat_unrotate(c->orientation, p->velocity);
         bool moved = false;
         for (int k = 0; k < count; ++k) {
@@ -363,7 +372,8 @@ static cw_entity_id collide_crafts(game *g, Transform *t, Player *p, bool can_st
                 if (clear) {
                     local = stepped;
                     if (velocity.y < 0.0f) velocity.y = 0.0f;
-                    standing = craft;
+                    if (!barred) standing = craft;
+                    p->grounded = true;
                     moved = true;
                     continue;
                 }
@@ -380,7 +390,10 @@ static cw_entity_id collide_crafts(game *g, Transform *t, Player *p, bool can_st
             *axis_of(&local, best / 2) += sign * out[best];
             float *v = axis_of(&velocity, best / 2);
             if (*v * sign < 0.0f) *v = 0.0f;
-            if (best == 3) standing = craft;
+            if (best == 3) {
+                p->grounded = true;
+                if (!barred) standing = craft;
+            }
             moved = true;
         }
         if (moved) {
@@ -405,16 +418,45 @@ static void walk_aboard(game *g, cw_entity_id id, cw_entity_id craft, Transform 
     cw_world *w = &g->world;
     Craft *c = CW_GET(w, craft, g->c_craft, Craft);
     Aboard *a = CW_GET(w, id, g->c_aboard, Aboard);
+    // The use key: at the helm or a mast's sails, leave them; by the helm or a
+    // mast's sail station (the nearest free one in reach), free, take it.
+    int working = game_craft_station_of(c, id);
     if (in->use) {
         if (c->pilot == id) {
-            c->pilot = CW_INVALID_ENTITY;
+            c->pilot = CW_INVALID_ENTITY;   // a docking under way goes on: she docks herself
+        } else if (working >= 0) {
+            c->sails[working].hand = CW_INVALID_ENTITY;
+            working = -1;
         } else if (helm_free(g, craft, c) && v3_length(v3_sub(a->position, c->helm)) <= CRAFT_HELM_REACH
                    && game_can_pilot(g, id, craft)) {
             c->pilot = id;
+        } else if (game_can_work_sails(g, id, craft)) {
+            float nearest = CRAFT_STATION_REACH;
+            for (int m = 0; m < c->masts && m < CRAFT_MAX_MASTS; ++m) {
+                cw_entity_id hand = c->sails[m].hand;
+                bool free = hand == CW_INVALID_ENTITY || game_aboard(g, hand) != craft;
+                float distance = v3_length(v3_sub(a->position, c->sails[m].station));
+                if (free && distance <= nearest) {
+                    nearest = distance;
+                    working = m;
+                }
+            }
+            if (working >= 0) c->sails[working].hand = id;
         }
     }
-    if (c->pilot == id) {
-        a->position = c->helm;
+    // The dock key at the helm: call off a docking under way; or flying, by a free
+    // dock that takes her, dock there.
+    if (in->dock && c->pilot == id) {
+        cw_entity_id dock = CW_INVALID_ENTITY;
+        if (c->docking == DOCK_APPROACH || c->docking == DOCK_DESCEND) {
+            c->docking = DOCK_NONE;
+            c->dock = CW_INVALID_ENTITY;
+        } else if (c->docking != DOCK_DOCKED && game_craft_airborne(g, craft) && (dock = game_dock_in_reach(g, craft)) != CW_INVALID_ENTITY) {
+            game_craft_start_docking(g, craft, dock);
+        }
+    }
+    if (c->pilot == id || working >= 0) {
+        a->position = c->pilot == id ? c->helm : c->sails[working].station;
         p->velocity = v3_make(0, 0, 0);
         p->grounded = true;
         if (p->swing_cooldown > 0.0f) p->swing_cooldown -= dt;
@@ -478,11 +520,12 @@ static void system_players(cw_world *w, cw_phase, float dt) {
 
         // Crafts, in their own frames; standing on one, or stepping into its cabin, is boarding it.
         if (cw_query_count(g->q_crafts)) {
-            cw_entity_id standing = collide_crafts(g, t, p, was_grounded);
+            cw_entity_id standing = collide_crafts(g, id, t, p, was_grounded);
             cw_query crafts = cw_query_begin(g->q_crafts);
             cw_entity_id candidate;
             while (standing == CW_INVALID_ENTITY && cw_query_next(&crafts, &candidate))
-                if (in_cabin(CW_GET(w, candidate, g->c_craft, Craft), game_craft_from_world(g, candidate, t->position)))
+                if (in_cabin(CW_GET(w, candidate, g->c_craft, Craft), game_craft_from_world(g, candidate, t->position))
+                    && game_may_board(g, id, candidate))
                     standing = candidate;
             if (standing != CW_INVALID_ENTITY) {
                 board(g, id, standing, t, p);
@@ -523,11 +566,12 @@ static void system_remember_positions(cw_world *w, cw_phase, float) {
 void game_init(game *g, cw_sim_role role) {
     memset(g, 0, sizeof(*g));
     g->role = role;
+    g->yard_order = ship_default_loadout(HULL_SLOOP);
     cw_world *w = &g->world;
     cw_world_init(w, g);
     cw_sim_init(&g->sim, role);
 
-    cw_component_id base = cw_comp_block(w, 14);
+    cw_component_id base = cw_comp_block(w, 19);
     g->c_transform = cw_cid(base, 0);
     g->c_solid = cw_cid(base, 1);
     g->c_attachment = cw_cid(base, 2);
@@ -542,6 +586,11 @@ void game_init(game *g, cw_sim_role role) {
     g->c_craft = cw_cid(base, 11);
     g->c_part = cw_cid(base, 12);
     g->c_aboard = cw_cid(base, 13);
+    g->c_gravity = cw_cid(base, 14);
+    g->c_barred = cw_cid(base, 15);
+    g->c_ship_order = cw_cid(base, 16);
+    g->c_dock = cw_cid(base, 17);
+    g->c_captain = cw_cid(base, 18);
     CW_REGISTER(w, g->c_transform, Transform);
     CW_REGISTER(w, g->c_solid, Solid);
     CW_REGISTER(w, g->c_attachment, Attachment);
@@ -556,6 +605,11 @@ void game_init(game *g, cw_sim_role role) {
     CW_REGISTER(w, g->c_craft, Craft);
     CW_REGISTER(w, g->c_part, Part);
     CW_REGISTER(w, g->c_aboard, Aboard);
+    CW_REGISTER(w, g->c_gravity, Gravity);
+    CW_REGISTER(w, g->c_barred, Barred);
+    CW_REGISTER(w, g->c_ship_order, ShipOrder);
+    CW_REGISTER(w, g->c_dock, Dock);
+    CW_REGISTER(w, g->c_captain, Captain);
     cw_comp_set_transient(w, g->c_input, true);
 
     cw_component_id solids[] = {g->c_transform, g->c_solid};
@@ -574,6 +628,12 @@ void game_init(game *g, cw_sim_role role) {
     g->q_loot = cw_query_create(w, cw_filter_all(cw_mask(loot, 2)));
     cw_component_id crafts[] = {g->c_transform, g->c_craft};
     g->q_crafts = cw_query_create(w, cw_filter_all(cw_mask(crafts, 2)));
+    cw_component_id sources[] = {g->c_transform, g->c_gravity};
+    g->q_gravity = cw_query_create(w, cw_filter_all(cw_mask(sources, 2)));
+    cw_component_id docks[] = {g->c_transform, g->c_dock};
+    g->q_docks = cw_query_create(w, cw_filter_all(cw_mask(docks, 2)));
+    cw_component_id captains[] = {g->c_transform, g->c_player, g->c_captain};
+    g->q_captains = cw_query_create(w, cw_filter_all(cw_mask(captains, 3)));
 
     // Every movement system is shared: a client runs them on its own player and on
     // the ships, which is prediction. Only what a server adds is host-only.
@@ -610,6 +670,13 @@ void game_init(game *g, cw_sim_role role) {
     d.name = "yard";
     d.fn = game_system_yard;
     d.order = 25;
+    d.authority = CW_HOST_ONLY;
+    cw_sim_register(&g->sim, d);
+    // The captains, at their helms before anything moves: their inputs are set as
+    // a client's would have been by now.
+    d.name = "captains";
+    d.fn = game_system_captains;
+    d.order = 5;
     d.authority = CW_HOST_ONLY;
     cw_sim_register(&g->sim, d);
 }
@@ -757,6 +824,12 @@ int game_place_at(const game *g, v3 point) {
             && inside_box(point, g->places[i].center, g->places[i].half)) return i;
     for (int i = 0; i < g->place_count; ++i)
         if (g->places[i].kind == PLACE_ZONE && inside_box(point, g->places[i].center, g->places[i].half)) return i;
+    return -1;
+}
+
+int game_place_of_kind_at(const game *g, v3 point, int kind) {
+    for (int i = 0; i < g->place_count; ++i)
+        if (g->places[i].kind == kind && inside_box(point, g->places[i].center, g->places[i].half)) return i;
     return -1;
 }
 

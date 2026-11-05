@@ -1,5 +1,8 @@
 #include "social.h"
 #include "protocol.h"
+#include "../game/shipwright.h"
+
+static_assert(SOCIAL_SAVE_VERSION == CHARACTER_FORMAT, "a save's version is the format of the characters in it");
 #include <stdio.h>
 #include <string.h>
 
@@ -149,7 +152,7 @@ void social_character_get_write(cw_writer *w, uint64_t account, const net_zone_t
     write_signed(w, body, b.size, secret);
 }
 void social_character_write(cw_writer *w, uint64_t account, const character *c, const net_zone_table *secret) {
-    unsigned char body[16 + (SLOT_COUNT + STASH_SIZE) * 12];
+    unsigned char body[NET_MAX_PAYLOAD - 64];
     cw_writer b;
     cw_writer_init_fixed(&b, body, sizeof(body));
     cw_writer_u64(&b, account);
@@ -210,14 +213,18 @@ bool social_load(social *s, const char *path) {
     cw_reader_bytes(&r, magic, 4);
     cw_reader_u32(&r, &version);
     cw_reader_u32(&r, &count);
-    bool ok = cw_reader_ok(&r) && memcmp(magic, "TPSV", 4) == 0 && version == SOCIAL_SAVE_VERSION;
+    // Version 1 characters had gear alone: they come back with a sloop, fitted out.
+    // Version 2 ships had no looks: they come back as built.
+    bool ok = cw_reader_ok(&r) && memcmp(magic, "TPSV", 4) == 0 && version >= 1 && version <= SOCIAL_SAVE_VERSION;
     for (uint32_t i = 0; ok && i < count; ++i) {
         uint64_t account = 0;
         char name[ACCOUNT_NAME_CAPACITY], platform[ACCOUNT_PLATFORM_CAPACITY];
         character gear = {};
         cw_reader_u64(&r, &account);
-        ok = read_text(&r, name, sizeof(name)) && read_text(&r, platform, sizeof(platform)) && character_read(&r, &gear);
+        ok = read_text(&r, name, sizeof(name)) && read_text(&r, platform, sizeof(platform))
+          && character_read_format(&r, &gear, (int)version);
         if (!ok) break;
+        character_fit_out(&gear);
         social_player *p = player_of(s, account);
         if (!p) {
             for (int k = 0; k < SOCIAL_MAX_PLAYERS && !p; ++k)
@@ -245,6 +252,7 @@ character *social_character(social *s, uint64_t account, const char *name) {
         p->used = true;
         p->account = account;
         if (name) strncpy(p->name, name, ACCOUNT_NAME_CAPACITY - 1);
+        character_fit_out(&p->gear);   // a sloop, and the purse
     }
     return &p->gear;
 }

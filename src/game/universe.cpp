@@ -1,23 +1,23 @@
 // The content of the world, as data: the hub, the planets, and the ship that serves
 // each planet. Adding a planet is adding a row to PLANETS.
-#include "game.h"
+#include "game_internal.h"
 #include <stdio.h>
 #include <string.h>
 
-struct ship_part { v3 offset, half, color; };
+struct liner_part { v3 offset, half, color; };
 
-static const ship_part SKIFF_PARTS[] = {
+static const liner_part SKIFF_PARTS[] = {
     {{0, 3.2f, -5.0f}, {1.5f, 0.15f, 1.0f}, {0.85f, 0.85f, 0.75f}},     // canopy
     {{1.2f, 1.6f, -5.0f}, {0.1f, 1.6f, 0.1f}, {0.4f, 0.4f, 0.4f}},
     {{-1.2f, 1.6f, -5.0f}, {0.1f, 1.6f, 0.1f}, {0.4f, 0.4f, 0.4f}},
 };
-static const ship_part HAULER_PARTS[] = {
+static const liner_part HAULER_PARTS[] = {
     {{-3.5f, 1.0f, -4.0f}, {1.0f, 1.0f, 1.5f}, {0.55f, 0.35f, 0.2f}},   // cargo
     {{3.5f, 1.0f, -4.0f}, {1.0f, 1.0f, 1.5f}, {0.55f, 0.35f, 0.2f}},
     {{3.5f, 1.0f, 3.0f}, {1.0f, 1.0f, 1.5f}, {0.5f, 0.3f, 0.2f}},
     {{0, 2.5f, -11.5f}, {5.5f, 2.5f, 0.4f}, {0.7f, 0.4f, 0.15f}},       // bridge
 };
-static const ship_part CLIPPER_PARTS[] = {
+static const liner_part CLIPPER_PARTS[] = {
     {{0, 6.0f, 2.0f}, {0.15f, 6.0f, 0.15f}, {0.35f, 0.25f, 0.2f}},      // masts
     {{0, 6.5f, -5.0f}, {0.15f, 6.5f, 0.15f}, {0.35f, 0.25f, 0.2f}},
     {{0, 8.0f, -5.0f}, {2.2f, 3.0f, 0.05f}, {0.85f, 0.9f, 0.95f}},      // sail
@@ -35,7 +35,7 @@ struct planet_row {
     v3 dock;                     // where its ship lands, relative to the origin
     float pier_x;                // the hub's pier for this ship
     float deck_half_x, deck_half_z;
-    const ship_part *parts;
+    const liner_part *parts;
     int part_count;
     float flight_seconds, dock_seconds;
 };
@@ -123,6 +123,35 @@ static void declare_place(game *g, const char *name, v3 center, v3 half, v3 spaw
     game_declare_place(g, name, PLACE_ZONE, center, half, spawn, NULL);
 }
 
+// A dock deck: a platform level with the ground it adjoins, reaching down to meet
+// whatever is under it, with three docks on it, bows to the north: a large one
+// nearest the ground it adjoins, two small ones beyond. `edge` is the middle of
+// that edge, on the ground's top; the deck runs east from it. Each dock is marked
+// on the deck, with a beacon at each corner (the client lights them). Standing
+// on the deck is being at `place`.
+static void spawn_dock_deck(game *g, const char *prefix, const char *place, v3 edge, v3 tint) {
+    const float half_x = 16.0f, half_z = 30.0f, depth = 10.0f;
+    spawn_block(g, v3_add(edge, v3_make(half_x, -depth * 0.5f, 0)), v3_make(half_x, depth * 0.5f, half_z), v3_make(0.4f, 0.4f, 0.44f));
+    struct { float x, z; int size; } docks[3] = {{9.0f, 0.0f, BERTH_LARGE}, {25.0f, -12.0f, BERTH_SMALL}, {25.0f, 14.0f, BERTH_SMALL}};
+    for (int i = 0; i < 3; ++i) {
+        v3 floor = v3_add(edge, v3_make(docks[i].x, 0.01f, docks[i].z));
+        char name[GAME_NAME_CAPACITY];
+        snprintf(name, sizeof(name), "%s Dock %d", prefix, i + 1);
+        game_spawn_dock(g, name, floor, 0.0f, docks[i].size);
+        // The marking, a little longer astern than ahead (the stairs come down there),
+        // and a beacon at each corner, clear of the widest hull the dock takes.
+        bool large = docks[i].size == BERTH_LARGE;
+        v3 half = large ? v3_make(6.2f, 0.5f, 19.5f) : v3_make(3.2f, 0.5f, 9.6f);
+        v3 marking = v3_add(floor, v3_make(0, -0.5f, 1.0f));
+        spawn_block(g, marking, half, large ? v3_make(0.5f, 0.38f, 0.18f) : v3_make(0.2f, 0.42f, 0.45f));
+        for (int corner = 0; corner < 4; ++corner) {   // a beacon post, the deck's own colour, at each corner
+            v3 at = v3_add(marking, v3_make((corner & 1 ? 1.0f : -1.0f) * (half.x + 0.4f), 0.5f, (corner & 2 ? 1.0f : -1.0f) * (half.z + 0.4f)));
+            spawn_block(g, v3_add(at, v3_make(0, 0.7f, 0)), v3_make(0.18f, 0.7f, 0.18f), tint);
+        }
+    }
+    declare_place(g, place, v3_add(edge, v3_make(half_x, 20.0f, 0)), v3_make(half_x + 1.0f, 21.0f, half_z + 1.0f), v3_add(edge, v3_make(4.0f, 0, 0)));
+}
+
 // The door to the planet's dungeon, at the far side of the pad: two posts, a lintel
 // and a dark slab, with the entrance place inside the frame.
 static void spawn_dungeon_door(game *g, const planet_row *row, v3 pad) {
@@ -178,6 +207,7 @@ static void spawn_planet(game *g, const planet_row *row) {
     spawn_dungeon_door(g, row, pad);
     spawn_block(g, v3_add(pad, v3_make(10, 2.0f, 8)), v3_make(2, 1, 2), v3_scale(row->color, 0.8f));
     spawn_block(g, v3_add(pad, v3_make(-14, 2.5f, 15)), v3_make(3, 1.5f, 2), v3_scale(row->color, 0.7f));
+    spawn_dock_deck(g, row->planet, row->planet, v3_add(pad, v3_make(PAD_HALF, 1.0f, 0)), v3_scale(row->color, 1.6f));
 
     cw_entity_id id = cw_world_create_entity(w);
     v3 center = v3_make(pad.x, pad.y - row->radius, pad.z);
@@ -193,9 +223,11 @@ static void spawn_planet(game *g, const planet_row *row) {
     planet.land.pad_radius = PAD_FLAT;
     planet.land.seed = row->seed;
     Visual visual = {MESH_SPHERE, v3_make(row->radius, row->radius, row->radius), row->color};
+    Gravity gravity = {GRAVITY_RADIAL, GAME_GRAVITY, row->radius, row->radius * GAME_WELL_REACH};
     cw_comp_set(w, id, g->c_transform, &t, sizeof(t));
     cw_comp_set(w, id, g->c_planet, &planet, sizeof(planet));
     cw_comp_set(w, id, g->c_visual, &visual, sizeof(visual));
+    cw_comp_set(w, id, g->c_gravity, &gravity, sizeof(gravity));
 
     v3 hub_dock = v3_make(row->pier_x, 0.0f, -HUB_HALF - PIER_LENGTH - row->deck_half_z);
     // The way in, from the hub's dock to this one: the monument stands beyond the
@@ -207,37 +239,94 @@ static void spawn_planet(game *g, const planet_row *row) {
 }
 
 // The yard: a platform west of the hub, across a bridge, where crafts are kept on
-// berths in two rows, bows to the north. A terminal at its near end is where a
-// player calls their craft (game_call_craft). It is part of the hub as a place.
-static const float YARD_X = -73.0f, YARD_HALF_X = 27.0f, YARD_HALF_Z = 30.0f;
+// berths, bows to the north: eight small ones in two rows by the bridge (for
+// sloops and cutters), and three large ones beyond them (for brigantines and
+// galleons). A terminal at its near end is where a player calls their craft
+// (game_call_craft). It is part of the hub as a place.
+static const float YARD_NEAR = -46.0f, YARD_FAR = -152.0f, YARD_HALF_Z = 30.0f;
+
+static void spawn_berth(game *g, v3 floor, int size) {
+    if (g->berth_count >= GAME_MAX_BERTHS) return;
+    game_berth *b = &g->berths[g->berth_count++];
+    b->floor = floor;
+    b->heading = 0.0f;
+    b->size = size;
+    // A pad marks each berth, a centimetre proud of the yard, a little longer astern
+    // than ahead: the stairs come down behind a craft.
+    v3 half = size == BERTH_SMALL ? v3_make(3.2f, 0.5f, 9.6f) : v3_make(6.2f, 0.5f, 19.5f);
+    spawn_block(g, v3_add(b->floor, v3_make(0, -0.49f, 1.0f)), half, v3_make(0.36f, 0.34f, 0.3f));
+    b->floor.y += 0.01f;
+}
+
+// The shipwright's stall, by the bridge across from the terminal: a counter under
+// an awning, and the shipwright behind it, facing whoever walks off the bridge.
+// Standing at the counter is being at the shipwright's (PLACE_SHIPWRIGHT).
+static void spawn_shipwright(game *g, v3 counter) {
+    cw_world *w = &g->world;
+    v3 wood = v3_make(0.45f, 0.3f, 0.18f), dark = v3_make(0.3f, 0.19f, 0.11f), canvas = v3_make(0.55f, 0.2f, 0.13f);
+    spawn_block(g, v3_add(counter, v3_make(0, 0.55f, 0)), v3_make(0.35f, 0.55f, 1.8f), wood);
+    spawn_block(g, v3_add(counter, v3_make(-2.8f, 1.7f, 0)), v3_make(0.15f, 1.7f, 2.6f), dark);        // the back wall
+    spawn_block(g, v3_add(counter, v3_make(-1.4f, 1.2f, 2.45f)), v3_make(1.4f, 1.2f, 0.15f), dark);   // the sides
+    spawn_block(g, v3_add(counter, v3_make(-1.4f, 1.2f, -2.45f)), v3_make(1.4f, 1.2f, 0.15f), dark);
+    spawn_block(g, v3_add(counter, v3_make(-1.0f, 3.5f, 0)), v3_make(2.1f, 0.12f, 2.8f), canvas);     // the awning...
+    spawn_block(g, v3_add(counter, v3_make(0.9f, 1.7f, 2.6f)), v3_make(0.1f, 1.7f, 0.1f), dark);      // ...on posts
+    spawn_block(g, v3_add(counter, v3_make(0.9f, 1.7f, -2.6f)), v3_make(0.1f, 1.7f, 0.1f), dark);
+    spawn_block(g, v3_add(counter, v3_make(1.05f, 3.0f, 0)), v3_make(0.05f, 0.35f, 1.4f), v3_make(0.75f, 0.58f, 0.25f));   // the sign
+    spawn_block(g, v3_add(counter, v3_make(-2.2f, 0.4f, 1.6f)), v3_make(0.4f, 0.4f, 0.4f), wood);      // stock: crates of fittings
+    spawn_block(g, v3_add(counter, v3_make(-2.2f, 0.3f, -1.7f)), v3_make(0.35f, 0.3f, 0.5f), v3_make(0.25f, 0.26f, 0.3f));
+    // The shipwright: a figure behind the counter, in a leather apron and a hat.
+    v3 feet = v3_add(counter, v3_make(-1.2f, 0, 0));
+    cw_entity_id figure = cw_world_create_entity(w);
+    Transform t = {feet, feet};
+    Visual body = {MESH_CAPSULE, v3_make(1, 1, 1), v3_make(0.42f, 0.28f, 0.2f)};
+    cw_comp_set(w, figure, g->c_transform, &t, sizeof(t));
+    cw_comp_set(w, figure, g->c_visual, &body, sizeof(body));
+    cw_entity_id hat = cw_world_create_entity(w);
+    v3 brim = v3_add(feet, v3_make(0, PLAYER_HEIGHT + 0.05f, 0));
+    Transform ht = {brim, brim};
+    Visual hat_visual = {MESH_CUBE, v3_make(0.32f, 0.06f, 0.32f), v3_make(0.12f, 0.1f, 0.1f)};
+    cw_comp_set(w, hat, g->c_transform, &ht, sizeof(ht));
+    cw_comp_set(w, hat, g->c_visual, &hat_visual, sizeof(hat_visual));
+    game_declare_place(g, "Shipwright", PLACE_SHIPWRIGHT, v3_add(counter, v3_make(1.1f, 1.0f, 0)), v3_make(0.9f, 1.2f, 1.8f),
+                       v3_add(counter, v3_make(1.2f, 0, 0)), NULL);
+}
 
 static void spawn_yard(game *g) {
     v3 stone = v3_make(0.42f, 0.42f, 0.47f);
-    float near_edge = YARD_X + YARD_HALF_X, far_edge = YARD_X - YARD_HALF_X;
+    float yard_x = (YARD_NEAR + YARD_FAR) * 0.5f, yard_half_x = (YARD_NEAR - YARD_FAR) * 0.5f;
     // The bridge, from the hub's west edge to the yard's near one, flush with both.
-    float bridge_half = (-HUB_HALF - near_edge) * 0.5f;
-    spawn_block(g, v3_make(near_edge + bridge_half, -0.5f, 0), v3_make(bridge_half, 0.5f, 2.5f), v3_scale(stone, 0.8f));
-    spawn_block(g, v3_make(YARD_X, -1.0f, 0), v3_make(YARD_HALF_X, 1.0f, YARD_HALF_Z), stone);
+    float bridge_half = (-HUB_HALF - YARD_NEAR) * 0.5f;
+    spawn_block(g, v3_make(YARD_NEAR + bridge_half, -0.5f, 0), v3_make(bridge_half, 0.5f, 2.5f), v3_scale(stone, 0.8f));
+    spawn_block(g, v3_make(yard_x, -1.0f, 0), v3_make(yard_half_x, 1.0f, YARD_HALF_Z), stone);
     for (int row = 0; row < 2; ++row)
-        for (int column = 0; column < 4; ++column) {
-            game_berth *b = &g->berths[g->berth_count++];
-            b->floor = v3_make(near_edge - 12.0f - 12.0f * (float)column, 0.0f, row ? 14.0f : -14.0f);
-            b->heading = 0.0f;
-            // A pad marks each berth, a centimetre proud of the yard.
-            spawn_block(g, v3_add(b->floor, v3_make(0, -0.49f, 0)), v3_make(2.8f, 0.5f, 7.2f), v3_make(0.36f, 0.34f, 0.3f));
-            b->floor.y += 0.01f;
-        }
-    v3 terminal = v3_make(near_edge - 4.0f, 0.0f, -6.0f);
+        for (int column = 0; column < 4; ++column)
+            spawn_berth(g, v3_make(YARD_NEAR - 12.0f - 12.0f * (float)column, 0.0f, row ? 14.0f : -14.0f), BERTH_SMALL);
+    for (int column = 0; column < 3; ++column)
+        spawn_berth(g, v3_make(YARD_NEAR - 66.0f - 15.0f * (float)column, 0.0f, -1.0f), BERTH_LARGE);
+    v3 terminal = v3_make(YARD_NEAR - 4.0f, 0.0f, -6.0f);
     spawn_block(g, v3_add(terminal, v3_make(0, 1.0f, 0)), v3_make(0.6f, 1.0f, 0.4f), v3_make(0.75f, 0.58f, 0.25f));
     game_declare_place(g, "Shipyard", PLACE_YARD, v3_add(terminal, v3_make(0, 1.0f, 1.4f)), v3_make(1.5f, 1.2f, 1.0f),
                        v3_add(terminal, v3_make(0, 0, 1.4f)), NULL);
+    spawn_shipwright(g, v3_make(YARD_NEAR - 4.0f, 0.0f, 10.0f));
     // Standing on the bridge or in the yard is being at the hub, for whoever owns it.
-    float west = far_edge - 1.0f, east = -HUB_HALF - 5.0f;
+    float west = YARD_FAR - 1.0f, east = -HUB_HALF - 5.0f;
     declare_place(g, "hub", v3_make((west + east) * 0.5f, 20.0f, 0), v3_make((east - west) * 0.5f, 21.0f, YARD_HALF_Z + 1.0f), g->spawn);
 }
 
+// The hub's artificial gravity: the world's down, over the hub, its piers and the
+// yard, fading out a couple of hundred metres beyond them. Past it is open space.
+static const float HUB_GRAVITY_RADIUS = 300.0f, HUB_GRAVITY_REACH = 500.0f;
+
 void game_build_universe(game *g) {
     g->spawn = v3_make(0.0f, 0.0f, 12.0f);
+    {
+        cw_entity_id id = cw_world_create_entity(&g->world);
+        v3 centre = v3_make(-35.0f, 0.0f, -10.0f);
+        Transform t = {centre, centre};
+        Gravity gravity = {GRAVITY_DOWN, GAME_GRAVITY, HUB_GRAVITY_RADIUS, HUB_GRAVITY_REACH};
+        cw_comp_set(&g->world, id, g->c_transform, &t, sizeof(t));
+        cw_comp_set(&g->world, id, g->c_gravity, &gravity, sizeof(gravity));
+    }
     // The hub and its piers; the ships docked at their ends are not part of it.
     declare_place(g, "hub", v3_make(0, 20.0f, -PIER_LENGTH * 0.5f),
                   v3_make(HUB_HALF + 5.0f, 21.0f, HUB_HALF + PIER_LENGTH * 0.5f), g->spawn);
@@ -247,5 +336,8 @@ void game_build_universe(game *g) {
     spawn_block(g, v3_make(-22, 1.0f, 5.0f), v3_make(2, 1, 2), v3_make(0.4f, 0.3f, 0.25f));  // crates
     spawn_block(g, v3_make(22, 1.5f, -5.0f), v3_make(2, 1.5f, 3), v3_make(0.3f, 0.35f, 0.4f));
     spawn_yard(g);
+    // The hub's docks, across a short bridge off its east edge.
+    spawn_block(g, v3_make(HUB_HALF + 5.0f, -0.5f, 0), v3_make(5.0f, 0.5f, 2.5f), v3_scale(stone, 0.8f));
+    spawn_dock_deck(g, "Hub", "hub", v3_make(HUB_HALF + 10.0f, 0.0f, 0), v3_make(0.9f, 0.85f, 0.6f));
     for (int i = 0; i < COUNT_OF(PLANETS); ++i) spawn_planet(g, &PLANETS[i]);
 }

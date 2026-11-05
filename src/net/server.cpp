@@ -32,6 +32,8 @@ static void handle_character(server *s, uint64_t account, const character *gear)
 static void send_character(server *s, server_client *c);
 static void wear_gear(server *s, server_client *c);
 static void save_gear(server *s, server_client *c, double now);
+static void send_character(server *s, server_client *c);
+static void order_ships(server *s);
 static void ids_push(cw_id_list *list, cw_entity_id id);
 
 static const char *world_name(const server_world *world) { return world->kind == WORLD_ZONE ? "the universe" : world->dungeon; }
@@ -617,8 +619,7 @@ static void build_snapshot(server *s, server_client *c, int wanted) {
         if (!cw_world_is_valid(w, id)) continue;   // gone since chosen
         if (cw_comp_has(w, id, g->c_craft)) {
             const Craft *craft = CW_GET(w, id, g->c_craft, Craft);
-            snapshot_entry e = snapshot_entry_craft(id, CW_GET(w, id, g->c_transform, Transform)->position, craft->velocity,
-                                                    craft->orientation, craft->spin, craft->pilot, craft->resting, craft->assist);
+            snapshot_entry e = snapshot_entry_craft(id, CW_GET(w, id, g->c_transform, Transform)->position, craft);
             e.priority = game_aboard(g, c->player) == id ? -1.0f : (float)i;
             snap->entries[snap->count++] = e;
             continue;
@@ -722,6 +723,73 @@ static void on_client_message(void *user, net_connection *, uint8_t type, cw_rea
             wear_gear(s, c);
             save_gear(s, c, net_seconds());
         }
+        break;
+    }
+    case MSG_KICK: {
+        // Only a craft's owner, standing by it, may put anyone off it, and not themselves.
+        uint8_t op = KICK_ONE;
+        cw_entity_id target = CW_INVALID_ENTITY;
+        cw_reader_u8(&payload, &op);
+        cw_reader_i64(&payload, &target);
+        server *s = c->world->owner;
+        if (!cw_reader_ok(&payload) || c->state != CLIENT_ACTIVE) return;
+        game *g = c->world->g;
+        cw_entity_id craft = op == KICK_ALL ? game_aboard(g, c->player)
+                           : cw_world_is_valid(&g->world, target) ? game_aboard(g, target) : CW_INVALID_ENTITY;
+        bool allowed = craft != CW_INVALID_ENTITY && c->account && game_owner(g, craft) == c->account
+                    && (op == KICK_ALL || (target != c->player && cw_comp_has(&g->world, target, g->c_player)));
+        if (allowed) {
+            const Craft *ship = CW_GET(&g->world, craft, g->c_craft, Craft);
+            v3 mine = CW_GET(&g->world, c->player, g->c_transform, Transform)->position;
+            allowed = v3_length(v3_sub(mine, CW_GET(&g->world, craft, g->c_transform, Transform)->position)) < ship->radius + 10.0f;
+        }
+        if (!allowed) {
+            ++s->kicks_refused;
+            return;
+        }
+        if (op == KICK_ALL) s->kicks += (uint32_t)game_kick_all(g, craft, c->player);
+        else {
+            game_kick(g, craft, target);
+            ++s->kicks;
+        }
+        note_updated(c->world, craft, 1u << NET_C_BARRED);
+        if (s->config.verbose)
+            fprintf(stderr, "server: %s put %s off their craft\n", CW_GET(&g->world, c->player, g->c_player, Player)->name,
+                    op == KICK_ALL ? "everyone" : CW_GET(&g->world, target, g->c_player, Player)->name);
+        break;
+    }
+    case MSG_SHIPWRIGHT: {
+        // Only a player standing at the shipwright's counter, whose character is here.
+        shipwright_order order;
+        if (!shipwright_order_read(&payload, &order) || c->state != CLIENT_ACTIVE) return;
+        server *s = c->world->owner;
+        game *g = c->world->g;
+        int result = SHIPWRIGHT_INVALID;
+        v3 feet = CW_GET(&g->world, c->player, g->c_transform, Transform)->position;
+        if (c->gear_known && game_place_of_kind_at(g, feet, PLACE_SHIPWRIGHT) >= 0 && game_aboard(g, c->player) == CW_INVALID_ENTITY) {
+            result = shipwright_apply(&c->gear, &order);
+            if (result == SHIPWRIGHT_DONE && order.op != SHIPWRIGHT_SHOW) {
+                save_gear(s, c, net_seconds());
+                send_character(s, c);
+                ++s->shipwright_orders;
+            }
+            if (result == SHIPWRIGHT_DONE || result == SHIPWRIGHT_UNCHANGED) {
+                // The ship the yard builds them, and theirs rebuilt to it if nobody is aboard.
+                game_set_ship_order(g, c->player, fleet_sailing(&c->gear));
+                game_refit_craft(g, c->player, fleet_sailing(&c->gear));
+            }
+        } else {
+            ++s->shipwright_refused;
+        }
+        unsigned char answer[8];
+        cw_writer w;
+        cw_writer_init_fixed(&w, answer, sizeof(answer));
+        cw_writer_u8(&w, (uint8_t)result);
+        shipwright_order_write(&w, &order);
+        net_connection_send(&c->connection, MSG_SHIPWRIGHT_RESULT, NET_RELIABLE_ORDERED, answer, w.size);
+        if (s->config.verbose && result == SHIPWRIGHT_DONE && order.op != SHIPWRIGHT_SHOW)
+            fprintf(stderr, "server: %s traded at the shipwright's (order %d)\n", CW_GET(&g->world, c->player, g->c_player, Player)->name,
+                    order.op);
         break;
     }
     case MSG_PARTY_REQUEST: {
@@ -846,8 +914,24 @@ static void handle_character(server *s, uint64_t account, const character *gear)
     server_client *c = server_client_of_account(s, account);
     if (!c || c->state == CLIENT_FREE || c->state == CLIENT_LINGERING || c->gear_known) return;
     c->gear = *gear;
+    character_fit_out(&c->gear);   // a character from before ships, and the purse everyone has for now
     c->gear_known = true;
     wear_gear(s, c);
+}
+// What the yard builds each player whose character is known: the hull they sail,
+// as fitted (ShipOrder). Kept up to date before every tick, whichever world the
+// player's body is in now.
+static void order_ships(server *s) {
+    for (int i = 0; i < s->config.max_clients; ++i) {
+        server_client *c = &s->clients[i];
+        if (c->state != CLIENT_ACTIVE || !c->gear_known) continue;
+        game *g = c->world->g;
+        if (!cw_world_is_valid(&g->world, c->player)) continue;
+        const ship_loadout *sailing = fleet_sailing(&c->gear);
+        if (cw_comp_has(&g->world, c->player, g->c_ship_order)
+            && ship_loadout_equal(&CW_GET(&g->world, c->player, g->c_ship_order, ShipOrder)->loadout, sailing)) continue;
+        game_set_ship_order(g, c->player, sailing);
+    }
 }
 // After a change here, the backend's copy.
 static void save_gear(server *s, server_client *c, double now) {
@@ -1196,6 +1280,7 @@ static void accept_client(server *s, net_address from, const net_connect_message
     welcome.spawn = g->spawn;
     welcome.account = c->account;
     welcome.input_target = SERVER_INPUT_TARGET;
+    welcome.currents = g->currents;
     if (world->kind == WORLD_INSTANCE) strncpy(welcome.world, world->dungeon, GAME_NAME_CAPACITY - 1);
     memcpy(welcome.zone, s->zone_name, sizeof(welcome.zone));
     welcome.place_count = g->place_count;
@@ -1498,11 +1583,18 @@ bool server_init(server *s, const server_config *config) {
 
     game_init(&s->zone, CW_HOST);
     s->zone.universe_base = s->tick_base;
+    s->zone.currents = s->config.currents;
     int self = server_self(s);
     bool instance_host = self >= 0 && s->zones.zones[self].instance_host;
     if (!instance_host) {
         game_build_universe(&s->zone);
         s->zone_world = world_add(s, WORLD_ZONE, &s->zone);
+        // Captains, on the server whose hub it is (or alone): one set for the universe.
+        bool hub = (!s->config.zones && s->config.directory.ip == 0) || (self >= 0 && net_zones_owner(&s->zones, "hub") == self);
+        if (s->config.captains > 0 && hub) {
+            game_spawn_captains(&s->zone, s->config.captains, (uint32_t)(net_seconds() * 1000.0));
+            if (s->config.verbose) fprintf(stderr, "server: %d captains sail from the docks\n", s->config.captains);
+        }
     }
     return true;
 }
@@ -1569,8 +1661,8 @@ static void apply_inputs(server *s) {
             // Frozen: the ticket described this player standing here, and the other
             // world will pick up from exactly that. Looking around still works.
             in->forward = in->strafe = in->lift = 0.0f;
-            in->turn_pitch = in->turn_yaw = in->turn_roll = 0.0f;
-            in->jump = in->use = false;
+            in->turn_pitch = in->turn_yaw = in->turn_roll = in->sail = in->brace = 0.0f;
+            in->jump = in->use = in->dock = false;
         }
     }
 }
@@ -1614,7 +1706,7 @@ void server_update(server *s, double now) {
         cw_entity_id id;
         while (cw_query_next(&crafts, &id)) {
             uint64_t owner = game_owner(g, id);
-            if (!owner) continue;   // nobody's: the world's own, kept
+            if (!owner || game_is_captain_account(g, owner)) continue;   // nobody's, or a captain's: the world's own, kept
             if (!cw_comp_has(&g->world, id, world->c_keep)) {
                 CraftKeep fresh = {};
                 cw_comp_set(&g->world, id, world->c_keep, &fresh, sizeof(fresh));
@@ -1664,6 +1756,7 @@ void server_update(server *s, double now) {
         ++s->tick;
         double a = net_seconds();
         apply_inputs(s);
+        order_ships(s);
         for (int i = 0; i < s->world_count; ++i) game_tick(s->worlds[i]->g);
         resolve_swings(s);
         for (int i = 0; i < s->world_count; ++i) record_trails(s->worlds[i]);

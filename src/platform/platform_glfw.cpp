@@ -44,6 +44,11 @@ static void on_cursor(GLFWwindow *handle, double x, double y) {
     window->cursor_y = y;
 }
 
+static void on_scroll(GLFWwindow *handle, double, double y) {
+    plat_window *window = (plat_window *)glfwGetWindowUserPointer(handle);
+    window->input.scroll += (float)y;
+}
+
 static void on_focus(GLFWwindow *handle, int focused) {
     plat_window *window = (plat_window *)glfwGetWindowUserPointer(handle);
     if (focused) return;
@@ -74,6 +79,7 @@ static bool open_handle(plat_window *window, int width, int height, bool opengl)
     glfwSetKeyCallback(window->handle, on_key);
     glfwSetMouseButtonCallback(window->handle, on_mouse_button);
     glfwSetCursorPosCallback(window->handle, on_cursor);
+    glfwSetScrollCallback(window->handle, on_scroll);
     glfwSetWindowFocusCallback(window->handle, on_focus);
     return true;
 }
@@ -133,10 +139,18 @@ bool plat_vsync(void) { return vsync_on; }
 bool plat_window_poll(plat_window *window) {
     window->input.mouse_dx = window->input.mouse_dy = 0.0f;
     window->input.clicked = false;
+    window->input.scroll = 0.0f;
     memset(window->input.pressed, 0, sizeof(window->input.pressed));
     // Minimised: nothing presents, so nothing paces the loop.
     if (glfwGetWindowAttrib(window->handle, GLFW_ICONIFIED)) glfwWaitEventsTimeout(0.01);
     else glfwPollEvents();
+    // The pointer, in the window's own units (which a high-density display's framebuffer is not).
+    int width = 0, height = 0;
+    glfwGetWindowSize(window->handle, &width, &height);
+    if (width > 0 && height > 0) {
+        window->input.cursor_x = (float)(window->cursor_x / (double)width);
+        window->input.cursor_y = (float)(window->cursor_y / (double)height);
+    }
     return !glfwWindowShouldClose(window->handle);
 }
 

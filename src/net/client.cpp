@@ -118,14 +118,9 @@ static void craft_from_entry(game *g, cw_entity_id id, const snapshot_entry *e) 
     Craft *craft = CW_GET(w, id, g->c_craft, Craft);
     Transform *t = CW_GET(w, id, g->c_transform, Transform);
     v3 position;
-    snapshot_craft_state(e, &position, &craft->velocity, &craft->orientation, &craft->spin);
-    craft->orientation = quat_normalize(craft->orientation);
+    snapshot_craft_apply(e, craft, &position);
     craft->previous_orientation = craft->orientation;
     t->position = t->previous = position;
-    craft->pilot = e->pilot;
-    craft->resting = (e->flags & SNAP_RESTING) != 0;
-    craft->assist = (e->flags & SNAP_ASSIST) != 0;
-    craft->quiet_ticks = 0;
 }
 
 // Where our player is in the frame that moves them: the craft's (aboard one) or the world's.
@@ -351,12 +346,18 @@ static void on_snapshot(net_client *c, cw_reader *r, double now) {
         s.craft = true;
         snapshot_craft_state(e, &s.position, &s.velocity, &s.orientation, &s.spin);
         s.orientation = quat_normalize(s.orientation);
+        memcpy(s.throttle, e->throttle, sizeof(s.throttle));
         replica_push(replica_of(c, e->id), &s);
-        craft->pilot = e->pilot;
-        craft->resting = (e->flags & SNAP_RESTING) != 0;
-        craft->assist = (e->flags & SNAP_ASSIST) != 0;
-        craft->velocity = s.velocity;
-        craft->spin = s.spin;
+        // The rest of its state as it is now; its pose and engines are drawn from
+        // the samples, at the render time, so that the flames go with the motion.
+        quat orientation = craft->orientation, previous = craft->previous_orientation;
+        float throttle[CRAFT_GROUPS];
+        memcpy(throttle, craft->throttle, sizeof(throttle));
+        v3 ignored;
+        snapshot_craft_apply(e, craft, &ignored);
+        craft->orientation = orientation;
+        craft->previous_orientation = previous;
+        memcpy(craft->throttle, throttle, sizeof(throttle));
     }
     for (uint16_t i = 0; i < snap->count; ++i) {
         const snapshot_entry *e = &snap->entries[i];
@@ -429,6 +430,7 @@ static void on_message(void *user, net_connection *, uint8_t type, cw_reader pay
         memcpy(c->world_name, m.world, sizeof(c->world_name));
         memcpy(c->zone, m.zone, sizeof(c->zone));
         g->universe_base = m.universe_base;
+        g->currents = m.currents;
         g->spawn = m.spawn;
         g->place_count = m.place_count;
         memcpy(g->places, m.places, sizeof(g->places));
@@ -552,6 +554,16 @@ static void on_message(void *user, net_connection *, uint8_t type, cw_reader pay
         ++c->gear_updates;
         break;
     }
+    case MSG_SHIPWRIGHT_RESULT: {
+        uint8_t result = 0;
+        shipwright_order order;
+        cw_reader_u8(&payload, &result);
+        if (!shipwright_order_read(&payload, &order)) return;
+        c->shipwright_result = result;
+        c->shipwright_answered = order;
+        ++c->shipwright_answers;
+        break;
+    }
     case MSG_DISCONNECT:
         fail(c, "the server closed the connection");
         break;
@@ -575,6 +587,23 @@ void net_client_equip(net_client *c, int index) {
     if (c->state != NC_CONNECTED || index < 0 || index >= STASH_SIZE) return;
     uint8_t payload = (uint8_t)index;
     net_connection_send(&c->connection, MSG_EQUIP, NET_RELIABLE_ORDERED, &payload, 1);
+}
+
+void net_client_kick(net_client *c, cw_entity_id player) {
+    if (c->state != NC_CONNECTED) return;
+    cw_writer w;
+    cw_writer_init_fixed(&w, c->scratch, sizeof(c->scratch));
+    cw_writer_u8(&w, player == CW_INVALID_ENTITY ? KICK_ALL : KICK_ONE);
+    cw_writer_i64(&w, player);
+    net_connection_send(&c->connection, MSG_KICK, NET_RELIABLE_ORDERED, c->scratch, w.size);
+}
+
+void net_client_shipwright(net_client *c, const shipwright_order *order) {
+    if (c->state != NC_CONNECTED) return;
+    cw_writer w;
+    cw_writer_init_fixed(&w, c->scratch, sizeof(c->scratch));
+    shipwright_order_write(&w, order);
+    net_connection_send(&c->connection, MSG_SHIPWRIGHT, NET_RELIABLE_ORDERED, c->scratch, w.size);
 }
 
 bool net_client_loot_in_view(const net_client *c, float reach, item *out) {
@@ -603,9 +632,18 @@ bool net_client_loot_in_view(const net_client *c, float reach, item *out) {
 }
 
 bool net_client_player_in_view(const net_client *c, float reach, char name[ACCOUNT_NAME_CAPACITY]) {
+    cw_entity_id best = net_client_player_looked_at(c, reach);
+    if (best == CW_INVALID_ENTITY) return false;
+    game *g = c->replica;
+    strncpy(name, CW_GET(&g->world, best, g->c_player, Player)->name, ACCOUNT_NAME_CAPACITY - 1);
+    name[ACCOUNT_NAME_CAPACITY - 1] = '\0';
+    return true;
+}
+
+cw_entity_id net_client_player_looked_at(const net_client *c, float reach) {
     game *g = c->replica;
     cw_world *w = &g->world;
-    if (!cw_world_is_valid(w, c->player)) return false;
+    if (!cw_world_is_valid(w, c->player)) return CW_INVALID_ENTITY;
     const Transform *me = CW_GET(w, c->player, g->c_transform, Transform);
     v3 eye, direction;
     game_player_view(g, c->player, &eye, &direction);
@@ -622,10 +660,7 @@ bool net_client_player_in_view(const net_client *c, float reach, char name[ACCOU
             best = id;
         }
     }
-    if (best == CW_INVALID_ENTITY) return false;
-    strncpy(name, CW_GET(w, best, g->c_player, Player)->name, ACCOUNT_NAME_CAPACITY - 1);
-    name[ACCOUNT_NAME_CAPACITY - 1] = '\0';
-    return true;
+    return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -841,16 +876,19 @@ void net_client_frame(net_client *c, const PlayerInput *in, double now) {
             applied.turn_pitch = applied.turn_yaw = applied.turn_roll = 0.0f;
             applied.jump = false;
             applied.act = false;
-            applied.use = false;
+            applied.use = applied.dock = false;
+            applied.sail = applied.brace = 0.0f;
         }
         // A swing is an edge, seen in one frame; ticks are rarer than frames, so it
         // is kept until the next tick and applied to that one alone. So is a use.
         if (applied.act) c->act_latched = true;
         if (applied.use) c->use_latched = true;
+        if (applied.dock) c->dock_latched = true;
         for (int i = 0; i < steps; ++i) {
             applied.act = c->act_latched;
             applied.use = c->use_latched;
-            c->act_latched = c->use_latched = false;
+            applied.dock = c->dock_latched;
+            c->act_latched = c->use_latched = c->dock_latched = false;
             predict_tick(c, &applied, now);
         }
 
@@ -883,6 +921,10 @@ void net_client_frame(net_client *c, const PlayerInput *in, double now) {
                         Craft *flying = CW_GET(w, id, g->c_craft, Craft);
                         if (flying->pilot == c->player) continue;   // ours: predicted
                         flying->orientation = flying->previous_orientation = replica_orientation(r, render_tick);
+                        // The engines as they were in the sample the pose comes from.
+                        const net_sample *shown = sample_at(r, 0);
+                        for (int k = 1; k < r->count && (double)sample_at(r, k)->tick <= render_tick; ++k) shown = sample_at(r, k);
+                        for (int k = 0; k < CRAFT_GROUPS; ++k) flying->throttle[k] = (float)shown->throttle[k] / 255.0f;
                     }
                     t->position = replica_position(c, r, render_tick, false);
                     t->previous = replica_position(c, r, render_tick, true);
@@ -1221,4 +1263,12 @@ const party_view *net_session_party(const net_session *s) {
 
 void net_session_equip(net_session *s, int stash_index) {
     if (s->link) net_client_equip(s->link, stash_index);
+}
+
+void net_session_kick(net_session *s, cw_entity_id player) {
+    if (s->link) net_client_kick(s->link, player);
+}
+
+void net_session_shipwright(net_session *s, const shipwright_order *order) {
+    if (s->link) net_client_shipwright(s->link, order);
 }

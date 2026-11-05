@@ -10,6 +10,13 @@ struct plat_window;
 // Letters and digits are their uppercase ASCII codes: keys['W'].
 #define PLAT_KEY_SPACE 32
 #define PLAT_KEY_ESCAPE 256
+#define PLAT_KEY_ENTER 257
+#define PLAT_KEY_TAB 258
+#define PLAT_KEY_BACKSPACE 259
+#define PLAT_KEY_RIGHT 262
+#define PLAT_KEY_LEFT 263
+#define PLAT_KEY_DOWN 264
+#define PLAT_KEY_UP 265
 #define PLAT_KEY_F1 290
 #define PLAT_KEY_F2 291
 #define PLAT_KEY_F3 292
@@ -23,6 +30,8 @@ struct plat_input {
     float mouse_dx, mouse_dy;    // counts since the last poll, while captured
     bool mouse_captured;
     bool clicked;                // the left button went down since the last poll
+    float cursor_x, cursor_y;    // where the pointer is, 0..1 across and down the window (while not captured)
+    float scroll;                // wheel notches since the last poll, away from you positive
 };
 
 // The window starts hidden, so that a renderer needing to replace it (see plat_gl_create)

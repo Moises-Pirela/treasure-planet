@@ -102,6 +102,9 @@ struct server_config {
     const char *save_path;       // characters on disk, when this server runs its own backend (no directory)
     double linger_quit, linger_timeout;   // seconds a body stays after a quit / after a timeout (0: defaults)
     double craft_linger;         // seconds a craft stays once its owner is on none of this server's worlds (0: default)
+    bool currents;               // the solar current flows (off for now: game.currents)
+    int captains;                // captains sailing their own ships about the universe (game_spawn_captains), when
+                                 // this server owns the hub or is alone; the executable's default is 4
     uint32_t bandwidth;          // bytes per second sent to each client at most; 0 takes SERVER_BANDWIDTH.
                                  // Snapshots shrink to fit (farthest players first), the baseline is paced
     uint32_t total_bandwidth;    // bytes per second sent by this server at most, shared out among its
@@ -246,6 +249,8 @@ struct server {
     uint32_t superseded;         // stale connections replaced by a ticketed arrival of the same account
     uint32_t swings, hits;       // swings judged, swings that landed
     uint32_t pickups;
+    uint32_t kicks, kicks_refused;   // players put off crafts by their owners; requests that were not theirs to make
+    uint32_t shipwright_orders, shipwright_refused;   // orders done at the shipwright's; orders from nowhere near it
     uint32_t reattached, lingered, finalized;
     double time_receive, time_ticks, time_snapshots, time_flush;   // seconds spent since the last trace
     uint32_t accepts_since_trace;

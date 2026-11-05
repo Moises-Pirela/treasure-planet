@@ -93,7 +93,7 @@ bool r_obj_parse(const char *text, size_t size, r_obj_mesh *out) {
             // the face's own normal when the file gives none.
             for (int t = 1; t + 1 < count && ok; ++t) {
                 obj_corner tri[3] = {corners[0], corners[t], corners[t + 1]};
-                v3 at[3];
+                v3 at[3] = {};   // every corner is set, or the face is refused; GCC cannot always tell
                 for (int k = 0; k < 3; ++k) {
                     int index = resolve(tri[k].position, positions.count);
                     if (index < 0) ok = false;

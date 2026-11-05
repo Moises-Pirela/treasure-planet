@@ -1,7 +1,8 @@
 // Items: what a player wears and carries. Plain data, deterministic names, nothing
 // that needs a database to mean something: an item is five numbers.
 //
-// A character is one player's equipment (one item per slot) and stash. Characters
+// A character is one player's equipment (one item per slot) and stash, their purse,
+// and their ships (the fleet: shipwright.h). Characters
 // belong to the backend (social.h keeps and saves them); a zone server holds a copy
 // for each player it hosts, changes it when they pick something up, and sends the
 // change back. What a player wears is replicated on their entity, so everyone sees
@@ -12,6 +13,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "ships.h"
 
 enum item_slot { SLOT_HEAD, SLOT_CHEST, SLOT_LEGS, SLOT_WEAPON, SLOT_TRINKET, SLOT_COUNT };
 enum item_rarity { RARITY_COMMON, RARITY_UNCOMMON, RARITY_RARE, RARITY_EPIC, RARITY_LEGENDARY, RARITY_COUNT };
@@ -25,9 +27,22 @@ struct item {
 };
 
 #define STASH_SIZE 24
+// A player's ships, as the shipwright keeps them: the hulls they own, the one they
+// sail, each one's fittings, and the fittings they have bought and taken out, in store.
+#define FLEET_STORE_MAX 999      // of any one fitting
+struct fleet {
+    uint8_t owned;               // a bit per hull_class
+    uint8_t sailing;             // the hull_class they sail: the one the yard builds them
+    ship_loadout loadouts[HULL_COUNT];   // each owned hull's, as fitted
+    uint16_t store[SHIP_CATALOGUE_MAX];  // fittings in store, by catalogue index
+};
 struct character {
     item equipment[SLOT_COUNT];
     item stash[STASH_SIZE];
+    int64_t doubloons;           // the purse
+    bool bottomless;             // a purse that never runs dry: spending takes nothing from it
+    int64_t spent;               // doubloons spent at the shipwright's, ever (what a bottomless purse has paid)
+    fleet ships;
     uint32_t version;            // bumped on every change, so copies can tell
 };
 
