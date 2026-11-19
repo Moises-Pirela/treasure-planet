@@ -359,7 +359,3 @@ python tools\compare_captures.py vk.bmp gl.bmp 8
 ```
 
 `--at X Y Z` and `--look YAW PITCH` place the camera. Expect a handful of differing pixels out of 921,600, along triangle edges, because the two APIs break rasterisation ties differently. The last argument is how many differing pixels to allow.
-
-## Licences
-
-The ported ECS keeps clockwork-c's MIT licence ([src/ecs/LICENSE](src/ecs/LICENSE)), and [third_party/README.md](third_party/README.md) lists the vendored code. The game itself has no licence chosen yet.
